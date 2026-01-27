@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build Release Binary
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Build release binary
+        run: swift build -c release
+
+      - name: Sign binary (ad-hoc)
+        run: |
+          codesign --force --sign - \
+            --entitlements Resources/Steno.entitlements \
+            .build/release/steno
+
+      - name: Create archive
+        run: |
+          cd .build/release
+          tar -czf steno-${{ github.ref_name }}-macos.tar.gz steno
+          shasum -a 256 steno-${{ github.ref_name }}-macos.tar.gz > steno-${{ github.ref_name }}-macos.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: steno-${{ github.ref_name }}-macos
+          path: |
+            .build/release/steno-${{ github.ref_name }}-macos.tar.gz
+            .build/release/steno-${{ github.ref_name }}-macos.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            .build/release/steno-${{ github.ref_name }}-macos.tar.gz
+            .build/release/steno-${{ github.ref_name }}-macos.tar.gz.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
