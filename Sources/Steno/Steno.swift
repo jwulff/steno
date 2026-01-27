@@ -1,26 +1,20 @@
 import ArgumentParser
 import Foundation
+import SwiftTUI
 
 @main
-struct Steno: AsyncParsableCommand {
+struct Steno: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Real-time speech-to-text transcription for macOS",
         version: "0.1.0"
     )
 
-    @Flag(name: .shortAndLong, help: "Print version and exit")
-    var version = false
-
-    func run() async throws {
-        if version {
-            print("Steno v0.1.0")
-            return
-        }
-
+    func run() throws {
         print("Steno - Speech to Text")
         print("Starting transcription interface...")
         print("")
 
-        await StenoApp().run()
+        // dispatch run loop - now that we're not in async context, this should work
+        Application(rootView: MainView()).start()
     }
 }
