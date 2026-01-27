@@ -1,0 +1,159 @@
+#!/bin/bash
+#
+# pre-push hook - Validates test attestation and runs tests before push
+#
+# Features:
+# - Checks for test attestation in commit messages
+# - Runs project tests before allowing push
+# - Interactive prompt when attestation missing (defaults to abort)
+# - Skips checks for main branch (CI handles it)
+#
+# Test Attestation Format:
+#   [steno-tests-passed: X tests in Ys]
+#
+# Installation:
+#   mkdir -p .githooks
+#   cp ~/Development/dotfiles/claude/githooks/pre-push .githooks/
+#   chmod +x .githooks/pre-push
+#   git config core.hooksPath .githooks
+#
+# Configuration:
+#   Edit TEST_COMMAND below to match your project's test runner
+#
+
+# === CONFIGURATION ===
+# Customize this for your project (auto-detected if not set)
+TEST_COMMAND=""
+
+# Detect test command if not configured
+detect_test_command() {
+    if [ -n "$TEST_COMMAND" ]; then
+        echo "$TEST_COMMAND"
+        return
+    fi
+
+    # Check for common test runners
+    if [ -f "Package.swift" ]; then
+        echo "swift test"
+    elif [ -f "package.json" ]; then
+        if command -v pnpm &> /dev/null && [ -f "pnpm-lock.yaml" ]; then
+            echo "pnpm test"
+        elif command -v yarn &> /dev/null && [ -f "yarn.lock" ]; then
+            echo "yarn test"
+        elif command -v npm &> /dev/null; then
+            echo "npm test"
+        fi
+    elif [ -f "go.mod" ]; then
+        echo "go test ./..."
+    elif [ -f "Cargo.toml" ]; then
+        echo "cargo test"
+    elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+        echo "pytest"
+    elif [ -f "Makefile" ] && grep -q "^test:" Makefile; then
+        echo "make test"
+    else
+        echo ""
+    fi
+}
+
+# === MAIN LOGIC ===
+
+set -e
+
+# Get current branch
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+# Skip checks for main/master branch (CI handles this)
+if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+    echo "Skipping pre-push checks for $BRANCH branch (CI handles this)"
+    exit 0
+fi
+
+# Read stdin for push info (required for pre-push hooks)
+while read local_ref local_sha remote_ref remote_sha; do
+    # Skip if deleting a branch
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        continue
+    fi
+
+    # Determine the range of commits being pushed
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        # New branch - check all commits from merge-base with main/master
+        if git show-ref --verify --quiet refs/heads/main; then
+            BASE_BRANCH="main"
+        else
+            BASE_BRANCH="master"
+        fi
+        MERGE_BASE=$(git merge-base "$BASE_BRANCH" "$local_sha" 2>/dev/null || echo "")
+        if [ -n "$MERGE_BASE" ]; then
+            RANGE="$MERGE_BASE..$local_sha"
+        else
+            RANGE="$local_sha"
+        fi
+    else
+        # Existing branch - check commits since last push
+        RANGE="$remote_sha..$local_sha"
+    fi
+
+    # Get commit messages for the range
+    COMMIT_MESSAGES=$(git log --format=%B "$RANGE" 2>/dev/null || git log --format=%B -1 "$local_sha")
+
+    # Check for any test attestation pattern
+    if echo "$COMMIT_MESSAGES" | grep -qE '\[.*tests?-passed:'; then
+        echo "✓ Test attestation found in commit messages"
+    else
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "WARNING: No test attestation found in commit messages"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "Expected format in commit message:"
+        echo "  [steno-tests-passed: X tests in Ys]"
+        echo ""
+        echo "RECOMMENDED: Run tests and amend your commit:"
+        echo "  <run your tests>"
+        echo "  git commit --amend"
+        echo ""
+
+        # Interactive prompt (only works in terminal)
+        if [ -t 0 ]; then
+            read -p "Push anyway without attestation? [y/N] " -n 1 -r </dev/tty
+            echo ""
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Push aborted. Run tests and amend your commit with attestation."
+                exit 1
+            fi
+            echo "Proceeding without attestation (CI will still run tests)..."
+        else
+            echo "Non-interactive mode: Push aborted. Add test attestation to commit."
+            exit 1
+        fi
+    fi
+done
+
+# Run tests before push
+TEST_CMD=$(detect_test_command)
+
+if [ -z "$TEST_CMD" ]; then
+    echo ""
+    echo "⚠ No test runner detected, skipping local tests"
+    echo "  Configure TEST_COMMAND in .githooks/pre-push if needed"
+    exit 0
+fi
+
+echo ""
+echo "Running pre-push tests: $TEST_CMD"
+echo ""
+
+if eval "$TEST_CMD"; then
+    echo ""
+    echo "✓ Tests passed! Push proceeding."
+else
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "ERROR: Tests failed"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Fix failing tests before pushing."
+    exit 1
+fi

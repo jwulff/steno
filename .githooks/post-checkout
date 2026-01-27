@@ -1,0 +1,62 @@
+#!/bin/bash
+#
+# post-checkout hook - Prevents branch switching in the main worktree
+#
+# This hook enforces the worktree-based development workflow:
+# - The main/ directory must always stay on the 'main' branch
+# - Feature work happens in separate worktrees
+# - Accidentally checking out a feature branch in main/ is auto-reverted
+#
+# Installation:
+#   mkdir -p .githooks
+#   cp ~/Development/dotfiles/claude/githooks/post-checkout .githooks/
+#   chmod +x .githooks/post-checkout
+#   git config core.hooksPath .githooks
+#
+
+# Only run for branch checkouts (flag=1), not file checkouts (flag=0)
+# Git passes: $1=previous HEAD, $2=new HEAD, $3=checkout type flag
+if [ "$3" != "1" ]; then
+    exit 0
+fi
+
+# Only enforce in main worktree (where .git is a directory, not a symlink/file)
+# Worktrees have .git as a file pointing to the main repo
+if [ ! -d ".git" ]; then
+    exit 0
+fi
+
+# Get current branch name
+BRANCH=$(git branch --show-current)
+
+# Allow if on main branch or detached HEAD (empty branch name)
+if [ -z "$BRANCH" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+    exit 0
+fi
+
+# Violation detected - auto-revert and show guidance
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "ERROR: Branch checkout blocked in main worktree"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "You checked out '$BRANCH' in the main/ worktree."
+echo "The main/ directory must stay on the 'main' branch."
+echo ""
+echo "Create a worktree instead:"
+echo ""
+echo "  git checkout main"
+echo "  git worktree add ../${BRANCH//\//-} $BRANCH"
+echo "  cd ../${BRANCH//\//-}"
+echo ""
+echo "Auto-reverting to main branch..."
+echo ""
+
+# Revert to main (or master if that's the default)
+if git show-ref --verify --quiet refs/heads/main; then
+    git checkout main
+else
+    git checkout master
+fi
+
+exit 1

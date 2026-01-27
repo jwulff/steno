@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.steno.cli</string>
+    <key>CFBundleName</key>
+    <string>Steno</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Steno needs microphone access to transcribe your speech in real-time.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Steno uses on-device speech recognition to convert your speech to text. All processing happens locally on your Mac.</string>
+</dict>
+</plist>

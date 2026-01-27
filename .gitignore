@@ -1,0 +1,37 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.a
+*.dylib
+
+# Signing
+*.p12
+*.cer
+*.mobileprovision
+
+# Environment
+.env
+.env.local
