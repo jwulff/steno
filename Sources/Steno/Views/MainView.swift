@@ -119,7 +119,86 @@ func getAudioInputDevices() -> [AudioInputDevice] {
     return devices
 }
 
-/// State container for the view with actual speech service integration.
+/// Handles audio tap callbacks in a thread-safe way
+final class AudioTapProcessor: @unchecked Sendable {
+    private let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+    private let onLevel: @Sendable (Float) -> Void
+    private let onLog: @Sendable (String) -> Void
+    private var lastLogTime = Date()
+    private let lock = NSLock()
+    private let converter: AVAudioConverter?
+    private let analyzerFormat: AVAudioFormat?
+    private let inputSampleRate: Double
+
+    init(
+        inputBuilder: AsyncStream<AnalyzerInput>.Continuation,
+        converter: AVAudioConverter?,
+        analyzerFormat: AVAudioFormat?,
+        inputSampleRate: Double,
+        onLevel: @escaping @Sendable (Float) -> Void,
+        onLog: @escaping @Sendable (String) -> Void
+    ) {
+        self.inputBuilder = inputBuilder
+        self.converter = converter
+        self.analyzerFormat = analyzerFormat
+        self.inputSampleRate = inputSampleRate
+        self.onLevel = onLevel
+        self.onLog = onLog
+    }
+
+    func handleBuffer(_ buffer: AVAudioPCMBuffer, _ time: AVAudioTime) {
+        // Calculate audio level
+        let frameLength = buffer.frameLength
+        var maxLevel: Float = 0
+        if let channelData = buffer.floatChannelData?[0] {
+            for i in 0..<Int(frameLength) {
+                let sample = abs(channelData[i])
+                if sample > maxLevel { maxLevel = sample }
+            }
+        }
+
+        // Report level
+        onLevel(maxLevel)
+
+        // Log periodically
+        lock.lock()
+        let now = Date()
+        let shouldLog = now.timeIntervalSince(lastLogTime) >= 1.0
+        if shouldLog {
+            lastLogTime = now
+        }
+        lock.unlock()
+
+        if shouldLog {
+            let levelBar = String(repeating: "█", count: min(20, Int(maxLevel * 100)))
+            onLog("Level: \(String(format: "%.3f", maxLevel)) \(levelBar)")
+        }
+
+        // Convert buffer if needed and feed to analyzer
+        let bufferToSend: AVAudioPCMBuffer
+        if let converter = converter, let analyzerFormat = analyzerFormat {
+            let outputFrameCapacity = AVAudioFrameCount(Double(buffer.frameLength) * analyzerFormat.sampleRate / inputSampleRate)
+            guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: outputFrameCapacity) else {
+                return
+            }
+            var error: NSError?
+            converter.convert(to: convertedBuffer, error: &error) { inNumPackets, outStatus in
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            if error != nil {
+                return
+            }
+            bufferToSend = convertedBuffer
+        } else {
+            bufferToSend = buffer
+        }
+
+        inputBuilder.yield(AnalyzerInput(buffer: bufferToSend))
+    }
+}
+
+/// State container for the view using macOS 26 SpeechAnalyzer API.
 class ViewState: ObservableObject, @unchecked Sendable {
     @Published var isListening: Bool = false
     @Published var segments: [TranscriptSegment] = []
@@ -130,6 +209,8 @@ class ViewState: ObservableObject, @unchecked Sendable {
     @Published var audioLevel: Float = 0
     @Published var availableDevices: [AudioInputDevice] = []
     @Published var selectedDeviceIndex: Int = 0
+    @Published var isDownloadingModel: Bool = false
+    @Published var downloadProgress: Double = 0
 
     // Scroll state
     @Published var scrollOffset: Int = 0
@@ -137,19 +218,18 @@ class ViewState: ObservableObject, @unchecked Sendable {
     let visibleLines: Int = 15
     let lineWidth: Int = 58  // Characters per line (leaving room for timestamp)
 
-    // Timing for entry grouping
-    private var lastEntryTime: Date?
+    // Timing for partial text display
     @Published var partialTimestamp: Date = Date()
-    let entryGroupingThreshold: TimeInterval = 5.0  // Start new line if > 5 seconds gap
 
-    // Stabilization timer - treat partial as final if unchanged for this duration
-    private var stabilizationWorkItem: DispatchWorkItem?
-    private var lastPartialText: String = ""
-    private var finalizedTextLength: Int = 0  // Track how much text we've already finalized
-    let stabilizationDelay: TimeInterval = 1.5  // Seconds of no change = finalize
-
-    private var recognitionTask: SFSpeechRecognitionTask?
+    // SpeechAnalyzer components (macOS 26+)
+    private var transcriber: SpeechTranscriber?
+    private var analyzer: SpeechAnalyzer?
+    private var analyzerFormat: AVAudioFormat?
+    private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
+    private var recognizerTask: Task<Void, Never>?
     private var audioEngine: AVAudioEngine?
+    private var audioConverter: AVAudioConverter?
+    private var audioTapProcessor: AudioTapProcessor?
 
     var fullText: String {
         segments.map(\.text).joined(separator: " ")
@@ -177,7 +257,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Add partial text if present (with real timestamp)
+        // Add partial/volatile text if present
         if !partialText.isEmpty {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
@@ -310,46 +390,31 @@ class ViewState: ObservableObject, @unchecked Sendable {
     }
 
     private func startListening() {
-        log("Starting...")
+        log("Starting with SpeechAnalyzer API...")
         statusMessage = "Checking permissions..."
 
-        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
-
-        log("Current permissions - mic: \(micStatus.rawValue), speech: \(speechStatus.rawValue)")
-
-        if micStatus != .authorized {
-            log("Requesting microphone access...")
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                self.log("Microphone access: \(granted)")
-                if granted {
-                    self.requestSpeechAndStart()
-                } else {
-                    self.errorMessage = "Microphone access denied"
-                    self.statusMessage = "Permission denied"
+        // Request microphone permission
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            if granted {
+                self.log("Microphone access granted")
+                // Request speech recognition permission (still needed)
+                SFSpeechRecognizer.requestAuthorization { status in
+                    if status == .authorized {
+                        self.log("Speech recognition authorized")
+                        Task { @MainActor in
+                            await self.beginSpeechAnalyzer()
+                        }
+                    } else {
+                        self.log("Speech recognition denied: \(status.rawValue)")
+                        self.errorMessage = "Speech recognition denied"
+                        self.statusMessage = "Permission denied"
+                    }
                 }
+            } else {
+                self.log("Microphone access denied")
+                self.errorMessage = "Microphone access denied"
+                self.statusMessage = "Permission denied"
             }
-        } else {
-            requestSpeechAndStart()
-        }
-    }
-
-    private func requestSpeechAndStart() {
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
-
-        if speechStatus != .authorized {
-            log("Requesting speech recognition access...")
-            SFSpeechRecognizer.requestAuthorization { status in
-                self.log("Speech recognition status: \(status.rawValue)")
-                if status == .authorized {
-                    self.beginTranscription()
-                } else {
-                    self.errorMessage = "Speech recognition denied"
-                    self.statusMessage = "Permission denied"
-                }
-            }
-        } else {
-            beginTranscription()
         }
     }
 
@@ -380,64 +445,190 @@ class ViewState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func beginTranscription() {
-        log("Beginning transcription...")
-        statusMessage = "Starting..."
+    @MainActor
+    private func beginSpeechAnalyzer() async {
+        log("Beginning SpeechAnalyzer transcription...")
+        statusMessage = "Initializing..."
 
+        // Set audio input device
         if let device = selectedDevice {
             log("Using input device: \(device.name)")
             _ = setAudioInputDevice(device.id)
         }
 
-        guard let recognizer = SFSpeechRecognizer(locale: .current) else {
-            log("ERROR: Could not create speech recognizer for current locale")
-            errorMessage = "Speech recognizer unavailable for locale"
-            return
-        }
-
-        guard recognizer.isAvailable else {
-            log("ERROR: Speech recognizer not available")
-            errorMessage = "Speech recognizer not available"
-            return
-        }
-
-        log("Speech recognizer available: \(recognizer.locale.identifier)")
-
         do {
+            let locale = Locale.current
+            log("Locale: \(locale.identifier)")
+
+            // Check if locale is supported
+            let supported = await SpeechTranscriber.supportedLocales
+            log("Supported locales: \(supported.map { $0.identifier })")
+
+            guard supported.contains(where: { $0.identifier == locale.identifier || $0.language.languageCode == locale.language.languageCode }) else {
+                log("ERROR: Locale not supported")
+                errorMessage = "Locale '\(locale.identifier)' not supported"
+                statusMessage = "Error"
+                return
+            }
+
+            // Create transcriber with volatile results for real-time feedback
+            let transcriber = SpeechTranscriber(
+                locale: locale,
+                transcriptionOptions: [],
+                reportingOptions: [.volatileResults],  // Get real-time partial results
+                attributeOptions: []
+            )
+            self.transcriber = transcriber
+
+            // Check if model needs to be downloaded
+            let installed = await SpeechTranscriber.installedLocales
+            log("Installed locales: \(installed.map { $0.identifier })")
+
+            let isInstalled = installed.contains(where: { $0.identifier == locale.identifier || $0.language.languageCode == locale.language.languageCode })
+
+            if !isInstalled {
+                log("Model not installed, checking for download...")
+                statusMessage = "Downloading model..."
+                isDownloadingModel = true
+
+                // Reserve the locale first
+                for reserved in await AssetInventory.reservedLocales {
+                    await AssetInventory.release(reservedLocale: reserved)
+                }
+                try await AssetInventory.reserve(locale: locale)
+
+                if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+                    log("Starting model download...")
+
+                    // Monitor progress
+                    Task {
+                        while !request.progress.isFinished {
+                            await MainActor.run {
+                                self.downloadProgress = request.progress.fractionCompleted
+                                self.statusMessage = "Downloading: \(Int(self.downloadProgress * 100))%"
+                            }
+                            try? await Task.sleep(for: .milliseconds(100))
+                        }
+                    }
+
+                    try await request.downloadAndInstall()
+                    log("Model downloaded successfully")
+                }
+
+                isDownloadingModel = false
+            }
+
+            // Create analyzer with the transcriber module
+            let analyzer = SpeechAnalyzer(modules: [transcriber])
+            self.analyzer = analyzer
+
+            // Get the required audio format
+            let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
+            self.analyzerFormat = analyzerFormat
+            log("Analyzer format: \(analyzerFormat?.sampleRate ?? 0)Hz, \(analyzerFormat?.channelCount ?? 0) channels")
+
+            // Create async stream for feeding audio
+            let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+            self.inputBuilder = inputBuilder
+
+            // Start listening for results
+            recognizerTask = Task { [weak self] in
+                do {
+                    for try await result in transcriber.results {
+                        await MainActor.run {
+                            guard let self = self else { return }
+
+                            let text = String(result.text.characters)
+
+                            if result.isFinal {
+                                // Final result - add to entries
+                                self.log("FINAL: '\(text)'")
+
+                                if !text.isEmpty {
+                                    let segment = TranscriptSegment(
+                                        text: text,
+                                        timestamp: Date(),
+                                        duration: 0,
+                                        confidence: nil
+                                    )
+                                    self.segments.append(segment)
+
+                                    let entry = TranscriptEntry(
+                                        timestamp: self.partialTimestamp,
+                                        text: text,
+                                        isFinal: true
+                                    )
+                                    self.entries.append(entry)
+
+                                    self.statusMessage = "Recording... (\(self.segments.count) segments)"
+                                }
+
+                                self.partialText = ""
+                                self.partialTimestamp = Date()
+
+                                if self.isLiveMode {
+                                    self.scrollOffset = 0
+                                }
+                            } else {
+                                // Volatile/partial result - show as in-progress
+                                self.log("PARTIAL: '\(text)'")
+
+                                if self.partialText.isEmpty && !text.isEmpty {
+                                    self.partialTimestamp = Date()
+                                }
+                                self.partialText = text
+                            }
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        self?.log("Recognition error: \(error.localizedDescription)")
+                        if !error.localizedDescription.lowercased().contains("cancel") {
+                            self?.errorMessage = error.localizedDescription
+                        }
+                    }
+                }
+            }
+
+            // Start the analyzer
+            try await analyzer.start(inputSequence: inputSequence)
+            log("Analyzer started")
+
+            // Set up audio engine
             let audioEngine = AVAudioEngine()
             self.audioEngine = audioEngine
 
-            let request = SFSpeechAudioBufferRecognitionRequest()
-            request.shouldReportPartialResults = true
-
             let inputNode = audioEngine.inputNode
-            let recordingFormat = inputNode.outputFormat(forBus: 0)
-            log("Audio format: \(recordingFormat.sampleRate)Hz, \(recordingFormat.channelCount) channels")
+            let inputFormat = inputNode.outputFormat(forBus: 0)
+            log("Input format: \(inputFormat.sampleRate)Hz, \(inputFormat.channelCount) channels")
 
-            self.log("Installing audio tap...")
-            var lastLogTime = Date()
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { buffer, _ in
-                request.append(buffer)
+            // Create converter if formats don't match
+            if let analyzerFormat = analyzerFormat, inputFormat != analyzerFormat {
+                audioConverter = AVAudioConverter(from: inputFormat, to: analyzerFormat)
+                log("Created audio converter")
+            }
 
-                let frameLength = buffer.frameLength
-                var maxLevel: Float = 0
-                if let channelData = buffer.floatChannelData?[0] {
-                    for i in 0..<Int(frameLength) {
-                        let level = abs(channelData[i])
-                        if level > maxLevel { maxLevel = level }
+            // Install tap to capture audio
+            // Create audio processor that handles tap callback without isolation issues
+            let audioProcessor = AudioTapProcessor(
+                inputBuilder: inputBuilder,
+                converter: self.audioConverter,
+                analyzerFormat: analyzerFormat,
+                inputSampleRate: inputFormat.sampleRate,
+                onLevel: { [weak self] level in
+                    DispatchQueue.main.async {
+                        self?.audioLevel = level
+                    }
+                },
+                onLog: { [weak self] message in
+                    DispatchQueue.main.async {
+                        self?.log(message)
                     }
                 }
+            )
+            self.audioTapProcessor = audioProcessor
 
-                self.audioLevel = maxLevel
-
-                let now = Date()
-                if now.timeIntervalSince(lastLogTime) >= 0.5 {
-                    lastLogTime = now
-                    let levelBar = String(repeating: "█", count: min(20, Int(maxLevel * 100)))
-                    self.log("Level: \(String(format: "%.3f", maxLevel)) \(levelBar)")
-                }
-            }
-            self.log("Audio tap installed")
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat, block: audioProcessor.handleBuffer)
 
             audioEngine.prepare()
             try audioEngine.start()
@@ -446,91 +637,9 @@ class ViewState: ObservableObject, @unchecked Sendable {
             isListening = true
             statusMessage = "Recording..."
 
-            recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-                let errorMsg = error?.localizedDescription
-                let text = result?.bestTranscription.formattedString
-                let isFinal = result?.isFinal ?? false
-                let confidence = result?.bestTranscription.segments.last?.confidence
-
-                if let errorMsg = errorMsg {
-                    if errorMsg.lowercased().contains("cancel") {
-                        self.log("Recognition stopped (cancelled)")
-                        return
-                    }
-                    self.log("Recognition error: \(errorMsg)")
-                    self.errorMessage = errorMsg
-                    self.isListening = false
-                    self.statusMessage = "Error"
-                    return
-                }
-
-                guard let text = text else {
-                    self.log("No result")
-                    return
-                }
-
-                self.log("Result: '\(text)' (final: \(isFinal))")
-
-                // Note: isFinal is often never true during continuous recognition
-                // We use a stabilization timer instead - if text unchanged for 1.5s, finalize it
-
-                if isFinal {
-                    // Rare, but handle it if it happens
-                    self.cancelStabilizationTimer()
-
-                    let segment = TranscriptSegment(
-                        text: text,
-                        timestamp: Date(),
-                        duration: 0,
-                        confidence: confidence
-                    )
-                    self.segments.append(segment)
-
-                    let now = Date()
-                    let entry = TranscriptEntry(timestamp: now, text: text, isFinal: true)
-                    self.entries.append(entry)
-
-                    self.lastEntryTime = now
-                    self.lastPartialText = ""
-                    self.partialText = ""
-                    self.statusMessage = "Recording... (\(self.segments.count) segments)"
-
-                    if self.isLiveMode {
-                        self.scrollOffset = 0
-                    }
-                } else {
-                    // Partial result - use stabilization timer
-                    // Only show/track the NEW text (after what we've already finalized)
-                    let newText: String
-                    if self.finalizedTextLength > 0 && text.count > self.finalizedTextLength {
-                        let startIndex = text.index(text.startIndex, offsetBy: self.finalizedTextLength)
-                        newText = String(text[startIndex...]).trimmingCharacters(in: .whitespaces)
-                    } else if self.finalizedTextLength == 0 {
-                        newText = text
-                    } else {
-                        newText = ""
-                    }
-
-                    if self.partialText.isEmpty && !newText.isEmpty {
-                        self.partialTimestamp = Date()
-                    }
-
-                    // Check if the new portion actually changed
-                    if newText != self.partialText && !newText.isEmpty {
-                        self.lastPartialText = text  // Store full text for finalization
-                        self.partialText = newText   // Display only new portion
-
-                        // Reset the timer since we got new content
-                        self.startStabilizationTimer()
-                    }
-                }
-            }
-
-            log("Recognition task started")
-
         } catch {
-            log("ERROR starting audio: \(error.localizedDescription)")
-            errorMessage = "Audio error: \(error.localizedDescription)"
+            log("ERROR: \(error.localizedDescription)")
+            errorMessage = error.localizedDescription
             statusMessage = "Error"
         }
     }
@@ -539,29 +648,43 @@ class ViewState: ObservableObject, @unchecked Sendable {
         log("Stopping transcription...")
         statusMessage = "Stopping..."
 
-        // Finalize any pending partial text before stopping
-        cancelStabilizationTimer()
-        if !partialText.isEmpty {
-            finalizePartialText()
-        }
-
+        // Stop audio engine first
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
+        audioConverter = nil
 
-        recognitionTask?.cancel()
-        recognitionTask = nil
+        // Finish the input stream
+        inputBuilder?.finish()
+        inputBuilder = nil
+
+        // Finalize the analyzer
+        Task {
+            do {
+                try await analyzer?.finalizeAndFinishThroughEndOfInput()
+                log("Analyzer finalized")
+            } catch {
+                log("Error finalizing analyzer: \(error)")
+            }
+        }
+
+        // Cancel recognition task
+        recognizerTask?.cancel()
+        recognizerTask = nil
+
+        // Clear references
+        analyzer = nil
+        transcriber = nil
+        analyzerFormat = nil
+        audioTapProcessor = nil
 
         isListening = false
         audioLevel = 0
-        lastPartialText = ""
-        finalizedTextLength = 0  // Reset for next session
         statusMessage = "Ready"
         log("Stopped")
     }
 
     func clear() {
-        cancelStabilizationTimer()
         segments.removeAll()
         entries.removeAll()
         partialText = ""
@@ -569,68 +692,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
         statusMessage = "Ready"
         scrollOffset = 0
         isLiveMode = true
-        lastEntryTime = nil
         partialTimestamp = Date()
-        lastPartialText = ""
-        finalizedTextLength = 0
-    }
-
-    private func cancelStabilizationTimer() {
-        stabilizationWorkItem?.cancel()
-        stabilizationWorkItem = nil
-    }
-
-    private func startStabilizationTimer() {
-        cancelStabilizationTimer()
-
-        let textToFinalize = partialText
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            // Only finalize if the text hasn't changed since timer started
-            if self.partialText == textToFinalize && !textToFinalize.isEmpty {
-                self.finalizePartialText()
-            } else {
-                self.log("Timer fired but text changed: '\(textToFinalize.prefix(20))...' -> '\(self.partialText.prefix(20))...'")
-            }
-        }
-        stabilizationWorkItem = workItem
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + stabilizationDelay, execute: workItem)
-        log("Timer started (\(stabilizationDelay)s) for: '\(textToFinalize.prefix(40))...'")
-    }
-
-    private func finalizePartialText() {
-        guard !partialText.isEmpty else { return }
-
-        // partialText already contains only the new text (calculated in the callback)
-        let newText = partialText
-
-        log("Stabilization timer fired - finalizing: '\(newText)'")
-
-        let now = Date()
-        let segment = TranscriptSegment(
-            text: newText,
-            timestamp: now,
-            duration: 0,
-            confidence: nil
-        )
-        segments.append(segment)
-
-        // Create new timestamped entry
-        let entry = TranscriptEntry(timestamp: partialTimestamp, text: newText, isFinal: true)
-        entries.append(entry)
-
-        // Update how much text we've finalized (use full text length from recognizer)
-        finalizedTextLength = lastPartialText.count
-
-        lastEntryTime = now
-        partialText = ""  // Clear display of partial
-        statusMessage = "Recording... (\(segments.count) segments)"
-
-        // Auto-scroll to bottom if in live mode
-        if isLiveMode {
-            scrollOffset = 0
-        }
     }
 
     func log(_ message: String) {
@@ -666,7 +728,7 @@ struct MainView: View {
             HStack {
                 Text("Steno")
                     .bold()
-                Text("- Speech to Text")
+                Text("- Speech to Text (SpeechAnalyzer)")
                     .foregroundColor(.gray)
             }
 
@@ -689,12 +751,15 @@ struct MainView: View {
                 if state.isListening {
                     Text("●")
                         .foregroundColor(.red)
+                } else if state.isDownloadingModel {
+                    Text("↓")
+                        .foregroundColor(.yellow)
                 } else {
                     Text("○")
                         .foregroundColor(.gray)
                 }
                 Text(state.statusMessage)
-                    .foregroundColor(state.isListening ? .green : .gray)
+                    .foregroundColor(state.isListening ? .green : (state.isDownloadingModel ? .yellow : .gray))
 
                 if state.isListening {
                     Text(" |")
