@@ -1,0 +1,81 @@
+# Steno
+
+A fast, private speech-to-text TUI for macOS.
+
+Steno uses Apple's new SpeechAnalyzer API (macOS 26) for real-time transcription that runs entirely on-device. No cloud services, no API keys, no rate limits.
+
+## Requirements
+
+- macOS 26 (Tahoe) or later
+- Swift 6.2+
+- Microphone access
+
+## Installation
+
+### From Source
+
+```bash
+git clone https://github.com/jwulff/steno.git
+cd steno
+swift build -c release
+```
+
+The binary will be at `.build/release/steno`.
+
+### Signed Binary
+
+For microphone access without Gatekeeper warnings:
+
+```bash
+swift build -c release
+codesign --force --sign - \
+  --entitlements Resources/Steno.entitlements \
+  .build/release/steno
+```
+
+## Usage
+
+```bash
+# Run with default microphone
+steno
+
+# List available microphones
+steno --list-devices
+
+# Use specific microphone
+steno --device "MacBook Pro Microphone"
+```
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| `Space` | Start/stop transcription |
+| `c` | Copy transcript to clipboard |
+| `x` | Clear transcript |
+| `q` | Quit |
+| `Up/Down` | Scroll transcript |
+
+## How It Works
+
+Steno uses the SpeechAnalyzer API introduced in macOS 26, which provides:
+
+- **On-device processing** - Your audio never leaves your Mac
+- **Low latency** - Real-time transcription as you speak
+- **High accuracy** - 55% faster than Whisper Large V3 Turbo in Apple's benchmarks
+
+## Development
+
+```bash
+# Run tests
+swift test
+
+# Run app
+swift run steno
+```
+
+See [CLAUDE.md](CLAUDE.md) for development conventions.
+
+## License
+
+MIT
