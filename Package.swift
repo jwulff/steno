@@ -12,7 +12,7 @@ let package = Package(
         .executable(name: "steno", targets: ["Steno"])
     ],
     dependencies: [
-        .package(url: "https://github.com/rensbreur/SwiftTUI.git", branch: "main"),
+        .package(url: "https://github.com/rensbreur/SwiftTUI.git", revision: "537133031bc2b2731048d00748c69700e1b48185"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0")
     ],
     targets: [
