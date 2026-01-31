@@ -5,6 +5,7 @@ import Observation
 public enum TranscriptionViewModelError: Error, Equatable {
     case permissionDenied(String)
     case speechError(String)
+    case storageError(String)
 }
 
 /// ViewModel managing transcription state and coordinating services.
@@ -25,6 +26,9 @@ public final class TranscriptionViewModel {
     /// Current error, if any.
     public private(set) var error: TranscriptionViewModelError?
 
+    /// The current recording session, if any.
+    public private(set) var currentSession: Session?
+
     /// The full transcribed text from all segments.
     public var fullText: String {
         segments.map(\.text).joined(separator: " ")
@@ -34,13 +38,30 @@ public final class TranscriptionViewModel {
 
     private let speechService: SpeechRecognitionService
     private let permissionService: PermissionService
+    private let repository: TranscriptRepository?
+    private let summaryCoordinator: RollingSummaryCoordinator?
     private var transcriptionTask: Task<Void, Never>?
+    private var currentSequenceNumber = 0
 
     // MARK: - Initialization
 
-    public init(speechService: SpeechRecognitionService, permissionService: PermissionService) {
+    /// Creates a ViewModel with optional persistence.
+    ///
+    /// - Parameters:
+    ///   - speechService: The speech recognition service.
+    ///   - permissionService: The permission service.
+    ///   - repository: Optional repository for persisting transcripts.
+    ///   - summaryCoordinator: Optional coordinator for rolling summaries.
+    public init(
+        speechService: SpeechRecognitionService,
+        permissionService: PermissionService,
+        repository: TranscriptRepository? = nil,
+        summaryCoordinator: RollingSummaryCoordinator? = nil
+    ) {
         self.speechService = speechService
         self.permissionService = permissionService
+        self.repository = repository
+        self.summaryCoordinator = summaryCoordinator
     }
 
     // MARK: - Public Methods
@@ -57,6 +78,18 @@ public final class TranscriptionViewModel {
         }
 
         error = nil
+        currentSequenceNumber = 0
+
+        // Create a new session if repository is available
+        if let repository {
+            do {
+                currentSession = try await repository.createSession(locale: .current)
+            } catch {
+                self.error = .storageError("Failed to create session: \(error.localizedDescription)")
+                return
+            }
+        }
+
         isListening = true
 
         transcriptionTask = Task { [weak self] in
@@ -69,6 +102,17 @@ public final class TranscriptionViewModel {
         transcriptionTask?.cancel()
         transcriptionTask = nil
         await speechService.stopTranscription()
+
+        // End the session if repository is available
+        if let repository, let session = currentSession {
+            do {
+                try await repository.endSession(session.id)
+            } catch {
+                // Log but don't fail - session is already stopped
+                print("Failed to end session: \(error)")
+            }
+        }
+
         isListening = false
     }
 
@@ -111,6 +155,28 @@ public final class TranscriptionViewModel {
             )
             segments.append(segment)
             partialText = ""
+
+            // Persist to repository if available
+            if let repository, let session = currentSession {
+                currentSequenceNumber += 1
+                let storedSegment = StoredSegment.from(
+                    segment,
+                    sessionId: session.id,
+                    sequenceNumber: currentSequenceNumber
+                )
+
+                do {
+                    try await repository.saveSegment(storedSegment)
+
+                    // Notify coordinator for potential summary generation
+                    if let coordinator = summaryCoordinator {
+                        await coordinator.onSegmentSaved(sessionId: session.id)
+                    }
+                } catch {
+                    // Log but don't fail - segment is already in memory
+                    print("Failed to save segment: \(error)")
+                }
+            }
         } else {
             partialText = result.text
         }

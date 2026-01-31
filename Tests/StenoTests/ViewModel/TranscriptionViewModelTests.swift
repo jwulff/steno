@@ -250,4 +250,109 @@ struct TranscriptionViewModelTests {
         #expect(viewModel.error != nil)
         #expect(viewModel.isListening == false)
     }
+
+    // MARK: - Persistence Tests
+
+    @Test func createsSessionOnStartWithRepository() async throws {
+        mockPermissionService.grantAll()
+        let mockRepo = MockTranscriptRepository()
+
+        let viewModel = TranscriptionViewModel(
+            speechService: mockSpeechService,
+            permissionService: mockPermissionService,
+            repository: mockRepo
+        )
+
+        await viewModel.startListening()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(viewModel.currentSession != nil)
+        let sessions = try await mockRepo.allSessions()
+        #expect(sessions.count == 1)
+    }
+
+    @Test func savesSegmentsToRepository() async throws {
+        mockPermissionService.grantAll()
+        let mockRepo = MockTranscriptRepository()
+
+        let viewModel = TranscriptionViewModel(
+            speechService: mockSpeechService,
+            permissionService: mockPermissionService,
+            repository: mockRepo
+        )
+
+        await viewModel.startListening()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let finalResult = TranscriptionResult(
+            text: "hello world",
+            isFinal: true,
+            confidence: 0.95,
+            timestamp: Date()
+        )
+        mockSpeechService.emit(finalResult)
+        try await Task.sleep(for: .milliseconds(100))
+
+        guard let session = viewModel.currentSession else {
+            Issue.record("No session created")
+            return
+        }
+
+        let storedSegments = try await mockRepo.segments(for: session.id)
+        #expect(storedSegments.count == 1)
+        #expect(storedSegments.first?.text == "hello world")
+    }
+
+    @Test func endsSessionOnStop() async throws {
+        mockPermissionService.grantAll()
+        let mockRepo = MockTranscriptRepository()
+
+        let viewModel = TranscriptionViewModel(
+            speechService: mockSpeechService,
+            permissionService: mockPermissionService,
+            repository: mockRepo
+        )
+
+        await viewModel.startListening()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let sessionId = viewModel.currentSession?.id
+
+        await viewModel.stopListening()
+        try await Task.sleep(for: .milliseconds(50))
+
+        guard let id = sessionId else {
+            Issue.record("No session was created")
+            return
+        }
+
+        let session = try await mockRepo.session(id)
+        #expect(session?.status == .completed)
+        #expect(session?.endedAt != nil)
+    }
+
+    @Test func worksWithoutRepository() async throws {
+        mockPermissionService.grantAll()
+
+        let viewModel = TranscriptionViewModel(
+            speechService: mockSpeechService,
+            permissionService: mockPermissionService
+            // No repository provided
+        )
+
+        await viewModel.startListening()
+        try await Task.sleep(for: .milliseconds(50))
+
+        let finalResult = TranscriptionResult(
+            text: "no persistence",
+            isFinal: true,
+            timestamp: Date()
+        )
+        mockSpeechService.emit(finalResult)
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Should still work without persistence
+        #expect(viewModel.segments.count == 1)
+        #expect(viewModel.currentSession == nil)
+    }
 }

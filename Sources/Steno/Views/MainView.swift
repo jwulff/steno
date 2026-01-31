@@ -2,6 +2,7 @@ import SwiftTUI
 import Combine
 import Foundation
 import CoreAudio
+import GRDB
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
 
@@ -221,6 +222,12 @@ class ViewState: ObservableObject, @unchecked Sendable {
     // Timing for partial text display
     @Published var partialTimestamp: Date = Date()
 
+    // Storage components
+    private var repository: SQLiteTranscriptRepository?
+    private var summaryCoordinator: RollingSummaryCoordinator?
+    private var currentSession: Session?
+    private var currentSequenceNumber: Int = 0
+
     // SpeechAnalyzer components (macOS 26+)
     private var transcriber: SpeechTranscriber?
     private var analyzer: SpeechAnalyzer?
@@ -359,6 +366,26 @@ class ViewState: ObservableObject, @unchecked Sendable {
 
     init() {
         refreshDevices()
+        initializeStorage()
+    }
+
+    private func initializeStorage() {
+        do {
+            let dbQueue = try DatabaseConfiguration.makeQueue(at: DatabaseConfiguration.defaultURL)
+            repository = SQLiteTranscriptRepository(dbQueue: dbQueue)
+            log("Database initialized at: \(DatabaseConfiguration.defaultURL.path)")
+
+            let summarizer = FoundationModelSummarizationService()
+            summaryCoordinator = RollingSummaryCoordinator(
+                repository: repository!,
+                summarizer: summarizer,
+                triggerCount: 10
+            )
+            log("Storage and summarization initialized")
+        } catch {
+            log("Failed to initialize storage: \(error)")
+            // App continues without persistence
+        }
     }
 
     func refreshDevices() {
@@ -449,6 +476,17 @@ class ViewState: ObservableObject, @unchecked Sendable {
     private func beginSpeechAnalyzer() async {
         log("Beginning SpeechAnalyzer transcription...")
         statusMessage = "Initializing..."
+
+        // Create a new session for persistence
+        currentSequenceNumber = 0
+        if let repository {
+            do {
+                currentSession = try await repository.createSession(locale: .current)
+                log("Created session: \(currentSession?.id.uuidString ?? "nil")")
+            } catch {
+                log("Failed to create session: \(error)")
+            }
+        }
 
         // Set audio input device
         if let device = selectedDevice {
@@ -560,6 +598,29 @@ class ViewState: ObservableObject, @unchecked Sendable {
                                     )
                                     self.entries.append(entry)
 
+                                    // Persist to database
+                                    if let repository = self.repository, let session = self.currentSession {
+                                        self.currentSequenceNumber += 1
+                                        let storedSegment = StoredSegment.from(
+                                            segment,
+                                            sessionId: session.id,
+                                            sequenceNumber: self.currentSequenceNumber
+                                        )
+                                        Task {
+                                            do {
+                                                try await repository.saveSegment(storedSegment)
+                                                self.log("Saved segment \(self.currentSequenceNumber)")
+
+                                                // Trigger rolling summary check
+                                                if let coordinator = self.summaryCoordinator {
+                                                    await coordinator.onSegmentSaved(sessionId: session.id)
+                                                }
+                                            } catch {
+                                                self.log("Failed to save segment: \(error)")
+                                            }
+                                        }
+                                    }
+
                                     self.statusMessage = "Recording... (\(self.segments.count) segments)"
                                 }
 
@@ -667,6 +728,19 @@ class ViewState: ObservableObject, @unchecked Sendable {
                 log("Error finalizing analyzer: \(error)")
             }
         }
+
+        // End the session in the database
+        if let repository, let session = currentSession {
+            Task {
+                do {
+                    try await repository.endSession(session.id)
+                    log("Ended session: \(session.id.uuidString)")
+                } catch {
+                    log("Failed to end session: \(error)")
+                }
+            }
+        }
+        currentSession = nil
 
         // Cancel recognition task
         recognizerTask?.cancel()
