@@ -228,6 +228,9 @@ class ViewState: ObservableObject, @unchecked Sendable {
     private var currentSession: Session?
     private var currentSequenceNumber: Int = 0
 
+    // Summary display
+    @Published var latestSummaryText: String?
+
     // SpeechAnalyzer components (macOS 26+)
     private var transcriber: SpeechTranscriber?
     private var analyzer: SpeechAnalyzer?
@@ -614,6 +617,14 @@ class ViewState: ObservableObject, @unchecked Sendable {
                                                 // Trigger rolling summary check
                                                 if let coordinator = self.summaryCoordinator {
                                                     await coordinator.onSegmentSaved(sessionId: session.id)
+
+                                                    // Fetch latest summary to display
+                                                    if let summary = try await repository.latestSummary(for: session.id) {
+                                                        await MainActor.run {
+                                                            self.latestSummaryText = summary.content
+                                                            self.log("Summary updated: \(summary.content.prefix(50))...")
+                                                        }
+                                                    }
                                                 }
                                             } catch {
                                                 self.log("Failed to save segment: \(error)")
@@ -767,6 +778,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
         scrollOffset = 0
         isLiveMode = true
         partialTimestamp = Date()
+        latestSummaryText = nil
     }
 
     func log(_ message: String) {
@@ -859,9 +871,26 @@ struct MainView: View {
                 }
             }
 
-            // Divider
-            Text(String(repeating: "─", count: 60))
-                .foregroundColor(.gray)
+            // AI Summary section + Divider
+            Group {
+                if let summary = state.latestSummaryText {
+                    Text(String(repeating: "─", count: 60))
+                        .foregroundColor(.gray)
+                    HStack {
+                        Text("AI Summary")
+                            .foregroundColor(.magenta)
+                            .bold()
+                        Text("(\(state.segments.count) segments)")
+                            .foregroundColor(.gray)
+                    }
+                    Text(summary)
+                        .foregroundColor(.white)
+                }
+
+                // Divider
+                Text(String(repeating: "─", count: 60))
+                    .foregroundColor(.gray)
+            }
 
             // Transcript log view (expands to fill available space)
             VStack(alignment: .leading) {
