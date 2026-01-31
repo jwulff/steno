@@ -92,11 +92,11 @@ func getAudioInputDevices() -> [AudioInputDevice] {
                         mElement: kAudioObjectPropertyElementMain
                     )
 
-                    var name: CFString = "" as CFString
-                    var nameSize = UInt32(MemoryLayout<CFString>.size)
+                    var name: Unmanaged<CFString>?
+                    var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
                     status = AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, &name)
 
-                    let deviceName = status == noErr ? name as String : "Unknown Device"
+                    let deviceName = status == noErr ? (name?.takeUnretainedValue() as String? ?? "Unknown Device") : "Unknown Device"
 
                     var uidAddress = AudioObjectPropertyAddress(
                         mSelector: kAudioDevicePropertyDeviceUID,
@@ -104,11 +104,11 @@ func getAudioInputDevices() -> [AudioInputDevice] {
                         mElement: kAudioObjectPropertyElementMain
                     )
 
-                    var uid: CFString = "" as CFString
-                    var uidSize = UInt32(MemoryLayout<CFString>.size)
+                    var uid: Unmanaged<CFString>?
+                    var uidSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
                     status = AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &uid)
 
-                    let deviceUID = status == noErr ? uid as String : ""
+                    let deviceUID = status == noErr ? (uid?.takeUnretainedValue() as String? ?? "") : ""
 
                     devices.append(AudioInputDevice(id: deviceID, name: deviceName, uid: deviceUID))
                 }
@@ -789,28 +789,22 @@ struct MainView: View {
             Text(String(repeating: "─", count: 60))
                 .foregroundColor(.gray)
 
-            // Transcript log view
+            // Transcript log view (expands to fill available space)
             VStack(alignment: .leading) {
                 if state.entries.isEmpty && state.partialText.isEmpty {
                     Text("Press [Start] to begin transcription...")
                         .foregroundColor(.gray)
                         .italic()
-                    // Pad to maintain consistent height
-                    ForEach(0..<(state.visibleLines - 1), id: \.self) { _ in
-                        Text(" ")
-                    }
                 } else {
                     let lines = state.visibleDisplayLines
-                    ForEach(0..<state.visibleLines, id: \.self) { i in
-                        if i < lines.count {
-                            Text(lines[i])
-                                .foregroundColor(lines[i].hasSuffix(" ▌") ? .yellow : .white)
-                        } else {
-                            Text(" ")
-                        }
+                    ForEach(0..<lines.count, id: \.self) { i in
+                        Text(lines[i])
+                            .foregroundColor(lines[i].hasSuffix(" ▌") ? .yellow : .white)
                     }
                 }
+                Spacer()
             }
+            .frame(maxHeight: .infinity)
 
             // Divider
             Text(String(repeating: "─", count: 60))
@@ -856,9 +850,10 @@ struct MainView: View {
                 }
             }
 
-            Text("Tab=navigate | ↑↓=scroll | Log: ~/.steno.log")
+                Text("Tab=navigate | ↑↓=scroll | Log: ~/.steno.log")
                 .foregroundColor(.gray)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(1)
     }
 
