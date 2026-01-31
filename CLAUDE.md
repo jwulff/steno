@@ -12,6 +12,26 @@
 
 ---
 
+## Public Open Source Project
+
+**This is a public repository on GitHub: https://github.com/jwulff/steno**
+
+Everything committed here is visible to the world. NEVER commit:
+
+- API keys, tokens, or secrets of any kind
+- Passwords or credentials
+- Private URLs or internal server addresses
+- Personal information (emails, phone numbers, addresses)
+- `.env` files or environment configurations with secrets
+- Signing certificates or private keys (`.p12`, `.pem`, `.key`)
+- Database dumps or files containing user data
+
+If you accidentally commit sensitive data, it's NOT enough to delete it in a new commit - the data remains in git history. You must rewrite history or consider the secret compromised.
+
+When in doubt, add it to `.gitignore` first.
+
+---
+
 ## Project Overview
 
 A macOS TUI app that uses Apple's Speech framework (SpeechAnalyzer/SpeechTranscriber from macOS 26) for real-time microphone transcription.
@@ -223,3 +243,4 @@ for try await result in transcriber.results {
 - Skipping error handling
 - Force unwrapping optionals
 - Business logic in views
+- Committing secrets, credentials, or sensitive data (this is a public repo!)
