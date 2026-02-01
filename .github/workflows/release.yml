@@ -35,7 +35,7 @@ jobs:
           shasum -a 256 steno-${{ github.ref_name }}-macos.tar.gz > steno-${{ github.ref_name }}-macos.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: steno-${{ github.ref_name }}-macos
           path: |
