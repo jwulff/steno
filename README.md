@@ -7,12 +7,29 @@ Steno uses Apple's new SpeechAnalyzer API (macOS 26) for real-time transcription
 ## Requirements
 
 - macOS 26 (Tahoe) or later
-- Swift 6.2+
 - Microphone access
 
 ## Installation
 
+### Download Binary
+
+Download the latest release from [GitHub Releases](https://github.com/jwulff/steno/releases/latest):
+
+```bash
+# Download and unzip
+curl -L https://github.com/jwulff/steno/releases/latest/download/steno-macos-arm64.zip -o steno.zip
+unzip steno.zip
+
+# Remove quarantine attribute (required for unsigned binaries)
+xattr -d com.apple.quarantine steno
+
+# Run
+./steno
+```
+
 ### From Source
+
+Requires Swift 6.2+.
 
 ```bash
 git clone https://github.com/jwulff/steno.git
@@ -51,8 +68,9 @@ steno --device "MacBook Pro Microphone"
 | Key | Action |
 |-----|--------|
 | `Space` | Start/stop transcription |
-| `c` | Copy transcript to clipboard |
-| `x` | Clear transcript |
+| `s` | Open settings |
+| `i` | Cycle input devices |
+| `m` | Cycle AI models |
 | `q` | Quit |
 | `Up/Down` | Scroll transcript |
 
