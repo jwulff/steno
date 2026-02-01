@@ -41,15 +41,18 @@ struct RollingSummaryCoordinatorTests {
         let repo = MockTranscriptRepository()
         let summarizer = MockSummarizationService()
 
+        // Use high time threshold to test count-based trigger only
+        // Also use only 2 segments (below the min 3 for time-based trigger)
         let coordinator = RollingSummaryCoordinator(
             repository: repo,
             summarizer: summarizer,
-            triggerCount: 10
+            triggerCount: 10,
+            timeThreshold: 3600  // 1 hour - effectively disables time trigger
         )
 
         let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
 
-        for i in 1...5 {
+        for i in 1...2 {
             let segment = StoredSegment(
                 sessionId: session.id,
                 text: "Segment \(i)",
@@ -193,5 +196,41 @@ struct RollingSummaryCoordinatorTests {
         // Check second call received first summary
         let secondPreviousSummary = await summarizer.lastPreviousSummary
         #expect(secondPreviousSummary == "First summary")
+    }
+
+    @Test func triggersOnTimeThresholdWithMinSegments() async throws {
+        let repo = MockTranscriptRepository()
+        let summarizer = MockSummarizationService()
+
+        // Set count threshold high but time threshold to 0 (immediate)
+        let coordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: summarizer,
+            triggerCount: 100,  // Won't reach this
+            timeThreshold: 0    // Immediate time-based trigger
+        )
+
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        // Add 3 segments (minimum for time-based trigger)
+        for i in 1...3 {
+            let segment = StoredSegment(
+                sessionId: session.id,
+                text: "Segment \(i)",
+                startedAt: Date(),
+                endedAt: Date().addingTimeInterval(1),
+                sequenceNumber: i,
+                createdAt: Date()
+            )
+            try await repo.saveSegment(segment)
+            await coordinator.onSegmentSaved(sessionId: session.id)
+        }
+
+        let summaries = try await repo.summaries(for: session.id)
+        let callCount = await summarizer.summarizeCallCount
+
+        // Should trigger due to time threshold being met with 3+ segments
+        #expect(summaries.count == 1)
+        #expect(callCount == 1)
     }
 }

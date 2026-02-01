@@ -24,6 +24,11 @@ actor MockSummarizationService: SummarizationService {
         return summaryToReturn
     }
 
+    func generateMeetingNotes(segments: [StoredSegment], previousNotes: String?) async throws -> String {
+        if let error = shouldThrow { throw error }
+        return "Mock meeting notes"
+    }
+
     func setAvailable(_ value: Bool) {
         available = value
     }

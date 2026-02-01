@@ -8,14 +8,23 @@ public protocol SummarizationService: Sendable {
     /// Whether the summarization model is currently available.
     var isAvailable: Bool { get async }
 
-    /// Summarize a set of transcript segments.
+    /// Generate a brief summary of transcript segments.
     ///
     /// - Parameters:
     ///   - segments: The segments to summarize.
     ///   - previousSummary: Optional previous summary for context.
-    /// - Returns: The generated summary text.
+    /// - Returns: The generated summary text (brief, ~50 tokens).
     /// - Throws: `SummarizationError` if summarization fails.
     func summarize(segments: [StoredSegment], previousSummary: String?) async throws -> String
+
+    /// Generate detailed meeting notes with bullets, action items, and key takeaways.
+    ///
+    /// - Parameters:
+    ///   - segments: The segments to analyze.
+    ///   - previousNotes: Optional previous notes for context.
+    /// - Returns: Formatted meeting notes with sections.
+    /// - Throws: `SummarizationError` if generation fails.
+    func generateMeetingNotes(segments: [StoredSegment], previousNotes: String?) async throws -> String
 }
 
 /// Errors that can occur during summarization.
@@ -24,4 +33,8 @@ public enum SummarizationError: Error, Equatable {
     case modelNotAvailable
     /// Generation failed with the specified reason.
     case generationFailed(String)
+    /// Network request failed.
+    case networkError(String)
+    /// API returned an error response.
+    case apiError(Int, String)
 }

@@ -1,6 +1,52 @@
 import Foundation
 import FoundationModels
 
+private func logModel(_ message: String) {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss.SSS"
+    let timestamp = formatter.string(from: Date())
+    let logMessage = "[\(timestamp)] [Model] \(message)\n"
+
+    let logFile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".steno.log")
+
+    if let data = logMessage.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logFile.path) {
+            if let handle = try? FileHandle(forWritingTo: logFile) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                handle.closeFile()
+            }
+        } else {
+            try? data.write(to: logFile)
+        }
+    }
+}
+
+/// Describes why the summarization model is unavailable.
+public enum ModelUnavailableReason: Sendable, Equatable {
+    case available
+    case appleIntelligenceNotEnabled
+    case deviceNotSupported
+    case modelNotReady
+    case other(String)
+
+    public var userMessage: String? {
+        switch self {
+        case .available:
+            return nil
+        case .appleIntelligenceNotEnabled:
+            return "Enable Apple Intelligence in System Settings → Apple Intelligence & Siri"
+        case .deviceNotSupported:
+            return "Apple Intelligence requires M1 chip or later"
+        case .modelNotReady:
+            return "AI model downloading... Summaries will appear once ready."
+        case .other(let reason):
+            return "AI unavailable: \(reason)"
+        }
+    }
+}
+
 /// Summarization service using Apple's Foundation Models (on-device LLM).
 ///
 /// This service uses the system's built-in language model available on
@@ -16,9 +62,35 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
 
     public var isAvailable: Bool {
         get async {
+            let reason = await availabilityReason
+            return reason == .available
+        }
+    }
+
+    /// Returns the detailed reason for model availability status.
+    public var availabilityReason: ModelUnavailableReason {
+        get async {
             let model = SystemLanguageModel.default
-            if case .available = model.availability { return true }
-            return false
+            let availability = model.availability
+            logModel("Availability: \(availability)")
+
+            switch availability {
+            case .available:
+                return .available
+            case .unavailable(let reason):
+                let reasonString = String(describing: reason)
+                if reasonString.contains("appleIntelligenceNotEnabled") {
+                    return .appleIntelligenceNotEnabled
+                } else if reasonString.contains("deviceNotSupported") {
+                    return .deviceNotSupported
+                } else if reasonString.contains("modelNotReady") {
+                    return .modelNotReady
+                } else {
+                    return .other(reasonString)
+                }
+            @unknown default:
+                return .other("Unknown availability status")
+            }
         }
     }
 
@@ -39,6 +111,48 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
         let options = GenerationOptions(
             sampling: .greedy,
             maximumResponseTokens: 150
+        )
+
+        let response = try await session.respond(to: prompt, options: options)
+        return response.content
+    }
+
+    private let meetingNotesPrompt = """
+        You are a meeting notes assistant. Analyze the transcript and create structured notes.
+        Format your response with these sections (use bullet points):
+
+        KEY POINTS:
+        • Main topics discussed
+
+        ACTION ITEMS:
+        • Tasks mentioned (include who if specified)
+
+        DECISIONS:
+        • Any decisions made
+
+        QUESTIONS/FOLLOW-UPS:
+        • Open questions or items needing follow-up
+
+        Keep each bullet concise (under 15 words). Skip sections if not applicable.
+        """
+
+    public func generateMeetingNotes(segments: [StoredSegment], previousNotes: String?) async throws -> String {
+        guard await isAvailable else {
+            throw SummarizationError.modelNotAvailable
+        }
+
+        let session = LanguageModelSession { meetingNotesPrompt }
+
+        var prompt = ""
+        if let previous = previousNotes {
+            prompt += "Previous notes to update/expand:\n\(previous)\n\n"
+        }
+        prompt += "Transcript:\n\n"
+        prompt += segments.map(\.text).joined(separator: " ")
+
+        let options = GenerationOptions(
+            sampling: .greedy,
+            maximumResponseTokens: 500
         )
 
         let response = try await session.respond(to: prompt, options: options)

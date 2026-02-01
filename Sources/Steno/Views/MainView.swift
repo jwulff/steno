@@ -6,6 +6,31 @@ import GRDB
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
 
+/// Get terminal dimensions using ioctl
+func getTerminalHeight() -> Int {
+    var windowSize = winsize()
+    if ioctl(STDOUT_FILENO, TIOCGWINSZ, &windowSize) == 0 {
+        return Int(windowSize.ws_row)
+    }
+    // Fallback to environment variable or default
+    if let lines = ProcessInfo.processInfo.environment["LINES"], let height = Int(lines) {
+        return height
+    }
+    return 24  // Default terminal height
+}
+
+func getTerminalWidth() -> Int {
+    var windowSize = winsize()
+    if ioctl(STDOUT_FILENO, TIOCGWINSZ, &windowSize) == 0 {
+        return Int(windowSize.ws_col)
+    }
+    // Fallback to environment variable or default
+    if let cols = ProcessInfo.processInfo.environment["COLUMNS"], let width = Int(cols) {
+        return width
+    }
+    return 80  // Default terminal width
+}
+
 /// Represents an audio input device
 struct AudioInputDevice: Identifiable {
     let id: AudioDeviceID
@@ -213,11 +238,26 @@ class ViewState: ObservableObject, @unchecked Sendable {
     @Published var isDownloadingModel: Bool = false
     @Published var downloadProgress: Double = 0
 
-    // Scroll state
-    @Published var scrollOffset: Int = 0
-    @Published var isLiveMode: Bool = true
-    let visibleLines: Int = 15
-    let lineWidth: Int = 58  // Characters per line (leaving room for timestamp)
+    // Transcript scroll state
+    @Published var transcriptScrollOffset: Int = 0
+    @Published var transcriptIsLiveMode: Bool = true
+    let transcriptLineWidth: Int = 38  // Narrower transcript (leaving room for timestamp)
+
+    // LLM panel scroll state
+    @Published var llmScrollOffset: Int = 0
+    @Published var llmIsLiveMode: Bool = true
+    let llmLineWidth: Int = 50  // LLM output width
+
+    // Dynamic visible lines based on terminal size
+    var visibleLines: Int {
+        let terminalHeight = getTerminalHeight()
+        // Reserve lines for: header(3) + status(2) + dividers(2) + controls(2) + padding(2)
+        let reservedLines = 11
+        return max(10, terminalHeight - reservedLines)
+    }
+
+    var transcriptVisibleLines: Int { visibleLines }
+    var llmVisibleLines: Int { visibleLines }
 
     // Timing for partial text display
     @Published var partialTimestamp: Date = Date()
@@ -225,11 +265,38 @@ class ViewState: ObservableObject, @unchecked Sendable {
     // Storage components
     private var repository: SQLiteTranscriptRepository?
     private var summaryCoordinator: RollingSummaryCoordinator?
+    private var localSummarizer: FoundationModelSummarizationService?
+    private var remoteSummarizer: AnthropicSummarizationService?
     private var currentSession: Session?
     private var currentSequenceNumber: Int = 0
 
     // Summary display
-    @Published var latestSummaryText: String?
+    @Published var latestSummaryText: String?        // Brief summary (top right)
+    @Published var detailedMeetingNotes: String?     // Detailed notes with bullets (bottom right)
+    @Published var modelStatusMessage: String?
+
+    // Token usage tracking (Anthropic only)
+    @Published var totalTokensUsed: Int = 0
+
+    // Model processing indicator
+    @Published var isModelProcessing: Bool = false
+
+    // Settings
+    @Published var settings: StenoSettings = StenoSettings.load()
+    @Published var isShowingSettings: Bool = false
+    @Published var apiKeyInput: String = ""
+    @Published var selectedModelIndex: Int = 0
+    @Published var isLoadingModels: Bool = false
+
+    // Available Claude models (dynamically fetched)
+    @Published var claudeModels: [ClaudeModel] = ViewState.fallbackModels
+
+    // Fallback models if API fetch fails
+    static let fallbackModels: [ClaudeModel] = [
+        ClaudeModel(id: "claude-3-5-haiku-20241022", displayName: "Claude 3.5 Haiku", createdAt: nil),
+        ClaudeModel(id: "claude-3-5-sonnet-20241022", displayName: "Claude 3.5 Sonnet", createdAt: nil),
+        ClaudeModel(id: "claude-3-opus-20240229", displayName: "Claude 3 Opus", createdAt: nil),
+    ]
 
     // SpeechAnalyzer components (macOS 26+)
     private var transcriber: SpeechTranscriber?
@@ -256,7 +323,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
 
         for entry in entries {
             let prefix = "[\(entry.formattedTime)] "
-            let wrappedLines = wrapText(entry.text, width: lineWidth - prefix.count)
+            let wrappedLines = wrapText(entry.text, width: transcriptLineWidth - prefix.count)
 
             for (i, line) in wrappedLines.enumerated() {
                 if i == 0 {
@@ -273,7 +340,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
             formatter.dateFormat = "HH:mm:ss"
             let timeStr = formatter.string(from: partialTimestamp)
             let prefix = "[\(timeStr)] "
-            let wrappedLines = wrapText(partialText, width: lineWidth - prefix.count)
+            let wrappedLines = wrapText(partialText, width: transcriptLineWidth - prefix.count)
             for (i, line) in wrappedLines.enumerated() {
                 if i == 0 {
                     lines.append(prefix + line + " ▌")  // Show cursor to indicate in-progress
@@ -293,83 +360,206 @@ class ViewState: ObservableObject, @unchecked Sendable {
 
         let totalLines = allLines.count
 
-        if isLiveMode {
+        if transcriptIsLiveMode {
             // Show last N lines
-            let start = max(0, totalLines - visibleLines)
+            let start = max(0, totalLines - transcriptVisibleLines)
             return Array(allLines[start..<totalLines])
         } else {
             // Show from scroll offset
-            let start = max(0, min(scrollOffset, totalLines - visibleLines))
-            let end = min(start + visibleLines, totalLines)
+            let start = max(0, min(transcriptScrollOffset, totalLines - transcriptVisibleLines))
+            let end = min(start + transcriptVisibleLines, totalLines)
             return Array(allLines[start..<end])
         }
     }
 
-    var canScrollUp: Bool {
-        !isLiveMode && scrollOffset > 0
+    /// Get wrapped LLM content lines for display
+    var llmDisplayLines: [String] {
+        var lines: [String] = []
+
+        // Add summary
+        if let summary = latestSummaryText {
+            lines.append("── SUMMARY ──")
+            lines.append(contentsOf: wrapText(summary, width: llmLineWidth))
+            lines.append("")
+        }
+
+        // Add meeting notes
+        if let notes = detailedMeetingNotes {
+            lines.append("── MEETING NOTES ──")
+            lines.append(contentsOf: wrapText(notes, width: llmLineWidth))
+        }
+
+        return lines
     }
 
-    var canScrollDown: Bool {
+    /// Get the LLM lines currently visible based on scroll position
+    var visibleLLMLines: [String] {
+        let allLines = llmDisplayLines
+        guard !allLines.isEmpty else { return [] }
+
+        let totalLines = allLines.count
+
+        if llmIsLiveMode {
+            // Show from beginning in live mode (LLM content reads top-down)
+            let end = min(llmVisibleLines, totalLines)
+            return Array(allLines[0..<end])
+        } else {
+            // Show from scroll offset
+            let start = max(0, min(llmScrollOffset, totalLines - llmVisibleLines))
+            let end = min(start + llmVisibleLines, totalLines)
+            return Array(allLines[start..<end])
+        }
+    }
+
+    var canTranscriptScrollUp: Bool {
+        !transcriptIsLiveMode && transcriptScrollOffset > 0
+    }
+
+    var canTranscriptScrollDown: Bool {
         let totalLines = displayLines.count
-        return !isLiveMode && scrollOffset < totalLines - visibleLines
+        return !transcriptIsLiveMode && transcriptScrollOffset < totalLines - transcriptVisibleLines
+    }
+
+    var canLLMScrollUp: Bool {
+        !llmIsLiveMode && llmScrollOffset > 0
+    }
+
+    var canLLMScrollDown: Bool {
+        let totalLines = llmDisplayLines.count
+        return !llmIsLiveMode && llmScrollOffset < totalLines - llmVisibleLines
     }
 
     private func wrapText(_ text: String, width: Int) -> [String] {
         guard width > 0 else { return [text] }
 
         var lines: [String] = []
-        var currentLine = ""
 
-        let words = text.split(separator: " ", omittingEmptySubsequences: false)
+        // Split by newlines first to preserve line breaks
+        let paragraphs = text.split(separator: "\n", omittingEmptySubsequences: false)
 
-        for word in words {
-            let wordStr = String(word)
-            if currentLine.isEmpty {
-                currentLine = wordStr
-            } else if currentLine.count + 1 + wordStr.count <= width {
-                currentLine += " " + wordStr
-            } else {
-                lines.append(currentLine)
-                currentLine = wordStr
+        for paragraph in paragraphs {
+            var currentLine = ""
+            let words = paragraph.split(separator: " ", omittingEmptySubsequences: false)
+
+            for word in words {
+                let wordStr = String(word)
+                if currentLine.isEmpty {
+                    currentLine = wordStr
+                } else if currentLine.count + 1 + wordStr.count <= width {
+                    currentLine += " " + wordStr
+                } else {
+                    lines.append(currentLine)
+                    currentLine = wordStr
+                }
             }
-        }
 
-        if !currentLine.isEmpty {
-            lines.append(currentLine)
+            if !currentLine.isEmpty {
+                lines.append(currentLine)
+            } else {
+                lines.append("")  // Preserve empty lines
+            }
         }
 
         return lines.isEmpty ? [""] : lines
     }
 
-    func scrollUp() {
-        if isLiveMode {
-            isLiveMode = false
-            scrollOffset = max(0, displayLines.count - visibleLines - 1)
-        } else if scrollOffset > 0 {
-            scrollOffset -= 1
+    // Transcript scroll controls
+    func transcriptScrollUp() {
+        if transcriptIsLiveMode {
+            transcriptIsLiveMode = false
+            transcriptScrollOffset = max(0, displayLines.count - transcriptVisibleLines - 1)
+        } else if transcriptScrollOffset > 0 {
+            transcriptScrollOffset -= 1
         }
     }
 
-    func scrollDown() {
-        guard !isLiveMode else { return }
-        let maxOffset = max(0, displayLines.count - visibleLines)
-        if scrollOffset < maxOffset {
-            scrollOffset += 1
+    func transcriptScrollDown() {
+        guard !transcriptIsLiveMode else { return }
+        let maxOffset = max(0, displayLines.count - transcriptVisibleLines)
+        if transcriptScrollOffset < maxOffset {
+            transcriptScrollOffset += 1
         }
-        // Jump back to live if at bottom
-        if scrollOffset >= maxOffset {
-            jumpToLive()
+        if transcriptScrollOffset >= maxOffset {
+            transcriptJumpToLive()
         }
     }
 
-    func jumpToLive() {
-        isLiveMode = true
-        scrollOffset = 0
+    func transcriptJumpToLive() {
+        transcriptIsLiveMode = true
+        transcriptScrollOffset = 0
+    }
+
+    // LLM scroll controls
+    func llmScrollUp() {
+        if llmIsLiveMode {
+            llmIsLiveMode = false
+            llmScrollOffset = 0  // Start at top when leaving live mode
+        } else if llmScrollOffset > 0 {
+            llmScrollOffset -= 1
+        }
+    }
+
+    func llmScrollDown() {
+        guard !llmIsLiveMode else { return }
+        let maxOffset = max(0, llmDisplayLines.count - llmVisibleLines)
+        if llmScrollOffset < maxOffset {
+            llmScrollOffset += 1
+        }
+    }
+
+    func llmJumpToLive() {
+        llmIsLiveMode = true
+        llmScrollOffset = 0
     }
 
     init() {
         refreshDevices()
         initializeStorage()
+        // Fetch available models if we have an API key
+        if settings.effectiveAnthropicAPIKey != nil {
+            fetchModels()
+        }
+        // Register global keyboard shortcuts
+        registerKeyboardShortcuts()
+        // Auto-start transcription on boot
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.startListening()
+        }
+    }
+
+    private func registerKeyboardShortcuts() {
+        // Space = toggle start/stop
+        Application.globalKeyHandlers[" "] = { [weak self] in
+            self?.toggleListening()
+        }
+        // s/S = settings
+        Application.globalKeyHandlers["s"] = { [weak self] in
+            self?.openSettings()
+        }
+        Application.globalKeyHandlers["S"] = { [weak self] in
+            self?.openSettings()
+        }
+        // q/Q = quit
+        Application.globalKeyHandlers["q"] = {
+            Darwin.exit(0)
+        }
+        Application.globalKeyHandlers["Q"] = {
+            Darwin.exit(0)
+        }
+        // i/I = cycle input device
+        Application.globalKeyHandlers["i"] = { [weak self] in
+            self?.selectNextDevice()
+        }
+        Application.globalKeyHandlers["I"] = { [weak self] in
+            self?.selectNextDevice()
+        }
+        // m/M = cycle model
+        Application.globalKeyHandlers["m"] = { [weak self] in
+            self?.selectNextModel()
+        }
+        Application.globalKeyHandlers["M"] = { [weak self] in
+            self?.selectNextModel()
+        }
     }
 
     private func initializeStorage() {
@@ -378,17 +568,212 @@ class ViewState: ObservableObject, @unchecked Sendable {
             repository = SQLiteTranscriptRepository(dbQueue: dbQueue)
             log("Database initialized at: \(DatabaseConfiguration.defaultURL.path)")
 
-            let summarizer = FoundationModelSummarizationService()
-            summaryCoordinator = RollingSummaryCoordinator(
-                repository: repository!,
-                summarizer: summarizer,
-                triggerCount: 10
-            )
-            log("Storage and summarization initialized")
+            // Initialize both summarizers
+            localSummarizer = FoundationModelSummarizationService()
+            if let apiKey = settings.effectiveAnthropicAPIKey, !apiKey.isEmpty {
+                remoteSummarizer = AnthropicSummarizationService(
+                    apiKey: apiKey,
+                    model: settings.anthropicModel,
+                    onTokenUsage: { [weak self] usage in
+                        DispatchQueue.main.async {
+                            self?.totalTokensUsed += usage.totalTokens
+                        }
+                    }
+                )
+            }
+
+            // Create coordinator with active summarizer
+            updateSummaryCoordinator()
+            log("Storage and summarization initialized (provider: \(settings.summarizationProvider.displayName))")
+
+            // Check model availability asynchronously
+            updateModelStatus()
         } catch {
             log("Failed to initialize storage: \(error)")
             // App continues without persistence
         }
+    }
+
+    private func updateSummaryCoordinator() {
+        guard let repository else { return }
+
+        let activeSummarizer: SummarizationService
+        switch settings.summarizationProvider {
+        case .local:
+            activeSummarizer = localSummarizer ?? FoundationModelSummarizationService()
+        case .anthropic:
+            if let remote = remoteSummarizer {
+                activeSummarizer = remote
+            } else {
+                // No API key configured
+                activeSummarizer = localSummarizer ?? FoundationModelSummarizationService()
+            }
+        }
+
+        summaryCoordinator = RollingSummaryCoordinator(
+            repository: repository,
+            summarizer: activeSummarizer,
+            triggerCount: 10
+        )
+    }
+
+    func handleSummaryResult(_ result: SummaryResult) {
+        latestSummaryText = result.briefSummary
+        detailedMeetingNotes = result.meetingNotes
+        log("Summary updated")
+    }
+
+    private func updateModelStatus() {
+        Task {
+            let message: String?
+            switch settings.summarizationProvider {
+            case .local:
+                if let summarizer = localSummarizer {
+                    let reason = await summarizer.availabilityReason
+                    message = reason.userMessage
+                } else {
+                    message = "Local model not initialized"
+                }
+            case .anthropic:
+                if let apiKey = settings.effectiveAnthropicAPIKey, !apiKey.isEmpty {
+                    message = nil  // API key configured, ready to go
+                } else {
+                    message = "Set ANTHROPIC_API_KEY env var or use [Set Key]"
+                }
+            }
+
+            await MainActor.run {
+                self.modelStatusMessage = message
+                if let msg = message {
+                    self.log("Model status: \(msg)")
+                } else {
+                    self.log("AI model available (\(self.settings.summarizationProvider.displayName))")
+                }
+            }
+        }
+    }
+
+    // MARK: - Settings Screen
+
+    func openSettings() {
+        // Find current model index
+        if let index = claudeModels.firstIndex(where: { $0.id == settings.anthropicModel }) {
+            selectedModelIndex = index
+        } else {
+            selectedModelIndex = 0
+        }
+        apiKeyInput = settings.anthropicAPIKey ?? ""
+        isShowingSettings = true
+
+        // Fetch latest models if we have an API key
+        if settings.effectiveAnthropicAPIKey != nil {
+            fetchModels()
+        }
+    }
+
+    func closeSettings() {
+        isShowingSettings = false
+    }
+
+    func selectProvider(_ provider: SummarizationProvider) {
+        var updatedSettings = settings
+        updatedSettings.summarizationProvider = provider
+        settings = updatedSettings  // Explicit reassign to trigger @Published
+        try? settings.save()
+        updateSummaryCoordinator()
+        updateModelStatus()
+        log("Switched to provider: \(provider.displayName)")
+    }
+
+    func selectNextModel() {
+        guard !claudeModels.isEmpty else { return }
+        selectedModelIndex = (selectedModelIndex + 1) % claudeModels.count
+        var updatedSettings = settings
+        updatedSettings.anthropicModel = claudeModels[selectedModelIndex].id
+        settings = updatedSettings  // Explicit reassign to trigger @Published
+        try? settings.save()
+        recreateRemoteSummarizer()
+        log("Selected model: \(claudeModels[selectedModelIndex].displayName)")
+    }
+
+    func selectPreviousModel() {
+        guard !claudeModels.isEmpty else { return }
+        selectedModelIndex = (selectedModelIndex - 1 + claudeModels.count) % claudeModels.count
+        var updatedSettings = settings
+        updatedSettings.anthropicModel = claudeModels[selectedModelIndex].id
+        settings = updatedSettings  // Explicit reassign to trigger @Published
+        try? settings.save()
+        recreateRemoteSummarizer()
+        log("Selected model: \(claudeModels[selectedModelIndex].displayName)")
+    }
+
+    func fetchModels() {
+        guard let apiKey = settings.effectiveAnthropicAPIKey, !apiKey.isEmpty else {
+            log("No API key, using fallback models")
+            return
+        }
+
+        isLoadingModels = true
+        Task {
+            do {
+                let models = try await fetchAvailableModels(apiKey: apiKey)
+                await MainActor.run {
+                    // Filter to only include chat models (exclude embedding models, etc.)
+                    self.claudeModels = models.filter { model in
+                        model.id.contains("claude")
+                    }
+                    // Update selected index if current model is in the list
+                    if let index = self.claudeModels.firstIndex(where: { $0.id == self.settings.anthropicModel }) {
+                        self.selectedModelIndex = index
+                    } else if !self.claudeModels.isEmpty {
+                        self.selectedModelIndex = 0
+                        // Update settings to use first available model
+                        var updatedSettings = self.settings
+                        updatedSettings.anthropicModel = self.claudeModels[0].id
+                        self.settings = updatedSettings
+                        try? self.settings.save()
+                    }
+                    self.isLoadingModels = false
+                    self.log("Fetched \(self.claudeModels.count) models from API")
+                }
+            } catch {
+                await MainActor.run {
+                    self.isLoadingModels = false
+                    self.log("Failed to fetch models: \(error)")
+                }
+            }
+        }
+    }
+
+    func saveAPIKey() {
+        var updatedSettings = settings
+        updatedSettings.anthropicAPIKey = apiKeyInput.isEmpty ? nil : apiKeyInput
+        settings = updatedSettings  // Explicit reassign to trigger @Published
+        try? settings.save()
+        recreateRemoteSummarizer()
+        updateModelStatus()
+        // Fetch latest models with new API key
+        if !apiKeyInput.isEmpty {
+            fetchModels()
+        }
+        log("API key saved")
+    }
+
+    private func recreateRemoteSummarizer() {
+        if let apiKey = settings.effectiveAnthropicAPIKey, !apiKey.isEmpty {
+            remoteSummarizer = AnthropicSummarizationService(
+                apiKey: apiKey,
+                model: settings.anthropicModel,
+                onTokenUsage: { [weak self] usage in
+                    DispatchQueue.main.async {
+                        self?.totalTokensUsed += usage.totalTokens
+                    }
+                }
+            )
+        } else {
+            remoteSummarizer = nil
+        }
+        updateSummaryCoordinator()
     }
 
     func refreshDevices() {
@@ -616,13 +1001,16 @@ class ViewState: ObservableObject, @unchecked Sendable {
 
                                                 // Trigger rolling summary check
                                                 if let coordinator = self.summaryCoordinator {
-                                                    await coordinator.onSegmentSaved(sessionId: session.id)
-
-                                                    // Fetch latest summary to display
-                                                    if let summary = try await repository.latestSummary(for: session.id) {
-                                                        await MainActor.run {
-                                                            self.latestSummaryText = summary.content
-                                                            self.log("Summary updated: \(summary.content.prefix(50))...")
+                                                    await MainActor.run {
+                                                        self.isModelProcessing = true
+                                                    }
+                                                    let result = await coordinator.onSegmentSaved(sessionId: session.id)
+                                                    await MainActor.run {
+                                                        self.isModelProcessing = false
+                                                        if let result = result {
+                                                            self.latestSummaryText = result.briefSummary
+                                                            self.detailedMeetingNotes = result.meetingNotes
+                                                            self.log("Summary updated: \(result.briefSummary.prefix(50))...")
                                                         }
                                                     }
                                                 }
@@ -638,8 +1026,8 @@ class ViewState: ObservableObject, @unchecked Sendable {
                                 self.partialText = ""
                                 self.partialTimestamp = Date()
 
-                                if self.isLiveMode {
-                                    self.scrollOffset = 0
+                                if self.transcriptIsLiveMode {
+                                    self.transcriptScrollOffset = 0
                                 }
                             } else {
                                 // Volatile/partial result - show as in-progress
@@ -775,10 +1163,15 @@ class ViewState: ObservableObject, @unchecked Sendable {
         partialText = ""
         errorMessage = nil
         statusMessage = "Ready"
-        scrollOffset = 0
-        isLiveMode = true
+        transcriptScrollOffset = 0
+        transcriptIsLiveMode = true
+        llmScrollOffset = 0
+        llmIsLiveMode = true
         partialTimestamp = Date()
         latestSummaryText = nil
+        detailedMeetingNotes = nil
+        totalTokensUsed = 0
+        isModelProcessing = false
     }
 
     func log(_ message: String) {
@@ -810,107 +1203,207 @@ struct MainView: View {
 
     var body: some View {
         VStack(alignment: .leading) {
-            // Header
-            HStack {
-                Text("Steno")
-                    .bold()
-                Text("- Speech to Text (SpeechAnalyzer)")
-                    .foregroundColor(.gray)
-            }
-
-            // Microphone selector
-            HStack {
-                Text("Mic:")
-                    .foregroundColor(.gray)
-                Button("[ < ]") {
-                    state.selectPreviousDevice()
-                }
-                Text(truncateName(state.selectedDevice?.name ?? "No devices", max: 30))
-                    .foregroundColor(.cyan)
-                Button("[ > ]") {
-                    state.selectNextDevice()
-                }
-            }
-
-            // Status line with level meter
-            HStack {
-                if state.isListening {
-                    Text("●")
-                        .foregroundColor(.red)
-                } else if state.isDownloadingModel {
-                    Text("↓")
-                        .foregroundColor(.yellow)
-                } else {
-                    Text("○")
-                        .foregroundColor(.gray)
-                }
-                Text(state.statusMessage)
-                    .foregroundColor(state.isListening ? .green : (state.isDownloadingModel ? .yellow : .gray))
-
-                if state.isListening {
-                    Text(" |")
-                        .foregroundColor(.gray)
-                    let levelBars = min(20, Int(state.audioLevel * 100))
-                    Text(String(repeating: "█", count: levelBars) + String(repeating: "░", count: 20 - levelBars))
-                        .foregroundColor(levelBars > 10 ? .green : (levelBars > 5 ? .yellow : .gray))
-                }
-            }
-
-            // Scroll indicator
-            HStack {
-                if state.isLiveMode {
-                    Text("LIVE")
-                        .foregroundColor(.green)
+            // Header + Settings Group
+            Group {
+                // Header
+                HStack {
+                    Text("Steno")
                         .bold()
-                } else {
-                    Text("PAUSED - ↑↓ scroll")
-                        .foregroundColor(.yellow)
-                    Button("[ LIVE ]") {
-                        state.jumpToLive()
+                    Text("- Speech to Text (SpeechAnalyzer)")
+                        .foregroundColor(.gray)
+                }
+
+                // Microphone selector
+                HStack {
+                    Text("Mic:")
+                        .foregroundColor(.gray)
+                    Button("[ < ]") {
+                        state.selectPreviousDevice()
+                    }
+                    Text(truncateName(state.selectedDevice?.name ?? "No devices", max: 30))
+                        .foregroundColor(.cyan)
+                    Button("[ > ]") {
+                        state.selectNextDevice()
+                    }
+                }
+
+                // AI status line
+                HStack {
+                    Text("AI:")
+                        .foregroundColor(.gray)
+                    Text(state.settings.summarizationProvider.displayName)
+                        .foregroundColor(.magenta)
+
+                    if state.settings.summarizationProvider == .anthropic {
+                        Text("│")
+                            .foregroundColor(.gray)
+                        if state.isModelProcessing {
+                            Text("⟳")
+                                .foregroundColor(.yellow)
+                        }
+                        Text(formatModelName(state.settings.anthropicModel))
+                            .foregroundColor(state.isModelProcessing ? .yellow : .gray)
+                        if state.totalTokensUsed > 0 {
+                            Text("\(formatTokenCount(state.totalTokensUsed))")
+                                .foregroundColor(.cyan)
+                        }
+                        if state.settings.effectiveAnthropicAPIKey != nil {
+                            Text("✓")
+                                .foregroundColor(.green)
+                        } else {
+                            Text("⚠ no key")
+                                .foregroundColor(.red)
+                        }
+                    }
+
+                    Text("│")
+                        .foregroundColor(.gray)
+                    Button("[ Settings ]") {
+                        state.openSettings()
                     }
                 }
             }
 
-            // AI Summary section + Divider
+            // Settings Screen (modal)
+            if state.isShowingSettings {
+                settingsScreen
+            }
+
+            // Status + Scroll Group
             Group {
-                if let summary = state.latestSummaryText {
-                    Text(String(repeating: "─", count: 60))
-                        .foregroundColor(.gray)
-                    HStack {
-                        Text("AI Summary")
-                            .foregroundColor(.magenta)
-                            .bold()
-                        Text("(\(state.segments.count) segments)")
+                // Status line with level meter
+                HStack {
+                    if state.isListening {
+                        Text("●")
+                            .foregroundColor(.red)
+                    } else if state.isDownloadingModel {
+                        Text("↓")
+                            .foregroundColor(.yellow)
+                    } else {
+                        Text("○")
                             .foregroundColor(.gray)
                     }
-                    Text(summary)
-                        .foregroundColor(.white)
-                }
+                    Text(state.statusMessage)
+                        .foregroundColor(state.isListening ? .green : (state.isDownloadingModel ? .yellow : .gray))
 
-                // Divider
-                Text(String(repeating: "─", count: 60))
-                    .foregroundColor(.gray)
-            }
-
-            // Transcript log view (expands to fill available space)
-            VStack(alignment: .leading) {
-                if state.entries.isEmpty && state.partialText.isEmpty {
-                    Text("Press [Start] to begin transcription...")
-                        .foregroundColor(.gray)
-                        .italic()
-                } else {
-                    let lines = state.visibleDisplayLines
-                    ForEach(0..<lines.count, id: \.self) { i in
-                        Text(lines[i])
-                            .foregroundColor(lines[i].hasSuffix(" ▌") ? .yellow : .white)
+                    if state.isListening {
+                        Text(" |")
+                            .foregroundColor(.gray)
+                        let levelBars = min(20, Int(state.audioLevel * 100))
+                        Text(String(repeating: "█", count: levelBars) + String(repeating: "░", count: 20 - levelBars))
+                            .foregroundColor(levelBars > 10 ? .green : (levelBars > 5 ? .yellow : .gray))
                     }
                 }
-                Spacer()
+
+            }
+
+            // Main content area - split screen
+            Text(String(repeating: "─", count: 120))
+                .foregroundColor(.gray)
+
+            HStack(alignment: .top) {
+                // LEFT PANEL: Transcript (narrower)
+                VStack(alignment: .leading) {
+                    // Transcript header with scroll controls
+                    HStack {
+                        Text("TRANSCRIPT")
+                            .foregroundColor(.cyan)
+                            .bold()
+                        if state.transcriptIsLiveMode {
+                            Text("LIVE")
+                                .foregroundColor(.green)
+                        } else {
+                            Text("SCROLL")
+                                .foregroundColor(.yellow)
+                        }
+                        Spacer()
+                        Button("[↑]") { state.transcriptScrollUp() }
+                        Button("[↓]") { state.transcriptScrollDown() }
+                        if !state.transcriptIsLiveMode {
+                            Button("[L]") { state.transcriptJumpToLive() }
+                        }
+                    }
+
+                    if state.entries.isEmpty && state.partialText.isEmpty {
+                        Text("Starting transcription...")
+                            .foregroundColor(.gray)
+                            .italic()
+                    } else {
+                        let lines = state.visibleDisplayLines
+                        ForEach(0..<lines.count, id: \.self) { i in
+                            Text(lines[i])
+                                .foregroundColor(lines[i].hasSuffix(" ▌") ? .yellow : .white)
+                        }
+                    }
+                    Spacer()
+                }
+                .frame(width: 50)
+
+                // Vertical divider
+                Text("│")
+                    .foregroundColor(.gray)
+
+                // RIGHT PANEL: AI Analysis (wider)
+                VStack(alignment: .leading) {
+                    // LLM header with scroll controls
+                    HStack {
+                        Text("AI ANALYSIS")
+                            .foregroundColor(.magenta)
+                            .bold()
+                        if state.isModelProcessing {
+                            Text("⟳ processing...")
+                                .foregroundColor(.yellow)
+                        } else {
+                            Text("(\(state.segments.count))")
+                                .foregroundColor(.gray)
+                        }
+                        Spacer()
+                        Button("[↑]") { state.llmScrollUp() }
+                        Button("[↓]") { state.llmScrollDown() }
+                        if !state.llmIsLiveMode {
+                            Button("[L]") { state.llmJumpToLive() }
+                        }
+                    }
+
+                    // Scrollable LLM content
+                    if state.llmDisplayLines.isEmpty {
+                        if let modelMsg = state.modelStatusMessage {
+                            Text("⚠ \(modelMsg)")
+                                .foregroundColor(.yellow)
+                        } else {
+                            Text("Waiting for segments...")
+                                .foregroundColor(.gray)
+                                .italic()
+                        }
+                    } else {
+                        let lines = state.visibleLLMLines
+                        ForEach(0..<lines.count, id: \.self) { i in
+                            let line = lines[i]
+                            if line.starts(with: "──") {
+                                Text(line)
+                                    .foregroundColor(.magenta)
+                                    .bold()
+                            } else if line.starts(with: "•") || line.starts(with: "-") {
+                                Text(line)
+                                    .foregroundColor(.white)
+                            } else if line.starts(with: "KEY") || line.starts(with: "ACTION") || line.starts(with: "DECISION") || line.starts(with: "QUESTION") {
+                                Text(line)
+                                    .foregroundColor(.green)
+                                    .bold()
+                            } else {
+                                Text(line)
+                                    .foregroundColor(.cyan)
+                            }
+                        }
+                    }
+
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxHeight: .infinity)
 
-            // Divider
-            Text(String(repeating: "─", count: 60))
+            Text(String(repeating: "─", count: 120))
                 .foregroundColor(.gray)
 
             // Error display
@@ -924,40 +1417,159 @@ struct MainView: View {
                 }
             }
 
-            // Control buttons
+            // Keyboard shortcuts status line
             HStack {
-                Button(state.isListening ? "[ Stop ]" : "[ Start ]") {
-                    state.toggleListening()
-                }
-
-                Text(" ")
-
-                Button("[ ↑ ]") {
-                    state.scrollUp()
-                }
-
-                Button("[ ↓ ]") {
-                    state.scrollDown()
-                }
-
-                Text(" ")
-
-                Button("[ Clear ]") {
-                    state.clear()
-                }
-
-                Text(" ")
-
-                Button("[ Quit ]") {
-                    Darwin.exit(0)
-                }
+                Text("[Space]")
+                    .foregroundColor(.cyan)
+                Text(state.isListening ? "stop" : "start")
+                    .foregroundColor(.gray)
+                Text("[s]")
+                    .foregroundColor(.cyan)
+                Text("settings")
+                    .foregroundColor(.gray)
+                Text("[i]")
+                    .foregroundColor(.cyan)
+                Text("input")
+                    .foregroundColor(.gray)
+                Text("[m]")
+                    .foregroundColor(.cyan)
+                Text("model")
+                    .foregroundColor(.gray)
+                Text("[q]")
+                    .foregroundColor(.cyan)
+                Text("quit")
+                    .foregroundColor(.gray)
             }
-
-                Text("Tab=navigate | ↑↓=scroll | Log: ~/.steno.log")
-                .foregroundColor(.gray)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(1)
+    }
+
+    // MARK: - Settings Screen
+
+    private var settingsScreen: some View {
+        VStack(alignment: .leading) {
+            // Header
+            Group {
+                Text(String(repeating: "═", count: 60))
+                    .foregroundColor(.cyan)
+                Text("  AI SETTINGS")
+                    .foregroundColor(.cyan)
+                    .bold()
+                Text(String(repeating: "═", count: 60))
+                    .foregroundColor(.cyan)
+                Text("")
+            }
+
+            // Provider selection
+            Group {
+                Text("Provider:")
+                    .foregroundColor(.gray)
+                HStack {
+                    Button(state.settings.summarizationProvider == .local ? "[●] Apple Intelligence" : "[ ] Apple Intelligence") {
+                        state.selectProvider(.local)
+                    }
+                    .foregroundColor(state.settings.summarizationProvider == .local ? .green : .white)
+                }
+                HStack {
+                    Button(state.settings.summarizationProvider == .anthropic ? "[●] Anthropic Claude" : "[ ] Anthropic Claude") {
+                        state.selectProvider(.anthropic)
+                    }
+                    .foregroundColor(state.settings.summarizationProvider == .anthropic ? .green : .white)
+                }
+                Text("")
+            }
+
+            // Anthropic settings (only shown when Anthropic is selected)
+            if state.settings.summarizationProvider == .anthropic {
+                anthropicSettingsSection
+            }
+
+            // Footer
+            Group {
+                Text("")
+                Text(String(repeating: "═", count: 60))
+                    .foregroundColor(.cyan)
+                HStack {
+                    Button("[ Done ]") {
+                        state.closeSettings()
+                    }
+                    .foregroundColor(.green)
+                }
+            }
+        }
+    }
+
+    private var anthropicSettingsSection: some View {
+        Group {
+            Text(String(repeating: "─", count: 50))
+                .foregroundColor(.gray)
+
+            // Model selection
+            Text("Model:")
+                .foregroundColor(.gray)
+            HStack {
+                Button("[ < ]") {
+                    state.selectPreviousModel()
+                }
+                if state.isLoadingModels {
+                    Text("Loading...")
+                        .foregroundColor(.yellow)
+                } else if state.selectedModelIndex < state.claudeModels.count {
+                    Text(state.claudeModels[state.selectedModelIndex].displayName)
+                        .foregroundColor(.magenta)
+                } else {
+                    Text("No models")
+                        .foregroundColor(.red)
+                }
+                Button("[ > ]") {
+                    state.selectNextModel()
+                }
+            }
+
+            Text("")
+
+            // API Key status
+            apiKeySection
+        }
+    }
+
+    private var apiKeySection: some View {
+        Group {
+            Text("API Key:")
+                .foregroundColor(.gray)
+            if let _ = state.settings.effectiveAnthropicAPIKey {
+                if ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil {
+                    Text("  ✓ Using ANTHROPIC_API_KEY env var")
+                        .foregroundColor(.green)
+                } else {
+                    Text("  ✓ Key saved in settings")
+                        .foregroundColor(.green)
+                }
+            } else {
+                Text("  ⚠ No API key configured")
+                    .foregroundColor(.red)
+            }
+
+            Text("")
+            Text("Enter key (paste with Cmd+V):")
+                .foregroundColor(.gray)
+            HStack {
+                Text("  ")
+                Text(maskAPIKey(state.apiKeyInput))
+                    .foregroundColor(.white)
+                Text("▌")
+                    .foregroundColor(.yellow)
+            }
+            HStack {
+                Button("[ Save Key ]") {
+                    state.saveAPIKey()
+                }
+                Button("[ Clear ]") {
+                    state.apiKeyInput = ""
+                }
+            }
+        }
     }
 
     private func truncateName(_ name: String, max: Int) -> String {
@@ -965,5 +1577,106 @@ struct MainView: View {
             return name
         }
         return String(name.prefix(max - 3)) + "..."
+    }
+
+    private func maskAPIKey(_ key: String) -> String {
+        if key.isEmpty {
+            return "(empty)"
+        } else if key.count <= 8 {
+            return String(repeating: "•", count: key.count)
+        } else {
+            return String(key.prefix(4)) + String(repeating: "•", count: key.count - 8) + String(key.suffix(4))
+        }
+    }
+
+    private func formatTokenCount(_ count: Int) -> String {
+        if count >= 1_000_000 {
+            return String(format: "%.1fM", Double(count) / 1_000_000)
+        } else if count >= 1_000 {
+            return String(format: "%.1fk", Double(count) / 1_000)
+        } else {
+            return "\(count)"
+        }
+    }
+
+    private func formatModelName(_ model: String) -> String {
+        // Extract model family and version from model IDs like:
+        // - "claude-haiku-4-5-20251001" (new format)
+        // - "claude-3-5-haiku-20241022" (old format)
+        // - "claude-sonnet-4-20250514"
+        let modelLower = model.lowercased()
+
+        // Determine model family
+        let family: String
+        if modelLower.contains("haiku") {
+            family = "haiku"
+        } else if modelLower.contains("sonnet") {
+            family = "sonnet"
+        } else if modelLower.contains("opus") {
+            family = "opus"
+        } else {
+            return model.split(separator: "-").last.map(String.init) ?? model
+        }
+
+        // Split and find version numbers (single digits, not 8-digit dates)
+        let parts = model.split(separator: "-").map(String.init)
+        var major: Int?
+        var minor: Int?
+
+        for part in parts {
+            // Skip non-numeric parts and dates (8 digits)
+            guard let num = Int(part), part.count <= 2 else { continue }
+            if major == nil {
+                major = num
+            } else if minor == nil {
+                minor = num
+                break
+            }
+        }
+
+        if let maj = major {
+            if let min = minor {
+                return "\(family)-\(maj).\(min)"
+            }
+            return "\(family)-\(maj)"
+        }
+
+        return family
+    }
+
+    private func wrapSummary(_ text: String) -> [String] {
+        wrapText(text, width: 58)
+    }
+
+    private func wrapText(_ text: String, width: Int) -> [String] {
+        var lines: [String] = []
+
+        // Split by newlines first to preserve line breaks
+        let paragraphs = text.split(separator: "\n", omittingEmptySubsequences: false)
+
+        for paragraph in paragraphs {
+            var currentLine = ""
+            let words = paragraph.split(separator: " ", omittingEmptySubsequences: false)
+
+            for word in words {
+                let wordStr = String(word)
+                if currentLine.isEmpty {
+                    currentLine = wordStr
+                } else if currentLine.count + 1 + wordStr.count <= width {
+                    currentLine += " " + wordStr
+                } else {
+                    lines.append(currentLine)
+                    currentLine = wordStr
+                }
+            }
+
+            if !currentLine.isEmpty {
+                lines.append(currentLine)
+            } else {
+                lines.append("")  // Preserve empty lines
+            }
+        }
+
+        return lines.isEmpty ? [""] : lines
     }
 }
