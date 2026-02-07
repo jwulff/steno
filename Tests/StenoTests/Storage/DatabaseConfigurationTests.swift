@@ -219,6 +219,79 @@ struct DatabaseConfigurationTests {
         }
     }
 
+    @Test func segmentsTableHasSourceColumn() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            let columns = try db.columns(in: "segments")
+            let columnNames = columns.map(\.name)
+
+            #expect(columnNames.contains("source"))
+        }
+    }
+
+    @Test func sourceDefaultsToMicrophone() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        // Insert a session
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: ["test-session", "en_US", Date().timeIntervalSince1970, "active", Date().timeIntervalSince1970]
+            )
+        }
+
+        // Insert a segment WITHOUT specifying source
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["test-segment", "test-session", "hello", Date().timeIntervalSince1970, Date().timeIntervalSince1970, 0, Date().timeIntervalSince1970]
+            )
+        }
+
+        // Verify source defaults to 'microphone'
+        try dbQueue.read { db in
+            let source = try String.fetchOne(db, sql: "SELECT source FROM segments WHERE id = ?", arguments: ["test-segment"])
+            #expect(source == "microphone")
+        }
+    }
+
+    @Test func sourceAcceptsSystemAudio() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: ["test-session", "en_US", Date().timeIntervalSince1970, "active", Date().timeIntervalSince1970]
+            )
+        }
+
+        // Insert a segment with systemAudio source
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["test-segment", "test-session", "hello", Date().timeIntervalSince1970, Date().timeIntervalSince1970, 0, Date().timeIntervalSince1970, "systemAudio"]
+            )
+        }
+
+        try dbQueue.read { db in
+            let source = try String.fetchOne(db, sql: "SELECT source FROM segments WHERE id = ?", arguments: ["test-segment"])
+            #expect(source == "systemAudio")
+        }
+    }
+
     @Test func confidenceRangeConstraint() throws {
         let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
 

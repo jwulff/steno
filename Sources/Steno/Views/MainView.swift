@@ -44,6 +44,14 @@ struct TranscriptEntry: Identifiable {
     let timestamp: Date
     var text: String
     let isFinal: Bool
+    let source: AudioSourceType
+
+    init(timestamp: Date, text: String, isFinal: Bool, source: AudioSourceType = .microphone) {
+        self.timestamp = timestamp
+        self.text = text
+        self.isFinal = isFinal
+        self.source = source
+    }
 
     var formattedTime: String {
         let formatter = DateFormatter()

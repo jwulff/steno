@@ -127,14 +127,14 @@ public enum AudioSourceType: String, Sendable, Codable, Equatable {
 7. Verify all existing tests pass unchanged (defaults mean no call sites break)
 
 **Acceptance Criteria:**
-- [ ] `AudioSource` protocol defined with `start() -> (buffers, format)` and `stop()`
-- [ ] `AudioSourceType` enum in `TranscriptSegment.swift`
-- [ ] `TranscriptSegment`, `StoredSegment`, `TranscriptEntry` all have `source` field with `.microphone` default
-- [ ] All modified `init()` methods have `source: AudioSourceType = .microphone` parameter
-- [ ] DB migration named `"20260207_001_add_segment_source"` adds column with default
-- [ ] Migration regression test: old schema -> migrate -> verify defaults
-- [ ] `MockAudioSource` for testing
-- [ ] All existing tests pass without modification (defaults preserve compat)
+- [x] `AudioSource` protocol defined with `start() -> (buffers, format)` and `stop()`
+- [x] `AudioSourceType` enum in `TranscriptSegment.swift`
+- [x] `TranscriptSegment`, `StoredSegment`, `TranscriptEntry` all have `source` field with `.microphone` default
+- [x] All modified `init()` methods have `source: AudioSourceType = .microphone` parameter
+- [x] DB migration named `"20260207_001_add_segment_source"` adds column with default
+- [x] Migration regression test: old schema -> migrate -> verify defaults
+- [x] `MockAudioSource` for testing
+- [x] All existing tests pass without modification (defaults preserve compat)
 
 ---
 

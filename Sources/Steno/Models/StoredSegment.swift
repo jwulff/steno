@@ -29,6 +29,9 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// When this segment was persisted.
     public let createdAt: Date
 
+    /// The audio source that produced this segment.
+    public let source: AudioSourceType
+
     public init(
         id: UUID = UUID(),
         sessionId: UUID,
@@ -37,7 +40,8 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         endedAt: Date,
         confidence: Float? = nil,
         sequenceNumber: Int,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        source: AudioSourceType = .microphone
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -47,6 +51,7 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.confidence = confidence
         self.sequenceNumber = sequenceNumber
         self.createdAt = createdAt
+        self.source = source
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.
@@ -67,7 +72,8 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
             startedAt: segment.timestamp,
             endedAt: segment.timestamp.addingTimeInterval(segment.duration),
             confidence: segment.confidence,
-            sequenceNumber: sequenceNumber
+            sequenceNumber: sequenceNumber,
+            source: segment.source
         )
     }
 }
