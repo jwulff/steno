@@ -1232,7 +1232,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
             do {
                 let (buffers, format) = try await source.start()
                 await MainActor.run {
-                    self.log("System audio started: \(format.sampleRate)Hz, \(format.channelCount)ch")
+                    self.log("[SYS] Tap format: \(format.sampleRate)Hz, \(format.channelCount)ch, interleaved=\(format.isInterleaved), standard=\(format.isStandard)")
                 }
 
                 // Create second SpeechTranscriber + SpeechAnalyzer

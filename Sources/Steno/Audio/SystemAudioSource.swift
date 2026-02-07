@@ -107,32 +107,41 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
             aggregateDeviceID,
             queue
         ) { _, inInputData, _, _, _ in
-            let bufferList = inInputData.pointee
-            let audioBuffer = bufferList.mBuffers
+            let srcBufferList = UnsafeMutableAudioBufferListPointer(
+                UnsafeMutablePointer(mutating: inInputData)
+            )
+            guard srcBufferList.count > 0, srcBufferList[0].mDataByteSize > 0 else { return }
 
-            guard let srcData = audioBuffer.mData, audioBuffer.mDataByteSize > 0 else { return }
+            // Calculate frame count based on format layout
+            let frameCount: AVAudioFrameCount
+            if capturedFormat.isInterleaved {
+                // Interleaved: single buffer with all channels interleaved
+                frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
+                    / AVAudioFrameCount(MemoryLayout<Float>.stride * Int(capturedFormat.channelCount))
+            } else {
+                // Non-interleaved: each buffer contains one channel's data
+                frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
+                    / AVAudioFrameCount(MemoryLayout<Float>.stride)
+            }
+            guard frameCount > 0 else { return }
 
             // CRITICAL: Copy the audio data. The IOProc buffer is only valid during this callback.
-            let frameCount = audioBuffer.mDataByteSize / UInt32(MemoryLayout<Float>.stride * Int(capturedFormat.channelCount))
-            guard let copiedBuffer = AVAudioPCMBuffer(pcmFormat: capturedFormat, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
-            copiedBuffer.frameLength = AVAudioFrameCount(frameCount)
+            guard let copiedBuffer = AVAudioPCMBuffer(
+                pcmFormat: capturedFormat,
+                frameCapacity: frameCount
+            ) else { return }
+            copiedBuffer.frameLength = frameCount
 
-            // Copy channel data
-            if let srcFloat = srcData.assumingMemoryBound(to: Float.self) as UnsafeMutablePointer<Float>? {
-                let totalSamples = Int(frameCount) * Int(capturedFormat.channelCount)
-                if capturedFormat.isInterleaved {
-                    if let dst = copiedBuffer.floatChannelData?[0] {
-                        dst.update(from: srcFloat, count: totalSamples)
-                    }
-                } else {
-                    // Non-interleaved: copy each channel
-                    let framesPerChannel = Int(frameCount)
-                    for ch in 0..<Int(capturedFormat.channelCount) {
-                        if let dst = copiedBuffer.floatChannelData?[ch] {
-                            dst.update(from: srcFloat.advanced(by: ch * framesPerChannel), count: framesPerChannel)
-                        }
-                    }
-                }
+            // Copy raw audio data from all IOProc buffers into our new buffer
+            let dstBufferList = UnsafeMutableAudioBufferListPointer(copiedBuffer.mutableAudioBufferList)
+            for i in 0..<min(dstBufferList.count, srcBufferList.count) {
+                guard let srcData = srcBufferList[i].mData,
+                      let dstData = dstBufferList[i].mData else { continue }
+                let byteCount = min(
+                    Int(srcBufferList[i].mDataByteSize),
+                    Int(dstBufferList[i].mDataByteSize)
+                )
+                memcpy(dstData, srcData, byteCount)
             }
 
             nonisolated(unsafe) let unsafeBuffer = copiedBuffer
