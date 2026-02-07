@@ -253,15 +253,15 @@ The second recognizer is a parallel `Task` that:
 7. Manual integration test: run during an actual Zoom call
 
 **Acceptance Criteria:**
-- [ ] `[a]` keyboard shortcut toggles system audio capture on/off
-- [ ] `[a]` shown in keyboard shortcuts help bar
-- [ ] Status bar shows `MIC + SYS` or `MIC`
-- [ ] Transcript entries show `[You]` / `[Others]` labels when multi-source active
-- [ ] No labels when session is mic-only (backward-compatible)
-- [ ] Two concurrent partial texts displayed correctly (two separate String properties)
-- [ ] System audio failure does not kill mic transcription
-- [ ] ViewState does not exceed ~1400 lines; if it does, extract audio management into a helper before merging
-- [ ] All tests pass
+- [x] `[a]` keyboard shortcut toggles system audio capture on/off
+- [x] `[a]` shown in keyboard shortcuts help bar
+- [x] Status bar shows `MIC + SYS` or `MIC`
+- [x] Transcript entries show `[You]` / `[Others]` labels when multi-source active
+- [x] No labels when session is mic-only (backward-compatible)
+- [x] Two concurrent partial texts displayed correctly (two separate String properties)
+- [x] System audio failure does not kill mic transcription
+- [x] ViewState does not exceed ~1400 lines; if it does, extract audio management into a helper before merging
+- [x] All tests pass
 
 ---
 

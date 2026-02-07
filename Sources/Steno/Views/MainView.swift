@@ -316,6 +316,16 @@ class ViewState: ObservableObject, @unchecked Sendable {
     private var audioConverter: AVAudioConverter?
     private var audioTapProcessor: AudioTapProcessor?
 
+    // System audio capture components
+    @Published var isSystemAudioEnabled: Bool = false
+    @Published var systemPartialText: String = ""
+    @Published var hasUsedSystemAudio: Bool = false  // true once system audio has been enabled in this session
+    private var systemAudioSource: SystemAudioSource?
+    private var systemRecognizerTask: Task<Void, Never>?
+    private var systemAnalyzer: SpeechAnalyzer?
+    private var systemTranscriber: SpeechTranscriber?
+    private var systemInputBuilder: AsyncStream<AnalyzerInput>.Continuation?
+
     var fullText: String {
         segments.map(\.text).joined(separator: " ")
     }
@@ -330,7 +340,8 @@ class ViewState: ObservableObject, @unchecked Sendable {
         var lines: [String] = []
 
         for entry in entries {
-            let prefix = "[\(entry.formattedTime)] "
+            let sourceLabel = hasUsedSystemAudio ? (entry.source == .microphone ? "[You] " : "[Others] ") : ""
+            let prefix = "[\(entry.formattedTime)] \(sourceLabel)"
             let wrappedLines = wrapText(entry.text, width: transcriptLineWidth - prefix.count)
 
             for (i, line) in wrappedLines.enumerated() {
@@ -342,16 +353,33 @@ class ViewState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Add partial/volatile text if present
+        // Add mic partial/volatile text if present
         if !partialText.isEmpty {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
             let timeStr = formatter.string(from: partialTimestamp)
-            let prefix = "[\(timeStr)] "
+            let sourceLabel = hasUsedSystemAudio ? "[You] " : ""
+            let prefix = "[\(timeStr)] \(sourceLabel)"
             let wrappedLines = wrapText(partialText, width: transcriptLineWidth - prefix.count)
             for (i, line) in wrappedLines.enumerated() {
                 if i == 0 {
                     lines.append(prefix + line + " ▌")  // Show cursor to indicate in-progress
+                } else {
+                    lines.append(String(repeating: " ", count: prefix.count) + line)
+                }
+            }
+        }
+
+        // Add system audio partial text if present
+        if !systemPartialText.isEmpty {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm:ss"
+            let timeStr = formatter.string(from: Date())
+            let prefix = "[\(timeStr)] [Others] "
+            let wrappedLines = wrapText(systemPartialText, width: transcriptLineWidth - prefix.count)
+            for (i, line) in wrappedLines.enumerated() {
+                if i == 0 {
+                    lines.append(prefix + line + " ▌")
                 } else {
                     lines.append(String(repeating: " ", count: prefix.count) + line)
                 }
@@ -567,6 +595,13 @@ class ViewState: ObservableObject, @unchecked Sendable {
         }
         Application.globalKeyHandlers["M"] = { [weak self] in
             self?.selectNextModel()
+        }
+        // a/A = toggle system audio
+        Application.globalKeyHandlers["a"] = { [weak self] in
+            self?.toggleSystemAudio()
+        }
+        Application.globalKeyHandlers["A"] = { [weak self] in
+            self?.toggleSystemAudio()
         }
     }
 
@@ -1153,6 +1188,9 @@ class ViewState: ObservableObject, @unchecked Sendable {
         recognizerTask?.cancel()
         recognizerTask = nil
 
+        // Stop system audio if active
+        stopSystemAudio()
+
         // Clear references
         analyzer = nil
         transcriber = nil
@@ -1165,10 +1203,215 @@ class ViewState: ObservableObject, @unchecked Sendable {
         log("Stopped")
     }
 
+    // MARK: - System Audio
+
+    func toggleSystemAudio() {
+        guard isListening else {
+            log("Cannot toggle system audio: not listening")
+            return
+        }
+
+        if isSystemAudioEnabled {
+            stopSystemAudio()
+        } else {
+            startSystemAudio()
+        }
+    }
+
+    private func startSystemAudio() {
+        log("Starting system audio capture...")
+        hasUsedSystemAudio = true
+
+        let source = SystemAudioSource()
+        self.systemAudioSource = source
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let (buffers, format) = try await source.start()
+                self.log("System audio started: \(format.sampleRate)Hz, \(format.channelCount)ch")
+
+                // Create second SpeechTranscriber + SpeechAnalyzer
+                let locale = Locale.current
+                let sysTranscriber = SpeechTranscriber(
+                    locale: locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [.volatileResults],
+                    attributeOptions: []
+                )
+                let sysAnalyzer = SpeechAnalyzer(modules: [sysTranscriber])
+                let sysAnalyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [sysTranscriber])
+
+                self.systemTranscriber = sysTranscriber
+                self.systemAnalyzer = sysAnalyzer
+
+                // Create async stream for feeding audio to analyzer
+                let (inputSequence, sysInputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+                self.systemInputBuilder = sysInputBuilder
+
+                // Set up converter if formats differ
+                var converter: AVAudioConverter?
+                if let analyzerFmt = sysAnalyzerFormat, format != analyzerFmt {
+                    converter = AVAudioConverter(from: format, to: analyzerFmt)
+                }
+
+                // Create audio processor for system audio buffers
+                let sysProcessor = AudioTapProcessor(
+                    inputBuilder: sysInputBuilder,
+                    converter: converter,
+                    analyzerFormat: sysAnalyzerFormat,
+                    inputSampleRate: format.sampleRate,
+                    onLevel: { _ in },  // No level meter for system audio
+                    onLog: { [weak self] message in
+                        DispatchQueue.main.async {
+                            self?.log("[SYS] \(message)")
+                        }
+                    }
+                )
+
+                // Listen for results from system audio recognizer
+                self.systemRecognizerTask = Task { [weak self] in
+                    do {
+                        for try await result in sysTranscriber.results {
+                            await MainActor.run {
+                                guard let self = self else { return }
+
+                                let text = String(result.text.characters)
+
+                                if result.isFinal {
+                                    self.log("[SYS] FINAL: '\(text)'")
+
+                                    if !text.isEmpty {
+                                        let segment = TranscriptSegment(
+                                            text: text,
+                                            timestamp: Date(),
+                                            duration: 0,
+                                            confidence: nil,
+                                            source: .systemAudio
+                                        )
+                                        self.segments.append(segment)
+
+                                        let entry = TranscriptEntry(
+                                            timestamp: Date(),
+                                            text: text,
+                                            isFinal: true,
+                                            source: .systemAudio
+                                        )
+                                        self.entries.append(entry)
+
+                                        // Persist to database
+                                        if let repository = self.repository, let session = self.currentSession {
+                                            self.currentSequenceNumber += 1
+                                            let storedSegment = StoredSegment.from(
+                                                segment,
+                                                sessionId: session.id,
+                                                sequenceNumber: self.currentSequenceNumber
+                                            )
+                                            Task {
+                                                do {
+                                                    try await repository.saveSegment(storedSegment)
+                                                    self.log("[SYS] Saved segment \(self.currentSequenceNumber)")
+                                                } catch {
+                                                    self.log("[SYS] Failed to save segment: \(error)")
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    self.systemPartialText = ""
+
+                                    if self.transcriptIsLiveMode {
+                                        self.transcriptScrollOffset = 0
+                                    }
+                                } else {
+                                    self.log("[SYS] PARTIAL: '\(text)'")
+                                    self.systemPartialText = text
+                                }
+                            }
+                        }
+                    } catch {
+                        await MainActor.run {
+                            self?.log("[SYS] Recognition error: \(error.localizedDescription)")
+                        }
+                    }
+                }
+
+                // Start the system analyzer
+                try await sysAnalyzer.start(inputSequence: inputSequence)
+
+                // Feed buffers from system audio source to the analyzer
+                for await buffer in buffers {
+                    sysProcessor.handleBuffer(buffer, AVAudioTime(hostTime: mach_absolute_time()))
+                }
+
+            } catch let error as SystemAudioError {
+                self.log("[SYS] System audio error: \(error)")
+                switch error {
+                case .permissionDenied:
+                    self.errorMessage = "System audio capture requires permission. Open System Settings > Privacy & Security > Audio Capture and allow Steno."
+                case .tapCreationFailed(let status):
+                    self.errorMessage = "System audio unavailable (tap creation failed: \(status))"
+                default:
+                    self.errorMessage = "System audio unavailable: \(error)"
+                }
+                self.isSystemAudioEnabled = false
+                self.systemAudioSource = nil
+            } catch {
+                self.log("[SYS] Unexpected error: \(error)")
+                self.errorMessage = "System audio error: \(error.localizedDescription)"
+                self.isSystemAudioEnabled = false
+                self.systemAudioSource = nil
+            }
+        }
+
+        isSystemAudioEnabled = true
+        statusMessage = "Recording... MIC + SYS"
+    }
+
+    private func stopSystemAudio() {
+        guard isSystemAudioEnabled else { return }
+        log("Stopping system audio...")
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+
+        systemInputBuilder?.finish()
+        systemInputBuilder = nil
+
+        Task {
+            await systemAudioSource?.stop()
+            await MainActor.run {
+                self.systemAudioSource = nil
+            }
+
+            do {
+                try await systemAnalyzer?.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                await MainActor.run {
+                    self.log("[SYS] Error finalizing analyzer: \(error)")
+                }
+            }
+        }
+
+        systemAnalyzer = nil
+        systemTranscriber = nil
+        systemPartialText = ""
+        isSystemAudioEnabled = false
+
+        if isListening {
+            statusMessage = "Recording..."
+        }
+
+        log("System audio stopped")
+    }
+
     func clear() {
         segments.removeAll()
         entries.removeAll()
         partialText = ""
+        systemPartialText = ""
+        hasUsedSystemAudio = false
         errorMessage = nil
         statusMessage = "Ready"
         transcriptScrollOffset = 0
@@ -1293,6 +1536,14 @@ struct MainView: View {
                     }
                     Text(state.statusMessage)
                         .foregroundColor(state.isListening ? .green : (state.isDownloadingModel ? .yellow : .gray))
+
+                    if state.isListening && state.isSystemAudioEnabled {
+                        Text("MIC + SYS")
+                            .foregroundColor(.cyan)
+                    } else if state.isListening {
+                        Text("MIC")
+                            .foregroundColor(.gray)
+                    }
 
                     if state.isListening {
                         Text(" |")
@@ -1427,26 +1678,34 @@ struct MainView: View {
 
             // Keyboard shortcuts status line
             HStack {
-                Text("[Space]")
-                    .foregroundColor(.cyan)
-                Text(state.isListening ? "stop" : "start")
-                    .foregroundColor(.gray)
-                Text("[s]")
-                    .foregroundColor(.cyan)
-                Text("settings")
-                    .foregroundColor(.gray)
-                Text("[i]")
-                    .foregroundColor(.cyan)
-                Text("input")
-                    .foregroundColor(.gray)
-                Text("[m]")
-                    .foregroundColor(.cyan)
-                Text("model")
-                    .foregroundColor(.gray)
-                Text("[q]")
-                    .foregroundColor(.cyan)
-                Text("quit")
-                    .foregroundColor(.gray)
+                Group {
+                    Text("[Space]")
+                        .foregroundColor(.cyan)
+                    Text(state.isListening ? "stop" : "start")
+                        .foregroundColor(.gray)
+                    Text("[a]")
+                        .foregroundColor(.cyan)
+                    Text(state.isSystemAudioEnabled ? "sys off" : "sys on")
+                        .foregroundColor(.gray)
+                    Text("[s]")
+                        .foregroundColor(.cyan)
+                    Text("settings")
+                        .foregroundColor(.gray)
+                }
+                Group {
+                    Text("[i]")
+                        .foregroundColor(.cyan)
+                    Text("input")
+                        .foregroundColor(.gray)
+                    Text("[m]")
+                        .foregroundColor(.cyan)
+                    Text("model")
+                        .foregroundColor(.gray)
+                    Text("[q]")
+                        .foregroundColor(.cyan)
+                    Text("quit")
+                        .foregroundColor(.gray)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
