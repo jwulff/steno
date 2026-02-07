@@ -14,5 +14,7 @@
     <string>Steno needs microphone access to transcribe your speech in real-time.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Steno uses on-device speech recognition to convert your speech to text. All processing happens locally on your Mac.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Steno captures system audio to transcribe other participants during video calls. All processing happens locally on your Mac.</string>
 </dict>
 </plist>

@@ -182,14 +182,14 @@ Implement system audio capture using Core Audio Taps. This is the hard part.
 4. Manual integration test: play audio through system, verify capture works
 
 **Acceptance Criteria:**
-- [ ] `SystemAudioSource` captures all system audio (excluding own process)
-- [ ] Conforms to `AudioSource` protocol
-- [ ] Audio format conversion handles different sample rates
-- [ ] Cleanup runs in correct reverse order on `stop()` (no resource leaks)
-- [ ] Permission denial handled inline with user-facing error message
-- [ ] `NSAudioCaptureUsageDescription` in Info.plist
-- [ ] Integration tests for lifecycle and error paths (local-only, not CI)
-- [ ] Protocol-level tests using MockAudioSource (CI-safe)
+- [x] `SystemAudioSource` captures all system audio (excluding own process)
+- [x] Conforms to `AudioSource` protocol
+- [x] Audio format conversion handles different sample rates
+- [x] Cleanup runs in correct reverse order on `stop()` (no resource leaks)
+- [x] Permission denial handled inline with user-facing error message
+- [x] `NSAudioCaptureUsageDescription` in Info.plist
+- [x] Integration tests for lifecycle and error paths (local-only, not CI)
+- [x] Protocol-level tests using MockAudioSource (CI-safe)
 
 ---
 
