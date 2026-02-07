@@ -107,6 +107,12 @@ public enum DatabaseConfiguration {
             try db.execute(sql: "CREATE INDEX idx_summaries_session ON summaries(sessionId)")
         }
 
+        migrator.registerMigration("20260207_001_add_segment_source") { db in
+            try db.execute(sql: """
+                ALTER TABLE segments ADD COLUMN source TEXT NOT NULL DEFAULT 'microphone'
+            """)
+        }
+
         return migrator
     }
 }

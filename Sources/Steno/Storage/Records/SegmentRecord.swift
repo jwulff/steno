@@ -13,6 +13,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     var confidence: Double?
     var sequenceNumber: Int
     var createdAt: Double
+    var source: String
 
     /// Convert to domain model.
     ///
@@ -31,7 +32,8 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             endedAt: Date(timeIntervalSince1970: endedAt),
             confidence: confidence.map { Float($0) },
             sequenceNumber: sequenceNumber,
-            createdAt: Date(timeIntervalSince1970: createdAt)
+            createdAt: Date(timeIntervalSince1970: createdAt),
+            source: AudioSourceType(rawValue: source) ?? .microphone
         )
     }
 
@@ -48,7 +50,8 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             endedAt: segment.endedAt.timeIntervalSince1970,
             confidence: segment.confidence.map { Double($0) },
             sequenceNumber: segment.sequenceNumber,
-            createdAt: segment.createdAt.timeIntervalSince1970
+            createdAt: segment.createdAt.timeIntervalSince1970,
+            source: segment.source.rawValue
         )
     }
 }

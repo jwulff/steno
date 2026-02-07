@@ -44,6 +44,14 @@ struct TranscriptEntry: Identifiable {
     let timestamp: Date
     var text: String
     let isFinal: Bool
+    let source: AudioSourceType
+
+    init(timestamp: Date, text: String, isFinal: Bool, source: AudioSourceType = .microphone) {
+        self.timestamp = timestamp
+        self.text = text
+        self.isFinal = isFinal
+        self.source = source
+    }
 
     var formattedTime: String {
         let formatter = DateFormatter()
@@ -308,6 +316,17 @@ class ViewState: ObservableObject, @unchecked Sendable {
     private var audioConverter: AVAudioConverter?
     private var audioTapProcessor: AudioTapProcessor?
 
+    // System audio capture components
+    @Published var isSystemAudioEnabled: Bool = false
+    @Published var systemPartialText: String = ""
+    @Published var systemAudioLevel: Float = 0
+    @Published var hasUsedSystemAudio: Bool = false  // true once system audio has been enabled in this session
+    private var systemAudioSource: SystemAudioSource?
+    private var systemRecognizerTask: Task<Void, Never>?
+    private var systemAnalyzer: SpeechAnalyzer?
+    private var systemTranscriber: SpeechTranscriber?
+    private var systemInputBuilder: AsyncStream<AnalyzerInput>.Continuation?
+
     var fullText: String {
         segments.map(\.text).joined(separator: " ")
     }
@@ -322,7 +341,8 @@ class ViewState: ObservableObject, @unchecked Sendable {
         var lines: [String] = []
 
         for entry in entries {
-            let prefix = "[\(entry.formattedTime)] "
+            let sourceLabel = hasUsedSystemAudio ? (entry.source == .microphone ? "[You] " : "[Others] ") : ""
+            let prefix = "[\(entry.formattedTime)] \(sourceLabel)"
             let wrappedLines = wrapText(entry.text, width: transcriptLineWidth - prefix.count)
 
             for (i, line) in wrappedLines.enumerated() {
@@ -334,16 +354,33 @@ class ViewState: ObservableObject, @unchecked Sendable {
             }
         }
 
-        // Add partial/volatile text if present
+        // Add mic partial/volatile text if present
         if !partialText.isEmpty {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm:ss"
             let timeStr = formatter.string(from: partialTimestamp)
-            let prefix = "[\(timeStr)] "
+            let sourceLabel = hasUsedSystemAudio ? "[You] " : ""
+            let prefix = "[\(timeStr)] \(sourceLabel)"
             let wrappedLines = wrapText(partialText, width: transcriptLineWidth - prefix.count)
             for (i, line) in wrappedLines.enumerated() {
                 if i == 0 {
                     lines.append(prefix + line + " ▌")  // Show cursor to indicate in-progress
+                } else {
+                    lines.append(String(repeating: " ", count: prefix.count) + line)
+                }
+            }
+        }
+
+        // Add system audio partial text if present
+        if !systemPartialText.isEmpty {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm:ss"
+            let timeStr = formatter.string(from: Date())
+            let prefix = "[\(timeStr)] [Others] "
+            let wrappedLines = wrapText(systemPartialText, width: transcriptLineWidth - prefix.count)
+            for (i, line) in wrappedLines.enumerated() {
+                if i == 0 {
+                    lines.append(prefix + line + " ▌")
                 } else {
                     lines.append(String(repeating: " ", count: prefix.count) + line)
                 }
@@ -559,6 +596,13 @@ class ViewState: ObservableObject, @unchecked Sendable {
         }
         Application.globalKeyHandlers["M"] = { [weak self] in
             self?.selectNextModel()
+        }
+        // a/A = toggle system audio
+        Application.globalKeyHandlers["a"] = { [weak self] in
+            self?.toggleSystemAudio()
+        }
+        Application.globalKeyHandlers["A"] = { [weak self] in
+            self?.toggleSystemAudio()
         }
     }
 
@@ -1145,6 +1189,9 @@ class ViewState: ObservableObject, @unchecked Sendable {
         recognizerTask?.cancel()
         recognizerTask = nil
 
+        // Stop system audio if active
+        stopSystemAudio()
+
         // Clear references
         analyzer = nil
         transcriber = nil
@@ -1157,10 +1204,259 @@ class ViewState: ObservableObject, @unchecked Sendable {
         log("Stopped")
     }
 
+    // MARK: - System Audio
+
+    func toggleSystemAudio() {
+        guard isListening else {
+            log("Cannot toggle system audio: not listening")
+            return
+        }
+
+        if isSystemAudioEnabled {
+            stopSystemAudio()
+        } else {
+            startSystemAudio()
+        }
+    }
+
+    private func startSystemAudio() {
+        log("Starting system audio capture...")
+        hasUsedSystemAudio = true
+
+        let source = SystemAudioSource()
+        self.systemAudioSource = source
+
+        // Setup task: create recognizer/analyzer on MainActor, then hand off buffer feeding to background
+        Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                let (buffers, format) = try await source.start()
+                await MainActor.run {
+                    self.log("[SYS] Tap format: \(format.sampleRate)Hz, \(format.channelCount)ch, interleaved=\(format.isInterleaved), standard=\(format.isStandard)")
+                }
+
+                // Create second SpeechTranscriber + SpeechAnalyzer
+                let locale = Locale.current
+                let sysTranscriber = SpeechTranscriber(
+                    locale: locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [.volatileResults],
+                    attributeOptions: []
+                )
+                let sysAnalyzer = SpeechAnalyzer(modules: [sysTranscriber])
+                let sysAnalyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [sysTranscriber])
+
+                // Create async stream for feeding audio to analyzer
+                let (inputSequence, sysInputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+
+                await MainActor.run {
+                    self.systemTranscriber = sysTranscriber
+                    self.systemAnalyzer = sysAnalyzer
+                    self.systemInputBuilder = sysInputBuilder
+                }
+
+                // Set up converter if formats differ
+                var converter: AVAudioConverter?
+                if let analyzerFmt = sysAnalyzerFormat, format != analyzerFmt {
+                    converter = AVAudioConverter(from: format, to: analyzerFmt)
+                    await MainActor.run {
+                        self.log("[SYS] Created converter: \(format.sampleRate)Hz -> \(analyzerFmt.sampleRate)Hz")
+                    }
+                }
+
+                // Create audio processor for system audio buffers
+                let sysProcessor = AudioTapProcessor(
+                    inputBuilder: sysInputBuilder,
+                    converter: converter,
+                    analyzerFormat: sysAnalyzerFormat,
+                    inputSampleRate: format.sampleRate,
+                    onLevel: { [weak self] level in
+                        DispatchQueue.main.async {
+                            self?.systemAudioLevel = level
+                        }
+                    },
+                    onLog: { [weak self] message in
+                        DispatchQueue.main.async {
+                            self?.log("[SYS] \(message)")
+                        }
+                    }
+                )
+
+                // Listen for results from system audio recognizer (@MainActor since it only handles UI updates)
+                let recognizerTask = Task { @MainActor [weak self] in
+                    do {
+                        for try await result in sysTranscriber.results {
+                            guard let self = self else { return }
+
+                            let text = String(result.text.characters)
+
+                            if result.isFinal {
+                                self.log("[SYS] FINAL: '\(text)'")
+
+                                if !text.isEmpty {
+                                    let segment = TranscriptSegment(
+                                        text: text,
+                                        timestamp: Date(),
+                                        duration: 0,
+                                        confidence: nil,
+                                        source: .systemAudio
+                                    )
+                                    self.segments.append(segment)
+
+                                    let entry = TranscriptEntry(
+                                        timestamp: Date(),
+                                        text: text,
+                                        isFinal: true,
+                                        source: .systemAudio
+                                    )
+                                    self.entries.append(entry)
+
+                                    // Persist to database
+                                    if let repository = self.repository, let session = self.currentSession {
+                                        self.currentSequenceNumber += 1
+                                        let storedSegment = StoredSegment.from(
+                                            segment,
+                                            sessionId: session.id,
+                                            sequenceNumber: self.currentSequenceNumber
+                                        )
+                                        Task {
+                                            do {
+                                                try await repository.saveSegment(storedSegment)
+                                                self.log("[SYS] Saved segment \(self.currentSequenceNumber)")
+                                            } catch {
+                                                self.log("[SYS] Failed to save segment: \(error)")
+                                            }
+                                        }
+                                    }
+
+                                    self.statusMessage = "Recording... MIC + SYS (\(self.segments.count) segments)"
+                                }
+
+                                self.systemPartialText = ""
+
+                                if self.transcriptIsLiveMode {
+                                    self.transcriptScrollOffset = 0
+                                }
+                            } else {
+                                self.systemPartialText = text
+                            }
+                        }
+                    } catch {
+                        self?.log("[SYS] Recognition error: \(error.localizedDescription)")
+                    }
+                }
+
+                await MainActor.run {
+                    self.systemRecognizerTask = recognizerTask
+                }
+
+                // Start the system analyzer
+                try await sysAnalyzer.start(inputSequence: inputSequence)
+                await MainActor.run {
+                    self.log("[SYS] Analyzer started, feeding buffers...")
+                }
+
+                // Feed buffers from system audio source to the analyzer (runs on background — NOT MainActor)
+                var bufferCount = 0
+                for await buffer in buffers {
+                    // Diagnostic: check audio levels of first few buffers and periodically
+                    if bufferCount < 5 || bufferCount % 500 == 0 {
+                        var maxLevel: Float = 0
+                        if let data = buffer.floatChannelData?[0] {
+                            for i in 0..<min(Int(buffer.frameLength), 512) {
+                                maxLevel = max(maxLevel, abs(data[i]))
+                            }
+                        }
+                        let bc = bufferCount
+                        let fl = buffer.frameLength
+                        let ch = buffer.format.channelCount
+                        let sr = buffer.format.sampleRate
+                        let il = buffer.format.isInterleaved
+                        await MainActor.run {
+                            self.log("[SYS] buf#\(bc): \(fl) frames, \(ch)ch \(sr)Hz il=\(il) maxLvl=\(String(format: "%.6f", maxLevel))")
+                        }
+                    }
+                    sysProcessor.handleBuffer(buffer, AVAudioTime(hostTime: mach_absolute_time()))
+                    bufferCount += 1
+                }
+
+                await MainActor.run {
+                    self.log("[SYS] Buffer stream ended after \(bufferCount) buffers")
+                }
+
+            } catch let error as SystemAudioError {
+                await MainActor.run {
+                    self.log("[SYS] System audio error: \(error)")
+                    switch error {
+                    case .permissionDenied:
+                        self.errorMessage = "System audio requires \"Screen & System Audio Recording\" permission. Grant permission in the dialog or via System Settings > Privacy & Security."
+                    case .noDisplaysAvailable:
+                        self.errorMessage = "System audio unavailable: no display found"
+                    case .streamStartFailed(let reason):
+                        self.errorMessage = "System audio unavailable: \(reason)"
+                    }
+                    self.isSystemAudioEnabled = false
+                    self.systemAudioSource = nil
+                }
+            } catch {
+                await MainActor.run {
+                    self.log("[SYS] Unexpected error: \(error)")
+                    self.errorMessage = "System audio error: \(error.localizedDescription)"
+                    self.isSystemAudioEnabled = false
+                    self.systemAudioSource = nil
+                }
+            }
+        }
+
+        isSystemAudioEnabled = true
+        statusMessage = "Recording... MIC + SYS"
+    }
+
+    private func stopSystemAudio() {
+        guard isSystemAudioEnabled else { return }
+        log("Stopping system audio...")
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+
+        systemInputBuilder?.finish()
+        systemInputBuilder = nil
+
+        Task {
+            await systemAudioSource?.stop()
+            await MainActor.run {
+                self.systemAudioSource = nil
+            }
+
+            do {
+                try await systemAnalyzer?.finalizeAndFinishThroughEndOfInput()
+            } catch {
+                await MainActor.run {
+                    self.log("[SYS] Error finalizing analyzer: \(error)")
+                }
+            }
+        }
+
+        systemAnalyzer = nil
+        systemTranscriber = nil
+        systemPartialText = ""
+        systemAudioLevel = 0
+        isSystemAudioEnabled = false
+
+        if isListening {
+            statusMessage = "Recording..."
+        }
+
+        log("System audio stopped")
+    }
+
     func clear() {
         segments.removeAll()
         entries.removeAll()
         partialText = ""
+        systemPartialText = ""
+        hasUsedSystemAudio = false
         errorMessage = nil
         statusMessage = "Ready"
         transcriptScrollOffset = 0
@@ -1286,12 +1582,28 @@ struct MainView: View {
                     Text(state.statusMessage)
                         .foregroundColor(state.isListening ? .green : (state.isDownloadingModel ? .yellow : .gray))
 
+                    if state.isListening && state.isSystemAudioEnabled {
+                        Text("MIC + SYS")
+                            .foregroundColor(.cyan)
+                    } else if state.isListening {
+                        Text("MIC")
+                            .foregroundColor(.gray)
+                    }
+
                     if state.isListening {
-                        Text(" |")
+                        Text(" MIC")
                             .foregroundColor(.gray)
                         let levelBars = min(20, Int(state.audioLevel * 100))
                         Text(String(repeating: "█", count: levelBars) + String(repeating: "░", count: 20 - levelBars))
                             .foregroundColor(levelBars > 10 ? .green : (levelBars > 5 ? .yellow : .gray))
+
+                        if state.isSystemAudioEnabled {
+                            Text(" SYS")
+                                .foregroundColor(.gray)
+                            let sysLevel = min(20, Int(state.systemAudioLevel * 100))
+                            Text(String(repeating: "█", count: sysLevel) + String(repeating: "░", count: 20 - sysLevel))
+                                .foregroundColor(sysLevel > 10 ? .green : (sysLevel > 5 ? .yellow : .gray))
+                        }
                     }
                 }
 
@@ -1419,26 +1731,34 @@ struct MainView: View {
 
             // Keyboard shortcuts status line
             HStack {
-                Text("[Space]")
-                    .foregroundColor(.cyan)
-                Text(state.isListening ? "stop" : "start")
-                    .foregroundColor(.gray)
-                Text("[s]")
-                    .foregroundColor(.cyan)
-                Text("settings")
-                    .foregroundColor(.gray)
-                Text("[i]")
-                    .foregroundColor(.cyan)
-                Text("input")
-                    .foregroundColor(.gray)
-                Text("[m]")
-                    .foregroundColor(.cyan)
-                Text("model")
-                    .foregroundColor(.gray)
-                Text("[q]")
-                    .foregroundColor(.cyan)
-                Text("quit")
-                    .foregroundColor(.gray)
+                Group {
+                    Text("[Space]")
+                        .foregroundColor(.cyan)
+                    Text(state.isListening ? "stop" : "start")
+                        .foregroundColor(.gray)
+                    Text("[a]")
+                        .foregroundColor(.cyan)
+                    Text(state.isSystemAudioEnabled ? "sys off" : "sys on")
+                        .foregroundColor(.gray)
+                    Text("[s]")
+                        .foregroundColor(.cyan)
+                    Text("settings")
+                        .foregroundColor(.gray)
+                }
+                Group {
+                    Text("[i]")
+                        .foregroundColor(.cyan)
+                    Text("input")
+                        .foregroundColor(.gray)
+                    Text("[m]")
+                        .foregroundColor(.cyan)
+                    Text("model")
+                        .foregroundColor(.gray)
+                    Text("[q]")
+                        .foregroundColor(.cyan)
+                    Text("quit")
+                        .foregroundColor(.gray)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

@@ -84,4 +84,69 @@ struct TranscriptSegmentTests {
 
         #expect(segment.confidence == nil)
     }
+
+    // MARK: - Audio Source Type
+
+    @Test func defaultSourceIsMicrophone() {
+        let segment = TranscriptSegment(
+            text: "hello",
+            timestamp: Date(),
+            duration: 1.0,
+            confidence: 0.9
+        )
+
+        #expect(segment.source == .microphone)
+    }
+
+    @Test func explicitSystemAudioSource() {
+        let segment = TranscriptSegment(
+            text: "hello from system",
+            timestamp: Date(),
+            duration: 1.0,
+            confidence: 0.9,
+            source: .systemAudio
+        )
+
+        #expect(segment.source == .systemAudio)
+    }
+
+    @Test func sourceIncludedInCodable() throws {
+        let segment = TranscriptSegment(
+            text: "test",
+            timestamp: Date(),
+            duration: 1.0,
+            confidence: 0.8,
+            source: .systemAudio
+        )
+
+        let data = try JSONEncoder().encode(segment)
+        let decoded = try JSONDecoder().decode(TranscriptSegment.self, from: data)
+
+        #expect(decoded.source == .systemAudio)
+    }
+
+    @Test func sourceAffectsEquality() {
+        let timestamp = Date()
+        let micSegment = TranscriptSegment(
+            text: "hello",
+            timestamp: timestamp,
+            duration: 1.0,
+            confidence: 0.9,
+            source: .microphone
+        )
+        let sysSegment = TranscriptSegment(
+            text: "hello",
+            timestamp: timestamp,
+            duration: 1.0,
+            confidence: 0.9,
+            source: .systemAudio
+        )
+
+        #expect(micSegment != sysSegment)
+    }
+
+    @Test func audioSourceTypeRawValues() {
+        #expect(AudioSourceType.microphone.rawValue == "microphone")
+        #expect(AudioSourceType.systemAudio.rawValue == "systemAudio")
+    }
 }

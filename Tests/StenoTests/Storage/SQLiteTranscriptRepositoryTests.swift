@@ -226,6 +226,55 @@ struct SQLiteTranscriptRepositoryTests {
         #expect(count == 0)
     }
 
+    @Test func saveAndFetchSegmentWithSource() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let segment = StoredSegment(
+            id: UUID(),
+            sessionId: session.id,
+            text: "Hello from system",
+            startedAt: Date(),
+            endedAt: Date(),
+            confidence: 0.90,
+            sequenceNumber: 0,
+            createdAt: Date(),
+            source: .systemAudio
+        )
+
+        try await repo.saveSegment(segment)
+        let segments = try await repo.segments(for: session.id)
+
+        #expect(segments.count == 1)
+        #expect(segments[0].source == .systemAudio)
+    }
+
+    @Test func segmentSourceDefaultsToMicrophone() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let segment = StoredSegment(
+            id: UUID(),
+            sessionId: session.id,
+            text: "Hello",
+            startedAt: Date(),
+            endedAt: Date(),
+            confidence: nil,
+            sequenceNumber: 0,
+            createdAt: Date()
+        )
+
+        try await repo.saveSegment(segment)
+        let segments = try await repo.segments(for: session.id)
+
+        #expect(segments.count == 1)
+        #expect(segments[0].source == .microphone)
+    }
+
     // MARK: - Summary Tests
 
     @Test func saveAndFetchSummary() async throws {
