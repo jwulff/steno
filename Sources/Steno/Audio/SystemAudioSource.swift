@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import CoreGraphics
 
 /// Errors specific to system audio capture.
 public enum SystemAudioError: Error, Equatable {
@@ -30,7 +31,29 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
 
     public init() {}
 
+    /// Check if screen/audio capture permission is granted. Core Audio taps
+    /// require the "Screen & System Audio Recording" TCC permission.
+    public static func hasPermission() -> Bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
+    /// Request screen/audio capture permission. Returns true if granted.
+    @discardableResult
+    public static func requestPermission() -> Bool {
+        CGRequestScreenCaptureAccess()
+    }
+
     public func start() async throws -> (buffers: AsyncStream<AVAudioPCMBuffer>, format: AVAudioFormat) {
+        // 0. Check permission before attempting tap creation
+        if !Self.hasPermission() {
+            // Request permission — this triggers the system dialog on first call
+            Self.requestPermission()
+            // After requesting, check again
+            if !Self.hasPermission() {
+                throw SystemAudioError.permissionDenied
+            }
+        }
+
         // 1. Create tap description for all system audio (excluding own process)
         let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcessAudioObjectID()])
         tapDescription.uuid = UUID()
