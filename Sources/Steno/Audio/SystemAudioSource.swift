@@ -221,10 +221,10 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
         return processObject
     }
 
-    /// Get the UID string of the default system output device.
+    /// Get the UID string of the default output device (where apps like Chrome play audio).
     private func getDefaultOutputDeviceUID() throws -> String {
         var address = AudioObjectPropertyAddress(
-            mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDefaultSystemOutputDevice),
+            mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDefaultOutputDevice),
             mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
             mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
         )

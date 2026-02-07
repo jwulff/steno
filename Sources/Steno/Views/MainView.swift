@@ -319,6 +319,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
     // System audio capture components
     @Published var isSystemAudioEnabled: Bool = false
     @Published var systemPartialText: String = ""
+    @Published var systemAudioLevel: Float = 0
     @Published var hasUsedSystemAudio: Bool = false  // true once system audio has been enabled in this session
     private var systemAudioSource: SystemAudioSource?
     private var systemRecognizerTask: Task<Void, Never>?
@@ -1270,7 +1271,11 @@ class ViewState: ObservableObject, @unchecked Sendable {
                     converter: converter,
                     analyzerFormat: sysAnalyzerFormat,
                     inputSampleRate: format.sampleRate,
-                    onLevel: { _ in },  // No level meter for system audio
+                    onLevel: { [weak self] level in
+                        DispatchQueue.main.async {
+                            self?.systemAudioLevel = level
+                        }
+                    },
                     onLog: { [weak self] message in
                         DispatchQueue.main.async {
                             self?.log("[SYS] \(message)")
@@ -1355,13 +1360,25 @@ class ViewState: ObservableObject, @unchecked Sendable {
                 // Feed buffers from system audio source to the analyzer (runs on background — NOT MainActor)
                 var bufferCount = 0
                 for await buffer in buffers {
-                    sysProcessor.handleBuffer(buffer, AVAudioTime(hostTime: mach_absolute_time()))
-                    bufferCount += 1
-                    if bufferCount == 1 {
+                    // Diagnostic: check audio levels of first few buffers and periodically
+                    if bufferCount < 5 || bufferCount % 500 == 0 {
+                        var maxLevel: Float = 0
+                        if let data = buffer.floatChannelData?[0] {
+                            for i in 0..<min(Int(buffer.frameLength), 512) {
+                                maxLevel = max(maxLevel, abs(data[i]))
+                            }
+                        }
+                        let bc = bufferCount
+                        let fl = buffer.frameLength
+                        let ch = buffer.format.channelCount
+                        let sr = buffer.format.sampleRate
+                        let il = buffer.format.isInterleaved
                         await MainActor.run {
-                            self.log("[SYS] First buffer received and processed")
+                            self.log("[SYS] buf#\(bc): \(fl) frames, \(ch)ch \(sr)Hz il=\(il) maxLvl=\(String(format: "%.6f", maxLevel))")
                         }
                     }
+                    sysProcessor.handleBuffer(buffer, AVAudioTime(hostTime: mach_absolute_time()))
+                    bufferCount += 1
                 }
 
                 await MainActor.run {
@@ -1424,6 +1441,7 @@ class ViewState: ObservableObject, @unchecked Sendable {
         systemAnalyzer = nil
         systemTranscriber = nil
         systemPartialText = ""
+        systemAudioLevel = 0
         isSystemAudioEnabled = false
 
         if isListening {
@@ -1573,11 +1591,19 @@ struct MainView: View {
                     }
 
                     if state.isListening {
-                        Text(" |")
+                        Text(" MIC")
                             .foregroundColor(.gray)
                         let levelBars = min(20, Int(state.audioLevel * 100))
                         Text(String(repeating: "█", count: levelBars) + String(repeating: "░", count: 20 - levelBars))
                             .foregroundColor(levelBars > 10 ? .green : (levelBars > 5 ? .yellow : .gray))
+
+                        if state.isSystemAudioEnabled {
+                            Text(" SYS")
+                                .foregroundColor(.gray)
+                            let sysLevel = min(20, Int(state.systemAudioLevel * 100))
+                            Text(String(repeating: "█", count: sysLevel) + String(repeating: "░", count: 20 - sysLevel))
+                                .foregroundColor(sysLevel > 10 ? .green : (sysLevel > 5 ? .yellow : .gray))
+                        }
                     }
                 }
 
