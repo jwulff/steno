@@ -6,8 +6,9 @@ import CoreGraphics
 public enum SystemAudioError: Error, Equatable {
     case tapCreationFailed(OSStatus)
     case formatReadFailed(OSStatus)
-    case outputDeviceFailed(OSStatus)
+    case tapUIDReadFailed(OSStatus)
     case aggregateDeviceFailed(OSStatus)
+    case tapAssignmentFailed(OSStatus)
     case ioProcFailed(OSStatus)
     case deviceStartFailed(OSStatus)
     case permissionDenied
@@ -46,9 +47,7 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
     public func start() async throws -> (buffers: AsyncStream<AVAudioPCMBuffer>, format: AVAudioFormat) {
         // 0. Check permission before attempting tap creation
         if !Self.hasPermission() {
-            // Request permission — this triggers the system dialog on first call
             Self.requestPermission()
-            // After requesting, check again
             if !Self.hasPermission() {
                 throw SystemAudioError.permissionDenied
             }
@@ -58,22 +57,23 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
         let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcessAudioObjectID()])
         tapDescription.uuid = UUID()
         tapDescription.muteBehavior = .unmuted
+        tapDescription.isPrivate = true
+        tapDescription.isMixdown = true
 
         // 2. Create process tap
         var status = AudioHardwareCreateProcessTap(tapDescription, &tapID)
         guard status == noErr else {
-            // Check if it's a permission issue (common error codes for TCC denial)
             if status == -50 || status == -10 {
                 throw SystemAudioError.permissionDenied
             }
             throw SystemAudioError.tapCreationFailed(status)
         }
 
-        // 3. Read tap format
+        // 3. Read tap format from the created tap object
         var formatAddress = AudioObjectPropertyAddress(
             mSelector: kAudioTapPropertyFormat,
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
-            mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
         var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.stride)
         var streamDesc = AudioStreamBasicDescription()
@@ -90,26 +90,17 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
         }
         self.tapFormat = format
 
-        // 4. Get system output device UID
-        let outputUID = try getDefaultOutputDeviceUID()
+        // 4. Read the tap's UID from the tap object (not from CATapDescription)
+        let tapUID = try readTapUID()
 
-        // 5. Create aggregate device with tap
+        // 5. Create bare aggregate device (no sub-devices)
         let aggregateDescription: [String: Any] = [
             kAudioAggregateDeviceNameKey: "Steno-SystemAudio",
             kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceMainSubDeviceKey: outputUID,
+            kAudioAggregateDeviceSubDeviceListKey: [] as CFArray,
+            kAudioAggregateDeviceMasterSubDeviceKey: 0,
             kAudioAggregateDeviceIsPrivateKey: true,
             kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [
-                [kAudioSubDeviceUIDKey: outputUID]
-            ],
-            kAudioAggregateDeviceTapListKey: [
-                [
-                    kAudioSubTapDriftCompensationKey: true,
-                    kAudioSubTapUIDKey: tapDescription.uuid.uuidString
-                ]
-            ]
         ]
 
         status = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &aggregateDeviceID)
@@ -118,11 +109,28 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
             throw SystemAudioError.aggregateDeviceFailed(status)
         }
 
-        // 6. Create async stream for buffer delivery
+        // 6. Add tap to aggregate device AFTER creation (proven pattern from AudioTee)
+        var tapListAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioAggregateDevicePropertyTapList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var tapArray = [tapUID] as CFArray
+        let tapArraySize = UInt32(MemoryLayout<CFArray>.stride)
+
+        status = withUnsafePointer(to: &tapArray) { ptr in
+            AudioObjectSetPropertyData(aggregateDeviceID, &tapListAddress, 0, nil, tapArraySize, ptr)
+        }
+        guard status == noErr else {
+            cleanup()
+            throw SystemAudioError.tapAssignmentFailed(status)
+        }
+
+        // 7. Create async stream for buffer delivery
         let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.continuation = continuation
 
-        // 7. Set up IOProc to receive audio
+        // 8. Set up IOProc to receive audio
         let capturedFormat = format
         let capturedContinuation = continuation
         status = AudioDeviceCreateIOProcIDWithBlock(
@@ -135,27 +143,22 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
             )
             guard srcBufferList.count > 0, srcBufferList[0].mDataByteSize > 0 else { return }
 
-            // Calculate frame count based on format layout
             let frameCount: AVAudioFrameCount
             if capturedFormat.isInterleaved {
-                // Interleaved: single buffer with all channels interleaved
                 frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
                     / AVAudioFrameCount(MemoryLayout<Float>.stride * Int(capturedFormat.channelCount))
             } else {
-                // Non-interleaved: each buffer contains one channel's data
                 frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
                     / AVAudioFrameCount(MemoryLayout<Float>.stride)
             }
             guard frameCount > 0 else { return }
 
-            // CRITICAL: Copy the audio data. The IOProc buffer is only valid during this callback.
             guard let copiedBuffer = AVAudioPCMBuffer(
                 pcmFormat: capturedFormat,
                 frameCapacity: frameCount
             ) else { return }
             copiedBuffer.frameLength = frameCount
 
-            // Copy raw audio data from all IOProc buffers into our new buffer
             let dstBufferList = UnsafeMutableAudioBufferListPointer(copiedBuffer.mutableAudioBufferList)
             for i in 0..<min(dstBufferList.count, srcBufferList.count) {
                 guard let srcData = srcBufferList[i].mData,
@@ -176,7 +179,7 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
             throw SystemAudioError.ioProcFailed(status)
         }
 
-        // 8. Start the device
+        // 9. Start the device
         status = AudioDeviceStart(aggregateDeviceID, ioProcID)
         guard status == noErr else {
             cleanup()
@@ -244,37 +247,24 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
         return processObject
     }
 
-    /// Get the UID string of the default output device (where apps like Chrome play audio).
-    private func getDefaultOutputDeviceUID() throws -> String {
+    /// Read the UID of the created tap object using kAudioTapPropertyUID.
+    private func readTapUID() throws -> CFString {
         var address = AudioObjectPropertyAddress(
-            mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyDefaultOutputDevice),
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
-            mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
+            mSelector: kAudioTapPropertyUID,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
         )
-        var outputID: AudioDeviceID = 0
-        var size = UInt32(MemoryLayout<AudioDeviceID>.stride)
+        var size = UInt32(MemoryLayout<CFString>.stride)
+        var tapUID: CFString = "" as CFString
 
-        var status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address, 0, nil, &size, &outputID
-        )
-        guard status == noErr else {
-            throw SystemAudioError.outputDeviceFailed(status)
-        }
-
-        // Read the UID
-        address.mSelector = AudioObjectPropertySelector(kAudioDevicePropertyDeviceUID)
-        size = UInt32(MemoryLayout<CFString>.stride)
-        var uid: CFString = "" as CFString
-
-        status = withUnsafeMutablePointer(to: &uid) { ptr in
-            AudioObjectGetPropertyData(outputID, &address, 0, nil, &size, ptr)
+        let status = withUnsafeMutablePointer(to: &tapUID) { ptr in
+            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, ptr)
         }
         guard status == noErr else {
-            throw SystemAudioError.outputDeviceFailed(status)
+            throw SystemAudioError.tapUIDReadFailed(status)
         }
 
-        return uid as String
+        return tapUID
     }
 
     deinit {

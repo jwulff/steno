@@ -29,14 +29,15 @@ struct SystemAudioSourceTests {
         let errors: [SystemAudioError] = [
             .tapCreationFailed(0),
             .formatReadFailed(0),
-            .outputDeviceFailed(0),
+            .tapUIDReadFailed(0),
             .aggregateDeviceFailed(0),
+            .tapAssignmentFailed(0),
             .ioProcFailed(0),
             .deviceStartFailed(0),
             .permissionDenied,
         ]
 
-        #expect(errors.count == 7)
+        #expect(errors.count == 8)
     }
 
     // MARK: - Protocol Contract Tests (using MockAudioSource)
