@@ -1,273 +1,179 @@
 import AVFoundation
-import CoreAudio
-import CoreGraphics
+import CoreMedia
+import ScreenCaptureKit
 
 /// Errors specific to system audio capture.
 public enum SystemAudioError: Error, Equatable {
-    case tapCreationFailed(OSStatus)
-    case formatReadFailed(OSStatus)
-    case tapUIDReadFailed(OSStatus)
-    case aggregateDeviceFailed(OSStatus)
-    case tapAssignmentFailed(OSStatus)
-    case ioProcFailed(OSStatus)
-    case deviceStartFailed(OSStatus)
+    case noDisplaysAvailable
+    case streamStartFailed(String)
     case permissionDenied
 }
 
-/// Captures system audio using Core Audio Taps API (macOS 14.4+).
+/// Captures system audio using ScreenCaptureKit.
 ///
-/// Taps all system audio except Steno's own process. No virtual audio driver required.
+/// Captures all system audio except Steno's own process. Uses SCStream
+/// which properly integrates with macOS TCC permissions and shows the
+/// recording indicator in the menu bar.
 /// Conforms to `AudioSource` for use alongside the microphone recognizer.
 public final class SystemAudioSource: AudioSource, @unchecked Sendable {
     public let name = "System Audio"
     public let sourceType: AudioSourceType = .systemAudio
 
-    private var tapID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
-    private var aggregateDeviceID: AudioObjectID = AudioObjectID(kAudioObjectUnknown)
-    private var ioProcID: AudioDeviceIOProcID?
+    private var stream: SCStream?
+    private var streamOutput: StreamOutputHandler?
     private var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
-    private var tapFormat: AVAudioFormat?
 
-    private let queue = DispatchQueue(label: "com.steno.system-audio-tap", qos: .userInteractive)
+    private let queue = DispatchQueue(label: "com.steno.system-audio", qos: .userInteractive)
 
     public init() {}
 
-    /// Check if screen/audio capture permission is granted. Core Audio taps
-    /// require the "Screen & System Audio Recording" TCC permission.
-    public static func hasPermission() -> Bool {
-        CGPreflightScreenCaptureAccess()
-    }
-
-    /// Request screen/audio capture permission. Returns true if granted.
-    @discardableResult
-    public static func requestPermission() -> Bool {
-        CGRequestScreenCaptureAccess()
-    }
-
     public func start() async throws -> (buffers: AsyncStream<AVAudioPCMBuffer>, format: AVAudioFormat) {
-        // 0. Check permission before attempting tap creation
-        if !Self.hasPermission() {
-            Self.requestPermission()
-            if !Self.hasPermission() {
-                throw SystemAudioError.permissionDenied
-            }
+        // 1. Get available content — triggers TCC permission dialog on first use
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.current
+        } catch {
+            throw SystemAudioError.permissionDenied
         }
 
-        // 1. Create tap description for all system audio (excluding own process)
-        let tapDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: [ownProcessAudioObjectID()])
-        tapDescription.uuid = UUID()
-        tapDescription.muteBehavior = .unmuted
-        tapDescription.isPrivate = true
-        tapDescription.isMixdown = true
-
-        // 2. Create process tap
-        var status = AudioHardwareCreateProcessTap(tapDescription, &tapID)
-        guard status == noErr else {
-            if status == -50 || status == -10 {
-                throw SystemAudioError.permissionDenied
-            }
-            throw SystemAudioError.tapCreationFailed(status)
+        guard let display = content.displays.first else {
+            throw SystemAudioError.noDisplaysAvailable
         }
 
-        // 3. Read tap format from the created tap object
-        var formatAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyFormat,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
+        // 2. Create content filter (all apps on main display)
+        let filter = SCContentFilter(
+            display: display,
+            excludingApplications: [],
+            exceptingWindows: []
         )
-        var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.stride)
-        var streamDesc = AudioStreamBasicDescription()
 
-        status = AudioObjectGetPropertyData(tapID, &formatAddress, 0, nil, &formatSize, &streamDesc)
-        guard status == noErr else {
-            cleanup()
-            throw SystemAudioError.formatReadFailed(status)
+        // 3. Configure stream for audio capture
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 48000
+        config.channelCount = 2
+
+        // Audio format: 48kHz stereo Float32 non-interleaved (ScreenCaptureKit default)
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48000,
+            channels: 2,
+            interleaved: false
+        ) else {
+            throw SystemAudioError.streamStartFailed("Failed to create audio format")
         }
 
-        guard let format = AVAudioFormat(streamDescription: &streamDesc) else {
-            cleanup()
-            throw SystemAudioError.formatReadFailed(-1)
-        }
-        self.tapFormat = format
-
-        // 4. Read the tap's UID from the tap object (not from CATapDescription)
-        let tapUID = try readTapUID()
-
-        // 5. Create bare aggregate device (no sub-devices)
-        let aggregateDescription: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "Steno-SystemAudio",
-            kAudioAggregateDeviceUIDKey: UUID().uuidString,
-            kAudioAggregateDeviceSubDeviceListKey: [] as CFArray,
-            kAudioAggregateDeviceMasterSubDeviceKey: 0,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false,
-        ]
-
-        status = AudioHardwareCreateAggregateDevice(aggregateDescription as CFDictionary, &aggregateDeviceID)
-        guard status == noErr else {
-            cleanup()
-            throw SystemAudioError.aggregateDeviceFailed(status)
-        }
-
-        // 6. Add tap to aggregate device AFTER creation (proven pattern from AudioTee)
-        var tapListAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioAggregateDevicePropertyTapList,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var tapArray = [tapUID] as CFArray
-        let tapArraySize = UInt32(MemoryLayout<CFArray>.stride)
-
-        status = withUnsafePointer(to: &tapArray) { ptr in
-            AudioObjectSetPropertyData(aggregateDeviceID, &tapListAddress, 0, nil, tapArraySize, ptr)
-        }
-        guard status == noErr else {
-            cleanup()
-            throw SystemAudioError.tapAssignmentFailed(status)
-        }
-
-        // 7. Create async stream for buffer delivery
-        let (stream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        // 4. Create async stream for buffer delivery
+        let (bufferStream, continuation) = AsyncStream<AVAudioPCMBuffer>.makeStream()
         self.continuation = continuation
 
-        // 8. Set up IOProc to receive audio
-        let capturedFormat = format
-        let capturedContinuation = continuation
-        status = AudioDeviceCreateIOProcIDWithBlock(
-            &ioProcID,
-            aggregateDeviceID,
-            queue
-        ) { _, inInputData, _, _, _ in
-            let srcBufferList = UnsafeMutableAudioBufferListPointer(
-                UnsafeMutablePointer(mutating: inInputData)
-            )
-            guard srcBufferList.count > 0, srcBufferList[0].mDataByteSize > 0 else { return }
+        // 5. Create stream and output handler
+        let scStream = SCStream(filter: filter, configuration: config, delegate: nil)
+        self.stream = scStream
 
-            let frameCount: AVAudioFrameCount
-            if capturedFormat.isInterleaved {
-                frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
-                    / AVAudioFrameCount(MemoryLayout<Float>.stride * Int(capturedFormat.channelCount))
-            } else {
-                frameCount = AVAudioFrameCount(srcBufferList[0].mDataByteSize)
-                    / AVAudioFrameCount(MemoryLayout<Float>.stride)
-            }
-            guard frameCount > 0 else { return }
+        let handler = StreamOutputHandler(format: format, continuation: continuation)
+        self.streamOutput = handler
 
-            guard let copiedBuffer = AVAudioPCMBuffer(
-                pcmFormat: capturedFormat,
-                frameCapacity: frameCount
-            ) else { return }
-            copiedBuffer.frameLength = frameCount
+        try scStream.addStreamOutput(handler, type: .audio, sampleHandlerQueue: queue)
 
-            let dstBufferList = UnsafeMutableAudioBufferListPointer(copiedBuffer.mutableAudioBufferList)
-            for i in 0..<min(dstBufferList.count, srcBufferList.count) {
-                guard let srcData = srcBufferList[i].mData,
-                      let dstData = dstBufferList[i].mData else { continue }
-                let byteCount = min(
-                    Int(srcBufferList[i].mDataByteSize),
-                    Int(dstBufferList[i].mDataByteSize)
-                )
-                memcpy(dstData, srcData, byteCount)
-            }
-
-            nonisolated(unsafe) let unsafeBuffer = copiedBuffer
-            capturedContinuation.yield(unsafeBuffer)
-        }
-
-        guard status == noErr else {
+        // 6. Start capture
+        do {
+            try await scStream.startCapture()
+        } catch {
             cleanup()
-            throw SystemAudioError.ioProcFailed(status)
+            throw SystemAudioError.streamStartFailed(error.localizedDescription)
         }
 
-        // 9. Start the device
-        status = AudioDeviceStart(aggregateDeviceID, ioProcID)
-        guard status == noErr else {
-            cleanup()
-            throw SystemAudioError.deviceStartFailed(status)
-        }
-
-        return (buffers: stream, format: format)
+        return (buffers: bufferStream, format: format)
     }
 
     public func stop() async {
-        cleanup()
-    }
-
-    // MARK: - Private
-
-    private func cleanup() {
-        // Reverse order: stop -> IOProc -> aggregate -> tap
-        if aggregateDeviceID != AudioObjectID(kAudioObjectUnknown) {
-            AudioDeviceStop(aggregateDeviceID, ioProcID)
-
-            if let ioProcID {
-                AudioDeviceDestroyIOProcID(aggregateDeviceID, ioProcID)
-                self.ioProcID = nil
-            }
-
-            AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
-            aggregateDeviceID = AudioObjectID(kAudioObjectUnknown)
+        if let stream {
+            try? await stream.stopCapture()
         }
-
-        if tapID != AudioObjectID(kAudioObjectUnknown) {
-            AudioHardwareDestroyProcessTap(tapID)
-            tapID = AudioObjectID(kAudioObjectUnknown)
-        }
-
+        stream = nil
+        streamOutput = nil
         continuation?.finish()
         continuation = nil
     }
 
-    /// Get the AudioObjectID for our own process so we can exclude it from the tap.
-    private func ownProcessAudioObjectID() -> AudioObjectID {
-        var address = AudioObjectPropertyAddress(
-            mSelector: AudioObjectPropertySelector(kAudioHardwarePropertyTranslatePIDToProcessObject),
-            mScope: AudioObjectPropertyScope(kAudioObjectPropertyScopeGlobal),
-            mElement: AudioObjectPropertyElement(kAudioObjectPropertyElementMain)
-        )
-        var pid = ProcessInfo.processInfo.processIdentifier
-        var processObject: AudioObjectID = 0
-        var size = UInt32(MemoryLayout<AudioObjectID>.stride)
-
-        let status = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            UInt32(MemoryLayout<pid_t>.stride),
-            &pid,
-            &size,
-            &processObject
-        )
-
-        guard status == noErr, processObject != kAudioObjectUnknown else {
-            // Fallback: return unknown, which means we won't exclude ourselves
-            // (minor issue - we'd hear our own sounds if any)
-            return AudioObjectID(kAudioObjectUnknown)
-        }
-
-        return processObject
-    }
-
-    /// Read the UID of the created tap object using kAudioTapPropertyUID.
-    private func readTapUID() throws -> CFString {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyUID,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var size = UInt32(MemoryLayout<CFString>.stride)
-        var tapUID: CFString = "" as CFString
-
-        let status = withUnsafeMutablePointer(to: &tapUID) { ptr in
-            AudioObjectGetPropertyData(tapID, &address, 0, nil, &size, ptr)
-        }
-        guard status == noErr else {
-            throw SystemAudioError.tapUIDReadFailed(status)
-        }
-
-        return tapUID
+    private func cleanup() {
+        stream = nil
+        streamOutput = nil
+        continuation?.finish()
+        continuation = nil
     }
 
     deinit {
-        cleanup()
+        stream = nil
+        streamOutput = nil
+        continuation?.finish()
+        continuation = nil
+    }
+}
+
+// MARK: - Stream Output Handler
+
+/// Receives audio sample buffers from ScreenCaptureKit and converts them
+/// to AVAudioPCMBuffer for the speech recognizer pipeline.
+private final class StreamOutputHandler: NSObject, SCStreamOutput, @unchecked Sendable {
+    private let format: AVAudioFormat
+    private let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+
+    init(format: AVAudioFormat, continuation: AsyncStream<AVAudioPCMBuffer>.Continuation) {
+        self.format = format
+        self.continuation = continuation
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of type: SCStreamOutputType
+    ) {
+        guard type == .audio else { return }
+        guard CMSampleBufferGetNumSamples(sampleBuffer) > 0 else { return }
+        guard let buffer = convertToPCMBuffer(sampleBuffer) else { return }
+        nonisolated(unsafe) let unsafeBuffer = buffer
+        continuation.yield(unsafeBuffer)
+    }
+
+    private func convertToPCMBuffer(_ sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+
+        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frameCount > 0 else { return nil }
+
+        guard let pcmBuffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(frameCount)
+        ) else { return nil }
+        pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
+
+        // Get raw audio data pointer from the CMBlockBuffer
+        var dataLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: &dataLength,
+            dataPointerOut: &dataPointer
+        )
+
+        guard status == kCMBlockBufferNoErr, let srcPtr = dataPointer else { return nil }
+
+        // ScreenCaptureKit delivers non-interleaved Float32 audio.
+        // Copy each channel's data into the PCM buffer's separate channel buffers.
+        let dstBufferList = UnsafeMutableAudioBufferListPointer(pcmBuffer.mutableAudioBufferList)
+        let bytesPerChannel = dataLength / Int(format.channelCount)
+
+        for i in 0..<min(Int(format.channelCount), dstBufferList.count) {
+            guard let dstData = dstBufferList[i].mData else { continue }
+            let srcOffset = i * bytesPerChannel
+            memcpy(dstData, srcPtr.advanced(by: srcOffset), bytesPerChannel)
+        }
+
+        return pcmBuffer
     }
 }

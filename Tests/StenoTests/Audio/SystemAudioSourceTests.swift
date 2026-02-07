@@ -20,24 +20,20 @@ struct SystemAudioSourceTests {
 
     @Test func systemAudioErrorEquality() {
         #expect(SystemAudioError.permissionDenied == SystemAudioError.permissionDenied)
-        #expect(SystemAudioError.tapCreationFailed(-50) == SystemAudioError.tapCreationFailed(-50))
-        #expect(SystemAudioError.tapCreationFailed(-50) != SystemAudioError.tapCreationFailed(-1))
+        #expect(SystemAudioError.noDisplaysAvailable == SystemAudioError.noDisplaysAvailable)
+        #expect(SystemAudioError.streamStartFailed("a") == SystemAudioError.streamStartFailed("a"))
+        #expect(SystemAudioError.streamStartFailed("a") != SystemAudioError.streamStartFailed("b"))
     }
 
     @Test func systemAudioErrorTypes() {
         // Verify all error cases exist and are distinguishable
         let errors: [SystemAudioError] = [
-            .tapCreationFailed(0),
-            .formatReadFailed(0),
-            .tapUIDReadFailed(0),
-            .aggregateDeviceFailed(0),
-            .tapAssignmentFailed(0),
-            .ioProcFailed(0),
-            .deviceStartFailed(0),
+            .noDisplaysAvailable,
+            .streamStartFailed("test"),
             .permissionDenied,
         ]
 
-        #expect(errors.count == 8)
+        #expect(errors.count == 3)
     }
 
     // MARK: - Protocol Contract Tests (using MockAudioSource)
@@ -74,6 +70,6 @@ struct SystemAudioSourceTests {
         }
     }
 
-    // NOTE: Integration tests for actual hardware (real tap creation, audio capture)
-    // are run manually, not in CI. The Core Audio APIs require real audio hardware.
+    // NOTE: Integration tests for actual hardware (real ScreenCaptureKit, audio capture)
+    // are run manually, not in CI. ScreenCaptureKit requires a display and user permission.
 }

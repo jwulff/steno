@@ -1390,11 +1390,11 @@ class ViewState: ObservableObject, @unchecked Sendable {
                     self.log("[SYS] System audio error: \(error)")
                     switch error {
                     case .permissionDenied:
-                        self.errorMessage = "System audio requires \"Screen & System Audio Recording\" permission. Open System Settings > Privacy & Security > Screen & System Audio Recording and enable Steno."
-                    case .tapCreationFailed(let status):
-                        self.errorMessage = "System audio unavailable (tap creation failed: \(status))"
-                    default:
-                        self.errorMessage = "System audio unavailable: \(error)"
+                        self.errorMessage = "System audio requires \"Screen & System Audio Recording\" permission. Grant permission in the dialog or via System Settings > Privacy & Security."
+                    case .noDisplaysAvailable:
+                        self.errorMessage = "System audio unavailable: no display found"
+                    case .streamStartFailed(let reason):
+                        self.errorMessage = "System audio unavailable: \(reason)"
                     }
                     self.isSystemAudioEnabled = false
                     self.systemAudioSource = nil
