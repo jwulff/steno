@@ -1225,12 +1225,15 @@ class ViewState: ObservableObject, @unchecked Sendable {
         let source = SystemAudioSource()
         self.systemAudioSource = source
 
-        Task { @MainActor [weak self] in
+        // Setup task: create recognizer/analyzer on MainActor, then hand off buffer feeding to background
+        Task { [weak self] in
             guard let self else { return }
 
             do {
                 let (buffers, format) = try await source.start()
-                self.log("System audio started: \(format.sampleRate)Hz, \(format.channelCount)ch")
+                await MainActor.run {
+                    self.log("System audio started: \(format.sampleRate)Hz, \(format.channelCount)ch")
+                }
 
                 // Create second SpeechTranscriber + SpeechAnalyzer
                 let locale = Locale.current
@@ -1243,17 +1246,22 @@ class ViewState: ObservableObject, @unchecked Sendable {
                 let sysAnalyzer = SpeechAnalyzer(modules: [sysTranscriber])
                 let sysAnalyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [sysTranscriber])
 
-                self.systemTranscriber = sysTranscriber
-                self.systemAnalyzer = sysAnalyzer
-
                 // Create async stream for feeding audio to analyzer
                 let (inputSequence, sysInputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-                self.systemInputBuilder = sysInputBuilder
+
+                await MainActor.run {
+                    self.systemTranscriber = sysTranscriber
+                    self.systemAnalyzer = sysAnalyzer
+                    self.systemInputBuilder = sysInputBuilder
+                }
 
                 // Set up converter if formats differ
                 var converter: AVAudioConverter?
                 if let analyzerFmt = sysAnalyzerFormat, format != analyzerFmt {
                     converter = AVAudioConverter(from: format, to: analyzerFmt)
+                    await MainActor.run {
+                        self.log("[SYS] Created converter: \(format.sampleRate)Hz -> \(analyzerFmt.sampleRate)Hz")
+                    }
                 }
 
                 // Create audio processor for system audio buffers
@@ -1270,98 +1278,117 @@ class ViewState: ObservableObject, @unchecked Sendable {
                     }
                 )
 
-                // Listen for results from system audio recognizer
-                self.systemRecognizerTask = Task { [weak self] in
+                // Listen for results from system audio recognizer (@MainActor since it only handles UI updates)
+                let recognizerTask = Task { @MainActor [weak self] in
                     do {
                         for try await result in sysTranscriber.results {
-                            await MainActor.run {
-                                guard let self = self else { return }
+                            guard let self = self else { return }
 
-                                let text = String(result.text.characters)
+                            let text = String(result.text.characters)
 
-                                if result.isFinal {
-                                    self.log("[SYS] FINAL: '\(text)'")
+                            if result.isFinal {
+                                self.log("[SYS] FINAL: '\(text)'")
 
-                                    if !text.isEmpty {
-                                        let segment = TranscriptSegment(
-                                            text: text,
-                                            timestamp: Date(),
-                                            duration: 0,
-                                            confidence: nil,
-                                            source: .systemAudio
+                                if !text.isEmpty {
+                                    let segment = TranscriptSegment(
+                                        text: text,
+                                        timestamp: Date(),
+                                        duration: 0,
+                                        confidence: nil,
+                                        source: .systemAudio
+                                    )
+                                    self.segments.append(segment)
+
+                                    let entry = TranscriptEntry(
+                                        timestamp: Date(),
+                                        text: text,
+                                        isFinal: true,
+                                        source: .systemAudio
+                                    )
+                                    self.entries.append(entry)
+
+                                    // Persist to database
+                                    if let repository = self.repository, let session = self.currentSession {
+                                        self.currentSequenceNumber += 1
+                                        let storedSegment = StoredSegment.from(
+                                            segment,
+                                            sessionId: session.id,
+                                            sequenceNumber: self.currentSequenceNumber
                                         )
-                                        self.segments.append(segment)
-
-                                        let entry = TranscriptEntry(
-                                            timestamp: Date(),
-                                            text: text,
-                                            isFinal: true,
-                                            source: .systemAudio
-                                        )
-                                        self.entries.append(entry)
-
-                                        // Persist to database
-                                        if let repository = self.repository, let session = self.currentSession {
-                                            self.currentSequenceNumber += 1
-                                            let storedSegment = StoredSegment.from(
-                                                segment,
-                                                sessionId: session.id,
-                                                sequenceNumber: self.currentSequenceNumber
-                                            )
-                                            Task {
-                                                do {
-                                                    try await repository.saveSegment(storedSegment)
-                                                    self.log("[SYS] Saved segment \(self.currentSequenceNumber)")
-                                                } catch {
-                                                    self.log("[SYS] Failed to save segment: \(error)")
-                                                }
+                                        Task {
+                                            do {
+                                                try await repository.saveSegment(storedSegment)
+                                                self.log("[SYS] Saved segment \(self.currentSequenceNumber)")
+                                            } catch {
+                                                self.log("[SYS] Failed to save segment: \(error)")
                                             }
                                         }
                                     }
 
-                                    self.systemPartialText = ""
-
-                                    if self.transcriptIsLiveMode {
-                                        self.transcriptScrollOffset = 0
-                                    }
-                                } else {
-                                    self.log("[SYS] PARTIAL: '\(text)'")
-                                    self.systemPartialText = text
+                                    self.statusMessage = "Recording... MIC + SYS (\(self.segments.count) segments)"
                                 }
+
+                                self.systemPartialText = ""
+
+                                if self.transcriptIsLiveMode {
+                                    self.transcriptScrollOffset = 0
+                                }
+                            } else {
+                                self.systemPartialText = text
                             }
                         }
                     } catch {
-                        await MainActor.run {
-                            self?.log("[SYS] Recognition error: \(error.localizedDescription)")
-                        }
+                        self?.log("[SYS] Recognition error: \(error.localizedDescription)")
                     }
+                }
+
+                await MainActor.run {
+                    self.systemRecognizerTask = recognizerTask
                 }
 
                 // Start the system analyzer
                 try await sysAnalyzer.start(inputSequence: inputSequence)
+                await MainActor.run {
+                    self.log("[SYS] Analyzer started, feeding buffers...")
+                }
 
-                // Feed buffers from system audio source to the analyzer
+                // Feed buffers from system audio source to the analyzer (runs on background — NOT MainActor)
+                var bufferCount = 0
                 for await buffer in buffers {
                     sysProcessor.handleBuffer(buffer, AVAudioTime(hostTime: mach_absolute_time()))
+                    bufferCount += 1
+                    if bufferCount == 1 {
+                        await MainActor.run {
+                            self.log("[SYS] First buffer received and processed")
+                        }
+                    }
+                }
+
+                await MainActor.run {
+                    self.log("[SYS] Buffer stream ended after \(bufferCount) buffers")
                 }
 
             } catch let error as SystemAudioError {
-                self.log("[SYS] System audio error: \(error)")
-                switch error {
-                case .permissionDenied:
-                    self.errorMessage = "System audio capture requires permission. Open System Settings > Privacy & Security > Audio Capture and allow Steno."
-                case .tapCreationFailed(let status):
-                    self.errorMessage = "System audio unavailable (tap creation failed: \(status))"
-                default:
-                    self.errorMessage = "System audio unavailable: \(error)"
+                await MainActor.run {
+                    self.log("[SYS] System audio error: \(error)")
+                    switch error {
+                    case .permissionDenied:
+                        self.errorMessage = "System audio capture requires permission. Open System Settings > Privacy & Security > Audio Capture and allow Steno."
+                    case .tapCreationFailed(let status):
+                        self.errorMessage = "System audio unavailable (tap creation failed: \(status))"
+                    default:
+                        self.errorMessage = "System audio unavailable: \(error)"
+                    }
+                    self.isSystemAudioEnabled = false
+                    self.systemAudioSource = nil
                 }
-                self.isSystemAudioEnabled = false
-                self.systemAudioSource = nil
             } catch {
-                self.log("[SYS] Unexpected error: \(error)")
-                self.errorMessage = "System audio error: \(error.localizedDescription)"
-                self.isSystemAudioEnabled = false
-                self.systemAudioSource = nil
+                await MainActor.run {
+                    self.log("[SYS] Unexpected error: \(error)")
+                    self.errorMessage = "System audio error: \(error.localizedDescription)"
+                    self.isSystemAudioEnabled = false
+                    self.systemAudioSource = nil
+                }
             }
         }
 

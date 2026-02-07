@@ -110,15 +110,32 @@ public final class SystemAudioSource: AudioSource, @unchecked Sendable {
             let bufferList = inInputData.pointee
             let audioBuffer = bufferList.mBuffers
 
-            guard audioBuffer.mData != nil, audioBuffer.mDataByteSize > 0 else { return }
+            guard let srcData = audioBuffer.mData, audioBuffer.mDataByteSize > 0 else { return }
 
-            guard let pcmBuffer = AVAudioPCMBuffer(
-                pcmFormat: capturedFormat,
-                bufferListNoCopy: inInputData,
-                deallocator: nil
-            ) else { return }
+            // CRITICAL: Copy the audio data. The IOProc buffer is only valid during this callback.
+            let frameCount = audioBuffer.mDataByteSize / UInt32(MemoryLayout<Float>.stride * Int(capturedFormat.channelCount))
+            guard let copiedBuffer = AVAudioPCMBuffer(pcmFormat: capturedFormat, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
+            copiedBuffer.frameLength = AVAudioFrameCount(frameCount)
 
-            nonisolated(unsafe) let unsafeBuffer = pcmBuffer
+            // Copy channel data
+            if let srcFloat = srcData.assumingMemoryBound(to: Float.self) as UnsafeMutablePointer<Float>? {
+                let totalSamples = Int(frameCount) * Int(capturedFormat.channelCount)
+                if capturedFormat.isInterleaved {
+                    if let dst = copiedBuffer.floatChannelData?[0] {
+                        dst.update(from: srcFloat, count: totalSamples)
+                    }
+                } else {
+                    // Non-interleaved: copy each channel
+                    let framesPerChannel = Int(frameCount)
+                    for ch in 0..<Int(capturedFormat.channelCount) {
+                        if let dst = copiedBuffer.floatChannelData?[ch] {
+                            dst.update(from: srcFloat.advanced(by: ch * framesPerChannel), count: framesPerChannel)
+                        }
+                    }
+                }
+            }
+
+            nonisolated(unsafe) let unsafeBuffer = copiedBuffer
             capturedContinuation.yield(unsafeBuffer)
         }
 
