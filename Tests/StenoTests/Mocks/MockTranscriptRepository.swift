@@ -6,6 +6,7 @@ actor MockTranscriptRepository: TranscriptRepository {
     private var sessions: [UUID: Session] = [:]
     private var segments: [UUID: [StoredSegment]] = [:]
     private var summaries: [UUID: [Summary]] = [:]
+    private var topics: [UUID: [Topic]] = [:]
 
     // MARK: - Sessions
 
@@ -49,6 +50,7 @@ actor MockTranscriptRepository: TranscriptRepository {
         sessions.removeValue(forKey: id)
         segments.removeValue(forKey: id)
         summaries.removeValue(forKey: id)
+        topics.removeValue(forKey: id)
     }
 
     // MARK: - Segments
@@ -83,5 +85,15 @@ actor MockTranscriptRepository: TranscriptRepository {
 
     func latestSummary(for sessionId: UUID) async throws -> Summary? {
         summaries[sessionId]?.max { $0.createdAt < $1.createdAt }
+    }
+
+    // MARK: - Topics
+
+    func saveTopic(_ topic: Topic) async throws {
+        topics[topic.sessionId, default: []].append(topic)
+    }
+
+    func topics(for sessionId: UUID) async throws -> [Topic] {
+        (topics[sessionId] ?? []).sorted { $0.segmentRange.lowerBound < $1.segmentRange.lowerBound }
     }
 }

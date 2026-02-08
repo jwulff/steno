@@ -158,4 +158,44 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
         let response = try await session.respond(to: prompt, options: options)
         return response.content
     }
+
+    private let topicExtractionPrompt = """
+        You are a meeting topic extractor. Extract topics ONLY from the provided segments \
+        (these are NEW segments not yet covered by existing topics).
+        Previously identified topics are listed for context — do NOT re-extract them.
+        Return a JSON array of topics. Each topic has:
+        - "title": 2-5 word topic name
+        - "summary": 1-3 sentence description of what was discussed
+        - "startSegment": first segment number (1-based)
+        - "endSegment": last segment number (1-based)
+
+        Return ONLY the JSON array, no other text.
+        """
+
+    public func extractTopics(segments: [StoredSegment], previousTopics: [Topic], sessionId: UUID) async throws -> [Topic] {
+        guard await isAvailable else {
+            throw SummarizationError.modelNotAvailable
+        }
+
+        guard !segments.isEmpty else { return [] }
+
+        let session = LanguageModelSession { topicExtractionPrompt }
+
+        var prompt = ""
+        if !previousTopics.isEmpty {
+            prompt += "Previously identified topics (DO NOT re-extract): \(previousTopics.map(\.title).joined(separator: ", "))\n\n"
+        }
+        prompt += "NEW transcript segments (\(segments.count) total):\n\n"
+        for segment in segments {
+            prompt += "[\(segment.sequenceNumber)] \(segment.text)\n"
+        }
+
+        let options = GenerationOptions(
+            sampling: .greedy,
+            maximumResponseTokens: 500
+        )
+
+        let response = try await session.respond(to: prompt, options: options)
+        return TopicParser.parse(response.content, sessionId: sessionId)
+    }
 }

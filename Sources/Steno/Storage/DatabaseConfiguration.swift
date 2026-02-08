@@ -113,6 +113,22 @@ public enum DatabaseConfiguration {
             """)
         }
 
+        migrator.registerMigration("20260207_002_create_topics_table") { db in
+            try db.execute(sql: """
+                CREATE TABLE topics (
+                    id TEXT PRIMARY KEY,
+                    sessionId TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    segmentRangeStart INTEGER NOT NULL,
+                    segmentRangeEnd INTEGER NOT NULL,
+                    createdAt REAL NOT NULL
+                )
+            """)
+
+            try db.execute(sql: "CREATE INDEX idx_topics_session ON topics(sessionId)")
+        }
+
         return migrator
     }
 }

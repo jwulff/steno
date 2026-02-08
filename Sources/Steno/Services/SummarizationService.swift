@@ -25,6 +25,16 @@ public protocol SummarizationService: Sendable {
     /// - Returns: Formatted meeting notes with sections.
     /// - Throws: `SummarizationError` if generation fails.
     func generateMeetingNotes(segments: [StoredSegment], previousNotes: String?) async throws -> String
+
+    /// Extract discussion topics from transcript segments.
+    ///
+    /// - Parameters:
+    ///   - segments: The segments to analyze.
+    ///   - previousTopics: Previously extracted topics for continuity.
+    ///   - sessionId: The session these topics belong to.
+    /// - Returns: Array of extracted topics, or empty array on failure.
+    /// - Throws: `SummarizationError` if extraction fails.
+    func extractTopics(segments: [StoredSegment], previousTopics: [Topic], sessionId: UUID) async throws -> [Topic]
 }
 
 /// Errors that can occur during summarization.
