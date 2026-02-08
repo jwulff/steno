@@ -29,6 +29,21 @@ actor MockSummarizationService: SummarizationService {
         return "Mock meeting notes"
     }
 
+    var topicsToReturn: [Topic] = []
+    private(set) var extractTopicsCallCount = 0
+    private(set) var lastExtractTopicsSegments: [StoredSegment]?
+
+    func extractTopics(segments: [StoredSegment], previousTopics: [Topic]) async throws -> [Topic] {
+        extractTopicsCallCount += 1
+        lastExtractTopicsSegments = segments
+        if let error = shouldThrow { throw error }
+        return topicsToReturn
+    }
+
+    func setTopicsToReturn(_ value: [Topic]) {
+        topicsToReturn = value
+    }
+
     func setAvailable(_ value: Bool) {
         available = value
     }

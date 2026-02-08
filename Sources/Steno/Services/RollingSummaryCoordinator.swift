@@ -22,10 +22,11 @@ private func logSummary(_ message: String) {
     }
 }
 
-/// Result of summary generation containing both brief summary and detailed notes.
+/// Result of summary generation containing brief summary, detailed notes, and topics.
 public struct SummaryResult: Sendable {
     public let briefSummary: String
     public let meetingNotes: String
+    public let topics: [Topic]
 }
 
 /// Coordinates automatic rolling summary generation.
@@ -131,7 +132,7 @@ public actor RollingSummaryCoordinator {
         logSummary("Generating summary for \(segments.count) segments...")
         let lastSummary = try await repository.latestSummary(for: sessionId)
 
-        // Generate both brief summary and detailed meeting notes
+        // Generate brief summary, meeting notes, and topics concurrently
         async let briefSummaryTask = summarizer.summarize(
             segments: allSegments,  // Use all segments for context
             previousSummary: lastSummary?.content
@@ -144,6 +145,15 @@ public actor RollingSummaryCoordinator {
         let briefSummary = try await briefSummaryTask
         let meetingNotes = try await meetingNotesTask
 
+        // Topic extraction is non-critical — failures return empty array
+        let topics: [Topic]
+        do {
+            topics = try await summarizer.extractTopics(segments: allSegments, previousTopics: [])
+        } catch {
+            logSummary("Topic extraction failed (non-critical): \(error)")
+            topics = []
+        }
+
         let summary = Summary(
             sessionId: sessionId,
             content: briefSummary,
@@ -155,7 +165,7 @@ public actor RollingSummaryCoordinator {
         try await repository.saveSummary(summary)
         logSummary("Summary saved: \(briefSummary.prefix(50))...")
 
-        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: meetingNotes)
+        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: meetingNotes, topics: topics)
 
         // Notify callback if set (for backwards compatibility)
         if let callback = onSummaryGenerated {
