@@ -4,6 +4,8 @@ A fast, private speech-to-text TUI for macOS.
 
 Steno uses Apple's new SpeechAnalyzer API (macOS 26) for real-time transcription that runs entirely on-device. No cloud services, no API keys, no rate limits.
 
+![Steno transcribing a Seahawks press conference with 15 auto-extracted topics](assets/screenshot.png)
+
 ## Requirements
 
 - macOS 26 (Tahoe) or later
