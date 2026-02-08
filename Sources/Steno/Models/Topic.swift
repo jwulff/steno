@@ -5,6 +5,9 @@ public struct Topic: Sendable, Codable, Identifiable, Equatable {
     /// Unique identifier for this topic.
     public let id: UUID
 
+    /// The session this topic belongs to.
+    public let sessionId: UUID
+
     /// Short title describing the topic (2-5 words).
     public let title: String
 
@@ -19,12 +22,14 @@ public struct Topic: Sendable, Codable, Identifiable, Equatable {
 
     public init(
         id: UUID = UUID(),
+        sessionId: UUID,
         title: String,
         summary: String,
         segmentRange: ClosedRange<Int>,
         createdAt: Date = Date()
     ) {
         self.id = id
+        self.sessionId = sessionId
         self.title = title
         self.summary = summary
         self.segmentRange = segmentRange

@@ -145,14 +145,36 @@ public actor RollingSummaryCoordinator {
         let briefSummary = try await briefSummaryTask
         let meetingNotes = try await meetingNotesTask
 
-        // Topic extraction is non-critical — failures return empty array
-        let topics: [Topic]
-        do {
-            topics = try await summarizer.extractTopics(segments: allSegments, previousTopics: [])
-        } catch {
-            logSummary("Topic extraction failed (non-critical): \(error)")
-            topics = []
+        // Load existing topics from DB — these are immutable once persisted
+        let existingTopics = try await repository.topics(for: sessionId)
+
+        // Determine uncovered segments: find highest segmentRangeEnd across existing topics
+        let highestCovered = existingTopics.map(\.segmentRange.upperBound).max() ?? 0
+        let uncoveredSegments = allSegments.filter { $0.sequenceNumber > highestCovered }
+
+        // Topic extraction is non-critical — failures preserve existing topics
+        var newTopics: [Topic] = []
+        if !uncoveredSegments.isEmpty {
+            do {
+                newTopics = try await summarizer.extractTopics(
+                    segments: uncoveredSegments,
+                    previousTopics: existingTopics,
+                    sessionId: sessionId
+                )
+                logSummary("Extracted \(newTopics.count) new topics from \(uncoveredSegments.count) uncovered segments")
+            } catch {
+                logSummary("Topic extraction failed (non-critical): \(error)")
+            }
+
+            // Persist new topics
+            for topic in newTopics {
+                try await repository.saveTopic(topic)
+            }
+        } else {
+            logSummary("No uncovered segments, skipping topic extraction")
         }
+
+        let allTopics = existingTopics + newTopics
 
         let summary = Summary(
             sessionId: sessionId,
@@ -165,7 +187,7 @@ public actor RollingSummaryCoordinator {
         try await repository.saveSummary(summary)
         logSummary("Summary saved: \(briefSummary.prefix(50))...")
 
-        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: meetingNotes, topics: topics)
+        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: meetingNotes, topics: allTopics)
 
         // Notify callback if set (for backwards compatibility)
         if let callback = onSummaryGenerated {

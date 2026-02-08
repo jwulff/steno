@@ -30,12 +30,16 @@ actor MockSummarizationService: SummarizationService {
     }
 
     var topicsToReturn: [Topic] = []
+    var extractTopicsShouldThrow: SummarizationError?
     private(set) var extractTopicsCallCount = 0
     private(set) var lastExtractTopicsSegments: [StoredSegment]?
+    private(set) var lastExtractTopicsPreviousTopics: [Topic]?
 
-    func extractTopics(segments: [StoredSegment], previousTopics: [Topic]) async throws -> [Topic] {
+    func extractTopics(segments: [StoredSegment], previousTopics: [Topic], sessionId: UUID) async throws -> [Topic] {
         extractTopicsCallCount += 1
         lastExtractTopicsSegments = segments
+        lastExtractTopicsPreviousTopics = previousTopics
+        if let error = extractTopicsShouldThrow { throw error }
         if let error = shouldThrow { throw error }
         return topicsToReturn
     }
@@ -54,5 +58,9 @@ actor MockSummarizationService: SummarizationService {
 
     func setShouldThrow(_ error: SummarizationError?) {
         shouldThrow = error
+    }
+
+    func setExtractTopicsShouldThrow(_ error: SummarizationError?) {
+        extractTopicsShouldThrow = error
     }
 }

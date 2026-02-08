@@ -5,10 +5,13 @@ import Foundation
 @Suite("Topic Navigation Tests")
 struct TopicNavigationTests {
 
+    private let testSessionId = UUID()
+
     private func makeViewState(topicCount: Int = 3) -> ViewState {
         let state = ViewState(forTesting: true)
         state.topics = (0..<topicCount).map { i in
             Topic(
+                sessionId: testSessionId,
                 title: "Topic \(i + 1)",
                 summary: "Summary for topic \(i + 1).",
                 segmentRange: (i * 3 + 1)...(i * 3 + 3)
@@ -144,7 +147,7 @@ struct TopicNavigationTests {
     @Test func handleSummaryResultUpdatesTopics() {
         let state = ViewState(forTesting: true)
         let topics = [
-            Topic(title: "Budget", summary: "Q2 approved.", segmentRange: 1...3),
+            Topic(sessionId: testSessionId, title: "Budget", summary: "Q2 approved.", segmentRange: 1...3),
         ]
         let result = SummaryResult(briefSummary: "Brief", meetingNotes: "Notes", topics: topics)
 
@@ -156,7 +159,7 @@ struct TopicNavigationTests {
 
     @Test func handleSummaryResultPreservesTopicsOnEmpty() {
         let state = ViewState(forTesting: true)
-        state.topics = [Topic(title: "Existing", summary: "Keep.", segmentRange: 1...2)]
+        state.topics = [Topic(sessionId: testSessionId, title: "Existing", summary: "Keep.", segmentRange: 1...2)]
         let result = SummaryResult(briefSummary: "Brief", meetingNotes: "Notes", topics: [])
 
         state.handleSummaryResult(result)

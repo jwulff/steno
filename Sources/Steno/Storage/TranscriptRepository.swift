@@ -79,4 +79,17 @@ public protocol TranscriptRepository: Sendable {
     /// - Parameter sessionId: The session ID.
     /// - Returns: The latest summary if any exist.
     func latestSummary(for sessionId: UUID) async throws -> Summary?
+
+    // MARK: - Topics
+
+    /// Save a topic.
+    ///
+    /// - Parameter topic: The topic to save.
+    func saveTopic(_ topic: Topic) async throws
+
+    /// Retrieve all topics for a session, ordered by segment range start.
+    ///
+    /// - Parameter sessionId: The session ID.
+    /// - Returns: Array of topics in order.
+    func topics(for sessionId: UUID) async throws -> [Topic]
 }

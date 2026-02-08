@@ -5,6 +5,8 @@ import Foundation
 @Suite("TopicParser Tests")
 struct TopicParserTests {
 
+    private let testSessionId = UUID()
+
     @Test func validJSON() {
         let json = """
         [
@@ -13,14 +15,16 @@ struct TopicParserTests {
         ]
         """
 
-        let topics = TopicParser.parse(json)
+        let topics = TopicParser.parse(json, sessionId: testSessionId)
 
         #expect(topics.count == 2)
         #expect(topics[0].title == "Project timeline")
         #expect(topics[0].summary == "Deadline is March 15th.")
         #expect(topics[0].segmentRange == 1...5)
+        #expect(topics[0].sessionId == testSessionId)
         #expect(topics[1].title == "Budget review")
         #expect(topics[1].segmentRange == 6...10)
+        #expect(topics[1].sessionId == testSessionId)
     }
 
     @Test func jsonWithCodeFences() {
@@ -32,7 +36,7 @@ struct TopicParserTests {
         ```
         """
 
-        let topics = TopicParser.parse(json)
+        let topics = TopicParser.parse(json, sessionId: testSessionId)
 
         #expect(topics.count == 1)
         #expect(topics[0].title == "API migration")
@@ -47,7 +51,7 @@ struct TopicParserTests {
         ```
         """
 
-        let topics = TopicParser.parse(json)
+        let topics = TopicParser.parse(json, sessionId: testSessionId)
 
         #expect(topics.count == 1)
         #expect(topics[0].title == "Hiring update")
@@ -56,19 +60,19 @@ struct TopicParserTests {
     @Test func malformedJSONReturnsEmpty() {
         let json = "this is not json at all"
 
-        let topics = TopicParser.parse(json)
+        let topics = TopicParser.parse(json, sessionId: testSessionId)
 
         #expect(topics.isEmpty)
     }
 
     @Test func emptyStringReturnsEmpty() {
-        let topics = TopicParser.parse("")
+        let topics = TopicParser.parse("", sessionId: testSessionId)
 
         #expect(topics.isEmpty)
     }
 
     @Test func emptyArrayReturnsEmpty() {
-        let topics = TopicParser.parse("[]")
+        let topics = TopicParser.parse("[]", sessionId: testSessionId)
 
         #expect(topics.isEmpty)
     }
@@ -81,7 +85,7 @@ struct TopicParserTests {
         ]
         """
 
-        let topics = TopicParser.parse(json)
+        let topics = TopicParser.parse(json, sessionId: testSessionId)
 
         #expect(topics.count == 1)
         #expect(topics[0].title == "Valid")

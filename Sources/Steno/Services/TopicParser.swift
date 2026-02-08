@@ -7,9 +7,11 @@ import Foundation
 public enum TopicParser {
     /// Parse a JSON string into an array of Topics.
     ///
-    /// - Parameter jsonString: Raw LLM output, possibly wrapped in markdown code fences.
+    /// - Parameters:
+    ///   - jsonString: Raw LLM output, possibly wrapped in markdown code fences.
+    ///   - sessionId: The session these topics belong to.
     /// - Returns: Parsed topics, or empty array if parsing fails.
-    public static func parse(_ jsonString: String) -> [Topic] {
+    public static func parse(_ jsonString: String, sessionId: UUID) -> [Topic] {
         let cleaned = stripCodeFences(jsonString).trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let data = cleaned.data(using: .utf8) else { return [] }
@@ -19,6 +21,7 @@ public enum TopicParser {
             return raw.compactMap { rawTopic -> Topic? in
                 guard rawTopic.startSegment <= rawTopic.endSegment else { return nil }
                 return Topic(
+                    sessionId: sessionId,
                     title: rawTopic.title,
                     summary: rawTopic.summary,
                     segmentRange: rawTopic.startSegment...rawTopic.endSegment
