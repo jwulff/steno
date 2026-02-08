@@ -157,7 +157,9 @@ public final class AnthropicSummarizationService: SummarizationService, Sendable
     }
 
     private let topicExtractionPrompt = """
-        You are a meeting topic extractor. Analyze the transcript and identify distinct discussion topics.
+        You are a meeting topic extractor. Extract topics ONLY from the provided segments \
+        (these are NEW segments not yet covered by existing topics).
+        Previously identified topics are listed for context — do NOT re-extract them.
         Return a JSON array of topics. Each topic has:
         - "title": 2-5 word topic name
         - "summary": 1-3 sentence description of what was discussed
@@ -167,7 +169,7 @@ public final class AnthropicSummarizationService: SummarizationService, Sendable
         Return ONLY the JSON array, no other text.
         """
 
-    public func extractTopics(segments: [StoredSegment], previousTopics: [Topic]) async throws -> [Topic] {
+    public func extractTopics(segments: [StoredSegment], previousTopics: [Topic], sessionId: UUID) async throws -> [Topic] {
         guard await isAvailable else {
             throw SummarizationError.modelNotAvailable
         }
@@ -176,9 +178,9 @@ public final class AnthropicSummarizationService: SummarizationService, Sendable
 
         var userPrompt = ""
         if !previousTopics.isEmpty {
-            userPrompt += "Previously identified topics: \(previousTopics.map(\.title).joined(separator: ", "))\n\n"
+            userPrompt += "Previously identified topics (DO NOT re-extract): \(previousTopics.map(\.title).joined(separator: ", "))\n\n"
         }
-        userPrompt += "Transcript segments (\(segments.count) total):\n\n"
+        userPrompt += "NEW transcript segments (\(segments.count) total):\n\n"
         for segment in segments {
             userPrompt += "[\(segment.sequenceNumber)] \(segment.text)\n"
         }
@@ -214,7 +216,7 @@ public final class AnthropicSummarizationService: SummarizationService, Sendable
             throw SummarizationError.networkError("No text content in response")
         }
 
-        return TopicParser.parse(textContent.text)
+        return TopicParser.parse(textContent.text, sessionId: sessionId)
     }
 
     private func makeRequest(body: AnthropicRequest) throws -> URLRequest {

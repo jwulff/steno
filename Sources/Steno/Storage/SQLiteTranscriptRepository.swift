@@ -141,4 +141,22 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
                 .toDomain()
         }
     }
+
+    // MARK: - Topics
+
+    public func saveTopic(_ topic: Topic) async throws {
+        try await dbQueue.write { db in
+            try TopicRecord.from(topic).insert(db)
+        }
+    }
+
+    public func topics(for sessionId: UUID) async throws -> [Topic] {
+        try await dbQueue.read { db in
+            try TopicRecord
+                .filter(Column("sessionId") == sessionId.uuidString)
+                .order(Column("segmentRangeStart").asc)
+                .fetchAll(db)
+                .compactMap { $0.toDomain() }
+        }
+    }
 }

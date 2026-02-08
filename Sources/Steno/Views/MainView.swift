@@ -1386,6 +1386,20 @@ class ViewState: ObservableObject, @unchecked Sendable {
                                             do {
                                                 try await repository.saveSegment(storedSegment)
                                                 self.log("[SYS] Saved segment \(self.currentSequenceNumber)")
+
+                                                // Trigger rolling summary check
+                                                if let coordinator = self.summaryCoordinator {
+                                                    await MainActor.run {
+                                                        self.isModelProcessing = true
+                                                    }
+                                                    let result = await coordinator.onSegmentSaved(sessionId: session.id)
+                                                    await MainActor.run {
+                                                        self.isModelProcessing = false
+                                                        if let result = result {
+                                                            self.handleSummaryResult(result)
+                                                        }
+                                                    }
+                                                }
                                             } catch {
                                                 self.log("[SYS] Failed to save segment: \(error)")
                                             }

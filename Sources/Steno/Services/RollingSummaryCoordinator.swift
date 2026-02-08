@@ -42,6 +42,7 @@ public actor RollingSummaryCoordinator {
     private let timeThreshold: TimeInterval
     private var lastSummaryTime: [UUID: Date] = [:]
     private var onSummaryGenerated: ((SummaryResult) -> Void)?
+    private var isGenerating = false
 
     /// Create a new rolling summary coordinator.
     ///
@@ -76,6 +77,11 @@ public actor RollingSummaryCoordinator {
     /// - Returns: The generated summary result if summarization was triggered, nil otherwise.
     @discardableResult
     public func onSegmentSaved(sessionId: UUID) async -> SummaryResult? {
+        // Prevent re-entrance: if already generating, skip
+        guard !isGenerating else {
+            return nil
+        }
+
         do {
             let count = try await repository.segmentCount(for: sessionId)
             let lastSummary = try await repository.latestSummary(for: sessionId)
@@ -98,6 +104,8 @@ public actor RollingSummaryCoordinator {
             if shouldTriggerByCount || shouldTriggerByTime {
                 let reason = shouldTriggerByCount ? "count threshold" : "time threshold"
                 logSummary("Triggering summary (\(reason))...")
+                isGenerating = true
+                defer { isGenerating = false }
                 let result = try await generateRollingSummary(
                     sessionId: sessionId,
                     fromSequence: lastSummarizedSequence + 1
@@ -107,8 +115,9 @@ public actor RollingSummaryCoordinator {
             }
             return nil
         } catch {
+            isGenerating = false
             // Log error but don't propagate - summarization is non-critical
-            logSummary("Rolling summary failed: \(error)")
+            logSummary("Rolling summary FAILED: \(error) [\(type(of: error))]")
             return nil
         }
     }
@@ -129,30 +138,100 @@ public actor RollingSummaryCoordinator {
             return nil
         }
 
-        logSummary("Generating summary for \(segments.count) segments...")
-        let lastSummary = try await repository.latestSummary(for: sessionId)
+        logSummary("Generating for \(segments.count) segments (from=\(fromSequence))...")
 
-        // Generate brief summary, meeting notes, and topics concurrently
-        async let briefSummaryTask = summarizer.summarize(
-            segments: allSegments,  // Use all segments for context
-            previousSummary: lastSummary?.content
-        )
-        async let meetingNotesTask = summarizer.generateMeetingNotes(
-            segments: allSegments,  // Use all segments for complete notes
-            previousNotes: nil
-        )
+        // Generate summary, notes, and topics using a single detached task with timeout.
+        // The Foundation Model can hang indefinitely, so we enforce a hard deadline.
+        let summarizer = self.summarizer
+        let repository = self.repository
+        let lastSummaryContent = try await repository.latestSummary(for: sessionId)?.content
 
-        let briefSummary = try await briefSummaryTask
-        let meetingNotes = try await meetingNotesTask
+        // Load existing topics from DB — these are immutable once persisted
+        let existingTopics = try await repository.topics(for: sessionId)
+        logSummary("Found \(existingTopics.count) existing topics")
 
-        // Topic extraction is non-critical — failures return empty array
-        let topics: [Topic]
-        do {
-            topics = try await summarizer.extractTopics(segments: allSegments, previousTopics: [])
-        } catch {
-            logSummary("Topic extraction failed (non-critical): \(error)")
-            topics = []
+        // Determine uncovered segments
+        let highestCovered = existingTopics.map(\.segmentRange.upperBound).max() ?? 0
+        let uncoveredSegments = allSegments.filter { $0.sequenceNumber > highestCovered }
+
+        // Run all LLM calls in a detached task with a hard timeout
+        let llmTimeout: TimeInterval = 45
+        logSummary("Starting LLM generation (timeout: \(Int(llmTimeout))s)...")
+
+        struct LLMResults: Sendable {
+            var briefSummary: String = ""
+            var meetingNotes: String = ""
+            var newTopics: [Topic] = []
         }
+
+        let results: LLMResults = await {
+            let task = Task.detached { () -> LLMResults in
+                var r = LLMResults()
+
+                // Brief summary
+                do {
+                    logSummary("LLM: starting summarize...")
+                    r.briefSummary = try await summarizer.summarize(
+                        segments: allSegments,
+                        previousSummary: lastSummaryContent
+                    )
+                    logSummary("LLM: summarize done (\(r.briefSummary.count) chars)")
+                } catch {
+                    logSummary("LLM: summarize failed: \(error)")
+                }
+
+                // Meeting notes
+                do {
+                    logSummary("LLM: starting meeting notes...")
+                    r.meetingNotes = try await summarizer.generateMeetingNotes(
+                        segments: allSegments,
+                        previousNotes: nil
+                    )
+                    logSummary("LLM: meeting notes done (\(r.meetingNotes.count) chars)")
+                } catch {
+                    logSummary("LLM: meeting notes failed: \(error)")
+                }
+
+                // Topic extraction
+                if !uncoveredSegments.isEmpty {
+                    do {
+                        logSummary("LLM: extracting topics from \(uncoveredSegments.count) segments...")
+                        r.newTopics = try await summarizer.extractTopics(
+                            segments: uncoveredSegments,
+                            previousTopics: existingTopics,
+                            sessionId: sessionId
+                        )
+                        logSummary("LLM: extracted \(r.newTopics.count) topics")
+                    } catch {
+                        logSummary("LLM: topic extraction failed: \(error)")
+                    }
+                }
+
+                return r
+            }
+
+            // Hard timeout: cancel the detached task after deadline
+            let timeoutTask = Task.detached {
+                try? await Task.sleep(for: .seconds(llmTimeout))
+                task.cancel()
+                logSummary("LLM: CANCELLED after \(Int(llmTimeout))s timeout")
+            }
+
+            let result = await task.value
+            timeoutTask.cancel()
+            return result
+        }()
+
+        logSummary("LLM generation complete: summary=\(results.briefSummary.count)ch, notes=\(results.meetingNotes.count)ch, topics=\(results.newTopics.count)")
+
+        // Persist new topics
+        for topic in results.newTopics {
+            try await repository.saveTopic(topic)
+        }
+
+        let allTopics = existingTopics + results.newTopics
+
+        let briefSummary = results.briefSummary.isEmpty ? "Processing..." : results.briefSummary
 
         let summary = Summary(
             sessionId: sessionId,
@@ -165,7 +244,7 @@ public actor RollingSummaryCoordinator {
         try await repository.saveSummary(summary)
         logSummary("Summary saved: \(briefSummary.prefix(50))...")
 
-        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: meetingNotes, topics: topics)
+        let result = SummaryResult(briefSummary: briefSummary, meetingNotes: results.meetingNotes, topics: allTopics)
 
         // Notify callback if set (for backwards compatibility)
         if let callback = onSummaryGenerated {

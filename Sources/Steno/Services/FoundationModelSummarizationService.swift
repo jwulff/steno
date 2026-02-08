@@ -160,7 +160,9 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
     }
 
     private let topicExtractionPrompt = """
-        You are a meeting topic extractor. Analyze the transcript and identify distinct discussion topics.
+        You are a meeting topic extractor. Extract topics ONLY from the provided segments \
+        (these are NEW segments not yet covered by existing topics).
+        Previously identified topics are listed for context — do NOT re-extract them.
         Return a JSON array of topics. Each topic has:
         - "title": 2-5 word topic name
         - "summary": 1-3 sentence description of what was discussed
@@ -170,7 +172,7 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
         Return ONLY the JSON array, no other text.
         """
 
-    public func extractTopics(segments: [StoredSegment], previousTopics: [Topic]) async throws -> [Topic] {
+    public func extractTopics(segments: [StoredSegment], previousTopics: [Topic], sessionId: UUID) async throws -> [Topic] {
         guard await isAvailable else {
             throw SummarizationError.modelNotAvailable
         }
@@ -181,9 +183,9 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
 
         var prompt = ""
         if !previousTopics.isEmpty {
-            prompt += "Previously identified topics: \(previousTopics.map(\.title).joined(separator: ", "))\n\n"
+            prompt += "Previously identified topics (DO NOT re-extract): \(previousTopics.map(\.title).joined(separator: ", "))\n\n"
         }
-        prompt += "Transcript segments (\(segments.count) total):\n\n"
+        prompt += "NEW transcript segments (\(segments.count) total):\n\n"
         for segment in segments {
             prompt += "[\(segment.sequenceNumber)] \(segment.text)\n"
         }
@@ -194,6 +196,6 @@ public final class FoundationModelSummarizationService: SummarizationService, Se
         )
 
         let response = try await session.respond(to: prompt, options: options)
-        return TopicParser.parse(response.content)
+        return TopicParser.parse(response.content, sessionId: sessionId)
     }
 }
