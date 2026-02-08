@@ -29,6 +29,23 @@ public struct SummaryResult: Sendable {
     public let topics: [Topic]
 }
 
+/// Runs an async closure with a timeout. Throws CancellationError if the timeout expires.
+private func withTimeout<T: Sendable>(
+    seconds: TimeInterval,
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw CancellationError()
+        }
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
+    }
+}
+
 /// Coordinates automatic rolling summary generation.
 ///
 /// This coordinator monitors segment saves and triggers summary generation
@@ -132,18 +149,39 @@ public actor RollingSummaryCoordinator {
         logSummary("Generating summary for \(segments.count) segments...")
         let lastSummary = try await repository.latestSummary(for: sessionId)
 
-        // Generate brief summary, meeting notes, and topics concurrently
-        async let briefSummaryTask = summarizer.summarize(
-            segments: allSegments,  // Use all segments for context
-            previousSummary: lastSummary?.content
-        )
-        async let meetingNotesTask = summarizer.generateMeetingNotes(
-            segments: allSegments,  // Use all segments for complete notes
-            previousNotes: nil
-        )
+        let llmTimeout: TimeInterval = 60
 
-        let briefSummary = try await briefSummaryTask
-        let meetingNotes = try await meetingNotesTask
+        // Generate brief summary and meeting notes with timeouts
+        let capturedSummarizer = summarizer
+        let capturedAllSegments = allSegments
+        let capturedPreviousSummary = lastSummary?.content
+
+        var briefSummary = "Summary generation timed out."
+        var meetingNotes = ""
+
+        do {
+            logSummary("Starting brief summary...")
+            async let briefTask = withTimeout(seconds: llmTimeout) {
+                try await capturedSummarizer.summarize(
+                    segments: capturedAllSegments,
+                    previousSummary: capturedPreviousSummary
+                )
+            }
+            async let notesTask = withTimeout(seconds: llmTimeout) {
+                try await capturedSummarizer.generateMeetingNotes(
+                    segments: capturedAllSegments,
+                    previousNotes: nil
+                )
+            }
+            briefSummary = try await briefTask
+            logSummary("Brief summary complete (\(briefSummary.count) chars)")
+            meetingNotes = try await notesTask
+            logSummary("Meeting notes complete (\(meetingNotes.count) chars)")
+        } catch is CancellationError {
+            logSummary("LLM timed out after \(Int(llmTimeout))s — continuing with topics only")
+        } catch {
+            logSummary("LLM summarization failed: \(error) — continuing with topics only")
+        }
 
         // Load existing topics from DB — these are immutable once persisted
         let existingTopics = try await repository.topics(for: sessionId)
@@ -156,12 +194,17 @@ public actor RollingSummaryCoordinator {
         var newTopics: [Topic] = []
         if !uncoveredSegments.isEmpty {
             do {
-                newTopics = try await summarizer.extractTopics(
-                    segments: uncoveredSegments,
-                    previousTopics: existingTopics,
-                    sessionId: sessionId
-                )
+                logSummary("Extracting topics from \(uncoveredSegments.count) uncovered segments...")
+                newTopics = try await withTimeout(seconds: llmTimeout) {
+                    try await capturedSummarizer.extractTopics(
+                        segments: uncoveredSegments,
+                        previousTopics: existingTopics,
+                        sessionId: sessionId
+                    )
+                }
                 logSummary("Extracted \(newTopics.count) new topics from \(uncoveredSegments.count) uncovered segments")
+            } catch is CancellationError {
+                logSummary("Topic extraction timed out after \(Int(llmTimeout))s")
             } catch {
                 logSummary("Topic extraction failed (non-critical): \(error)")
             }
