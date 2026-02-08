@@ -84,11 +84,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 // TestLiveDaemonEventStream tests subscribing to events and receiving them.
 // Uses a separate connection for the event stream.
 // Skipped if the daemon socket doesn't exist.
-// NOTE: This test may crash the daemon due to speech recognition entitlement
-// issues when recording in a CLI context. Run manually when testing with
-// proper microphone permissions.
 func TestLiveDaemonEventStream(t *testing.T) {
-	t.Skip("Skipped: daemon crashes when recording with event subscriber (entitlement issue)")
 	sockPath := SocketPath()
 	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
 		t.Skip("daemon not running")
