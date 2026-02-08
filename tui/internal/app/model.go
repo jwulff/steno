@@ -691,7 +691,13 @@ func renderLevelMeter(label string, level float32) string {
 		}
 	}
 
-	return ui.DimStyle.Render(label+" ") + bar
+	var styledLabel string
+	if label == "SYS" {
+		styledLabel = ui.SysLabelStyle.Render(label)
+	} else {
+		styledLabel = ui.MicLabelStyle.Render(label)
+	}
+	return styledLabel + " " + bar
 }
 
 func (m Model) renderMainContent() string {
@@ -823,7 +829,7 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		lines = append(lines, ui.DimStyle.Render("  Press Space to start recording"))
 	} else {
 		// Build display lines from entries, wrapping long text
-		// Prefix: "  [HH:MM:SS] [You] " = ~22 chars visible
+		// Prefix: "  [HH:MM:SS] [MIC] " = ~22 chars visible
 		prefixWidth := 22
 		textWidth := max(10, width-prefixWidth-2) // -2 for leading indent
 		indentStr := strings.Repeat(" ", prefixWidth)
@@ -833,9 +839,9 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			ts := ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
 			var src string
 			if e.Source == "systemAudio" {
-				src = ui.SourceLabelStyle.Render("[Others] ")
+				src = ui.SysLabelStyle.Render("[SYS] ")
 			} else {
-				src = ui.SourceLabelStyle.Render("[You] ")
+				src = ui.MicLabelStyle.Render("[MIC] ")
 			}
 			wrapped := wrapText(e.Text, textWidth)
 			displayLines = append(displayLines, ts+" "+src+wrapped[0])
@@ -847,11 +853,9 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		// Partial text
 		if m.partialText != "" {
 			ts := ui.TimestampStyle.Render(time.Now().Format("[15:04:05]"))
-			var src string
+			src := ui.PartialTextStyle.Render("[MIC] ")
 			if m.partialSrc == "systemAudio" {
-				src = ui.SourceLabelStyle.Render("[Others] ")
-			} else {
-				src = ui.SourceLabelStyle.Render("[You] ")
+				src = ui.PartialTextStyle.Render("[SYS] ")
 			}
 			wrapped := wrapText(m.partialText+"▌", textWidth)
 			partial := ui.PartialTextStyle.Render(wrapped[0])

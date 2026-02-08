@@ -46,8 +46,11 @@ var (
 	TimestampStyle = lipgloss.NewStyle().
 			Foreground(ColorGray)
 
-	SourceLabelStyle = lipgloss.NewStyle().
-				Foreground(ColorCyan)
+	MicLabelStyle = lipgloss.NewStyle().
+			Foreground(ColorGreen)
+
+	SysLabelStyle = lipgloss.NewStyle().
+			Foreground(ColorCyan)
 
 	PanelTitleStyle = lipgloss.NewStyle().
 			Bold(true).

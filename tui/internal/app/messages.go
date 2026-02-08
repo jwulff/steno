@@ -2,9 +2,10 @@ package app
 
 import "github.com/jwulff/steno/tui/internal/daemon"
 
-// DaemonConnectedMsg is sent when the daemon connection is established.
+// DaemonConnectedMsg is sent when both daemon connections are established.
 type DaemonConnectedMsg struct {
-	Client *daemon.Client
+	Client   *daemon.Client // for commands (start, stop, status, devices)
+	EvClient *daemon.Client // for event subscription
 }
 
 // DaemonConnectErrorMsg is sent when the daemon connection fails.
