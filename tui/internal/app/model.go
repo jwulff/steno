@@ -40,7 +40,8 @@ type TopicDisplay struct {
 // Model is the root bubbletea model for the steno TUI.
 type Model struct {
 	// Connection state
-	client    *daemon.Client
+	client    *daemon.Client // command connection
+	evClient  *daemon.Client // event subscription connection
 	connected bool
 	connError string
 
@@ -103,32 +104,39 @@ func (m Model) Init() tea.Cmd {
 	return connectCmd()
 }
 
-// connectCmd attempts to connect to the daemon.
+// connectCmd attempts to connect to the daemon with two connections:
+// one for commands, one for event subscription.
 func connectCmd() tea.Cmd {
 	return func() tea.Msg {
-		client, err := daemon.Connect(daemon.SocketPath())
+		sockPath := daemon.SocketPath()
+		client, err := daemon.Connect(sockPath)
 		if err != nil {
 			return DaemonConnectErrorMsg{Err: err}
 		}
-		return DaemonConnectedMsg{Client: client}
+		evClient, err := daemon.Connect(sockPath)
+		if err != nil {
+			client.Close()
+			return DaemonConnectErrorMsg{Err: err}
+		}
+		return DaemonConnectedMsg{Client: client, EvClient: evClient}
 	}
 }
 
-// subscribeCmd sends a subscribe command and starts reading events.
-func subscribeCmd(client *daemon.Client) tea.Cmd {
+// subscribeCmd sends a subscribe command on the event client and starts reading events.
+func subscribeCmd(evClient *daemon.Client) tea.Cmd {
 	return func() tea.Msg {
-		_, err := client.SendCommand(daemon.Command{Cmd: "subscribe"})
+		_, err := evClient.SendCommand(daemon.Command{Cmd: "subscribe"})
 		if err != nil {
 			return DaemonEventErrorMsg{Err: err}
 		}
-		return readEventCmd(client)()
+		return readEventCmd(evClient)()
 	}
 }
 
-// readEventCmd reads the next event from the daemon.
-func readEventCmd(client *daemon.Client) tea.Cmd {
+// readEventCmd reads the next event from the event client.
+func readEventCmd(evClient *daemon.Client) tea.Cmd {
 	return func() tea.Msg {
-		ev, err := client.ReadEvent()
+		ev, err := evClient.ReadEvent()
 		if err != nil {
 			return DaemonEventErrorMsg{Err: err}
 		}
@@ -249,14 +257,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case DaemonConnectedMsg:
 		m.client = msg.Client
+		m.evClient = msg.EvClient
 		m.connected = true
 		m.connError = ""
 		m.reconnecting = false
 		m.reconnectAttempt = 0
 		m.statusText = "Connected"
-		// Subscribe to events, fetch status and devices, open store
+		// Subscribe on event client, fetch status/devices on command client
 		return m, tea.Batch(
-			subscribeCmd(m.client),
+			subscribeCmd(m.evClient),
 			statusCmd(m.client),
 			devicesCmd(m.client),
 			openStoreCmd(),
@@ -323,8 +332,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case DaemonEventMsg:
 		cmd := m.handleEvent(msg.Event)
-		// Continue reading events
-		return m, tea.Batch(cmd, readEventCmd(m.client))
+		// Continue reading events on event client
+		return m, tea.Batch(cmd, readEventCmd(m.evClient))
 
 	case DaemonEventErrorMsg:
 		m.connected = false
@@ -334,6 +343,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.client != nil {
 			m.client.Close()
 			m.client = nil
+		}
+		if m.evClient != nil {
+			m.evClient.Close()
+			m.evClient = nil
 		}
 		return m, reconnectCmd(m.reconnectAttempt)
 
@@ -440,6 +453,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "Q", "ctrl+c":
 		if m.client != nil {
 			m.client.Close()
+		}
+		if m.evClient != nil {
+			m.evClient.Close()
 		}
 		return m, tea.Quit
 
@@ -806,7 +822,12 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		lines = append(lines, "")
 		lines = append(lines, ui.DimStyle.Render("  Press Space to start recording"))
 	} else {
-		// Build display lines from entries
+		// Build display lines from entries, wrapping long text
+		// Prefix: "  [HH:MM:SS] [You] " = ~22 chars visible
+		prefixWidth := 22
+		textWidth := max(10, width-prefixWidth-2) // -2 for leading indent
+		indentStr := strings.Repeat(" ", prefixWidth)
+
 		var displayLines []string
 		for _, e := range m.entries {
 			ts := ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
@@ -816,7 +837,11 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			} else {
 				src = ui.SourceLabelStyle.Render("[You] ")
 			}
-			displayLines = append(displayLines, ts+" "+src+e.Text)
+			wrapped := wrapText(e.Text, textWidth)
+			displayLines = append(displayLines, ts+" "+src+wrapped[0])
+			for _, wl := range wrapped[1:] {
+				displayLines = append(displayLines, indentStr+wl)
+			}
 		}
 
 		// Partial text
@@ -828,8 +853,12 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			} else {
 				src = ui.SourceLabelStyle.Render("[You] ")
 			}
-			partial := ui.PartialTextStyle.Render(m.partialText + "▌")
+			wrapped := wrapText(m.partialText+"▌", textWidth)
+			partial := ui.PartialTextStyle.Render(wrapped[0])
 			displayLines = append(displayLines, ts+" "+src+partial)
+			for _, wl := range wrapped[1:] {
+				displayLines = append(displayLines, indentStr+ui.PartialTextStyle.Render(wl))
+			}
 		}
 
 		// Apply scroll
