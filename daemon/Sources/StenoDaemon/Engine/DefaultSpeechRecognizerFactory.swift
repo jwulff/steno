@@ -13,17 +13,22 @@ public final class DefaultSpeechRecognizerFactory: SpeechRecognizerFactory, Send
     }
 }
 
+/// Shared reference so the handle's `stop()` can reach the analyzer
+/// created on `@MainActor` inside `Pipeline.run()`.
+private final class AnalyzerRef: @unchecked Sendable {
+    var analyzer: SpeechAnalyzer?
+}
+
 /// Real speech recognizer handle wrapping SpeechAnalyzer.
 ///
-/// Uses `@unchecked Sendable` because `SpeechAnalyzer` and `SpeechTranscriber`
-/// are not yet marked Sendable by Apple. Access is serialized: `transcribe` sets
-/// up state synchronously, then a single Task drives the pipeline.
+/// ALL Speech framework interaction (construction, start, results iteration,
+/// finalization) runs on `@MainActor`. CLI executables crash with SIGTRAP
+/// if any Speech framework work happens off the main actor.
 final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Sendable {
     private let locale: Locale
     private let inputFormat: AVAudioFormat
     private let source: AudioSourceType
-    private var analyzer: SpeechAnalyzer?
-    private var transcriber: SpeechTranscriber?
+    private let analyzerRef = AnalyzerRef()
 
     init(locale: Locale, inputFormat: AVAudioFormat, source: AudioSourceType) {
         self.locale = locale
@@ -33,27 +38,16 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
 
     func transcribe(buffers: AsyncStream<AVAudioPCMBuffer>)
         -> AsyncThrowingStream<RecognizerResult, Error> {
-        let transcriber = SpeechTranscriber(
-            locale: self.locale,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
-            attributeOptions: []
-        )
-        self.transcriber = transcriber
-
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        self.analyzer = analyzer
-
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
 
         let pipeline = Pipeline(
             buffers: buffers,
             inputFormat: inputFormat,
             source: source,
-            analyzer: analyzer,
-            transcriber: transcriber,
+            locale: locale,
             inputSequence: inputSequence,
-            inputBuilder: inputBuilder
+            inputBuilder: inputBuilder,
+            analyzerRef: analyzerRef
         )
 
         return AsyncThrowingStream { continuation in
@@ -68,31 +62,43 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
 
     func stop() async {
         do {
-            try await analyzer?.finalizeAndFinishThroughEndOfInput()
+            try await Task { @MainActor in
+                try await self.analyzerRef.analyzer?.finalizeAndFinishThroughEndOfInput()
+            }.value
         } catch {
             // Ignore cleanup errors
         }
-        analyzer = nil
-        transcriber = nil
+        analyzerRef.analyzer = nil
     }
 }
 
-/// Packages all pipeline state into a Sendable value that can cross
+/// Packages pipeline state into a Sendable value that can cross
 /// the `sending` boundary of `Task.detached` without capture issues.
+///
+/// Speech framework objects are created inside `run()` on `@MainActor`,
+/// not passed in from outside.
 private struct Pipeline: @unchecked Sendable {
     let buffers: AsyncStream<AVAudioPCMBuffer>
     let inputFormat: AVAudioFormat
     let source: AudioSourceType
-    let analyzer: SpeechAnalyzer
-    let transcriber: SpeechTranscriber
+    let locale: Locale
     let inputSequence: AsyncStream<AnalyzerInput>
     let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+    let analyzerRef: AnalyzerRef
 
     func run(continuation: AsyncThrowingStream<RecognizerResult, Error>.Continuation) async {
-        // Get the format SpeechAnalyzer expects and create a converter if needed.
-        let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
-            compatibleWith: [transcriber]
-        )
+        // Query the format SpeechAnalyzer expects on @MainActor (Speech framework
+        // calls must stay on the main actor in CLI executables).
+        let analyzerFormat = await Task { @MainActor in
+            await SpeechAnalyzer.bestAvailableAudioFormat(
+                compatibleWith: [SpeechTranscriber(
+                    locale: self.locale,
+                    transcriptionOptions: [],
+                    reportingOptions: [.volatileResults],
+                    attributeOptions: []
+                )]
+            )
+        }.value
         let converter: AVAudioConverter? = if let analyzerFormat, inputFormat != analyzerFormat {
             AVAudioConverter(from: inputFormat, to: analyzerFormat)
         } else {
@@ -129,35 +135,42 @@ private struct Pipeline: @unchecked Sendable {
                     self.inputBuilder.finish()
                 }
 
-                // Task 2: Listen for transcription results.
+                // Task 2: Construct Speech objects on @MainActor, start the
+                // analyzer, and iterate results — ALL on @MainActor.
                 // MUST start BEFORE analyzer.start() because start() blocks
                 // until the input stream ends.
-                group.addTask {
-                    for try await result in self.transcriber.results {
-                        let text = String(result.text.characters)
-                        // #64: carry the result's audio time range (analyzer
-                        // input timeline) so segments can be joined to
-                        // diarization windows on the frame-accurate capture
-                        // clock. CMTimeGetSeconds yields NaN for an invalid
-                        // range → treated as unavailable (nil).
-                        let startSeconds = CMTimeGetSeconds(result.range.start)
-                        let durationSeconds = CMTimeGetSeconds(result.range.duration)
-                        continuation.yield(RecognizerResult(
-                            text: text,
-                            isFinal: result.isFinal,
-                            source: self.source,
-                            audioStartSeconds: startSeconds.isFinite ? startSeconds : nil,
-                            audioDurationSeconds: durationSeconds.isFinite ? durationSeconds : nil
-                        ))
-                    }
-                }
-
-                // Task 3: Start the analyzer on @MainActor.
-                // SpeechAnalyzer MUST run on @MainActor — crashes with
-                // SIGTRAP otherwise.
+                // CLI executables crash with SIGTRAP if any Speech framework
+                // work happens off the main actor.
                 group.addTask {
                     try await Task { @MainActor in
-                        try await self.analyzer.start(inputSequence: self.inputSequence)
+                        let transcriber = SpeechTranscriber(
+                            locale: self.locale,
+                            transcriptionOptions: [],
+                            reportingOptions: [.volatileResults],
+                            attributeOptions: []
+                        )
+                        let analyzer = SpeechAnalyzer(modules: [transcriber])
+                        self.analyzerRef.analyzer = analyzer
+
+                        try await analyzer.start(inputSequence: self.inputSequence)
+
+                        for try await result in transcriber.results {
+                            let text = String(result.text.characters)
+                            // #64: carry the result's audio time range (analyzer
+                            // input timeline) so segments can be joined to
+                            // diarization windows on the frame-accurate capture
+                            // clock. CMTimeGetSeconds yields NaN for an invalid
+                            // range → treated as unavailable (nil).
+                            let startSeconds = CMTimeGetSeconds(result.range.start)
+                            let durationSeconds = CMTimeGetSeconds(result.range.duration)
+                            continuation.yield(RecognizerResult(
+                                text: text,
+                                isFinal: result.isFinal,
+                                source: self.source,
+                                audioStartSeconds: startSeconds.isFinite ? startSeconds : nil,
+                                audioDurationSeconds: durationSeconds.isFinite ? durationSeconds : nil
+                            ))
+                        }
                     }.value
                 }
 
