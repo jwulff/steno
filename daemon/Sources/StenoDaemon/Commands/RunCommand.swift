@@ -1,7 +1,7 @@
 import ArgumentParser
 import Foundation
 
-struct RunCommand: AsyncParsableCommand {
+struct RunCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
         abstract: "Start the daemon in the foreground"
@@ -13,7 +13,7 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Database path (default: ~/Library/Application Support/Steno/steno.sqlite)")
     var dbPath: String?
 
-    func run() async throws {
+    func run() throws {
         let log = DaemonLogger.daemon
 
         // 1. Ensure base directory
@@ -26,67 +26,84 @@ struct RunCommand: AsyncParsableCommand {
             print("steno-daemon: another instance is already running (PID \(existingPID ?? 0))")
             throw ExitCode.failure
         }
-        defer { pidFile.release() }
 
-        log.info("Starting steno-daemon (PID \(ProcessInfo.processInfo.processIdentifier))")
+        let socketPath = self.socketPath
+        let dbPath = self.dbPath
 
-        // 3. Initialize database
-        let dbURL = dbPath.map { URL(fileURLWithPath: $0) } ?? DaemonPaths.databaseURL
-        let dbQueue = try DatabaseConfiguration.makeQueue(at: dbURL)
-        let repository = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        // Launch all async work in a Task, then keep the main RunLoop alive
+        // via dispatchMain(). SpeechAnalyzer requires the main RunLoop.
+        Task {
+            do {
+                log.info("Starting steno-daemon (PID \(ProcessInfo.processInfo.processIdentifier))")
 
-        // 4. Initialize services
-        let permissionService = SystemPermissionService()
-        let summarizer: SummarizationService = FoundationModelSummarizationService()
+                // 3. Initialize database
+                let dbURL = dbPath.map { URL(fileURLWithPath: $0) } ?? DaemonPaths.databaseURL
+                let dbQueue = try DatabaseConfiguration.makeQueue(at: dbURL)
+                let repository = SQLiteTranscriptRepository(dbQueue: dbQueue)
 
-        let summaryCoordinator = RollingSummaryCoordinator(
-            repository: repository,
-            summarizer: summarizer
-        )
+                // 4. Initialize services
+                let permissionService = SystemPermissionService()
+                let summarizer: SummarizationService = FoundationModelSummarizationService()
 
-        let audioSourceFactory = DefaultAudioSourceFactory()
-        let speechRecognizerFactory = DefaultSpeechRecognizerFactory()
+                let summaryCoordinator = RollingSummaryCoordinator(
+                    repository: repository,
+                    summarizer: summarizer
+                )
 
-        // 5. Create engine, broadcaster, dispatcher
-        let broadcaster = EventBroadcaster()
+                let audioSourceFactory = DefaultAudioSourceFactory()
+                let speechRecognizerFactory = DefaultSpeechRecognizerFactory()
 
-        let engine = RecordingEngine(
-            repository: repository,
-            permissionService: permissionService,
-            summaryCoordinator: summaryCoordinator,
-            audioSourceFactory: audioSourceFactory,
-            speechRecognizerFactory: speechRecognizerFactory,
-            delegate: broadcaster
-        )
+                // 5. Create engine, broadcaster, dispatcher
+                let broadcaster = EventBroadcaster()
 
-        let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
+                let engine = RecordingEngine(
+                    repository: repository,
+                    permissionService: permissionService,
+                    summaryCoordinator: summaryCoordinator,
+                    audioSourceFactory: audioSourceFactory,
+                    speechRecognizerFactory: speechRecognizerFactory,
+                    delegate: broadcaster
+                )
 
-        // 6. Start socket server
-        let server = UnixSocketServer()
-        let sockPath = socketPath ?? DaemonPaths.socketPath
+                let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
 
-        server.onCommand = { client, command in
-            await dispatcher.handle(command, from: client)
+                // 6. Start socket server
+                let server = UnixSocketServer()
+                let sockPath = socketPath ?? DaemonPaths.socketPath
+
+                server.onCommand = { client, command in
+                    await dispatcher.handle(command, from: client)
+                }
+
+                server.onClientDisconnected = { clientId in
+                    await broadcaster.unsubscribe(clientId)
+                }
+
+                try await server.start(at: sockPath)
+                log.info("Listening on \(sockPath)")
+                print("steno-daemon: listening on \(sockPath)")
+
+                // 7. Await shutdown signal
+                for await signal in makeSignalStream() {
+                    log.info("Received \(String(describing: signal)), shutting down...")
+                    print("steno-daemon: shutting down...")
+                    break
+                }
+
+                // 8. Graceful shutdown
+                await engine.stop()
+                await server.stop()
+                pidFile.release()
+                log.info("Shutdown complete")
+                Foundation.exit(0)
+            } catch {
+                pidFile.release()
+                log.error("Fatal error: \(error)")
+                Foundation.exit(1)
+            }
         }
 
-        server.onClientDisconnected = { clientId in
-            await broadcaster.unsubscribe(clientId)
-        }
-
-        try await server.start(at: sockPath)
-        log.info("Listening on \(sockPath)")
-        print("steno-daemon: listening on \(sockPath)")
-
-        // 7. Await shutdown signal
-        for await signal in makeSignalStream() {
-            log.info("Received \(String(describing: signal)), shutting down...")
-            print("steno-daemon: shutting down...")
-            break
-        }
-
-        // 8. Graceful shutdown
-        await engine.stop()
-        await server.stop()
-        log.info("Shutdown complete")
+        // Keep the main RunLoop alive — required by SpeechAnalyzer.
+        dispatchMain()
     }
 }

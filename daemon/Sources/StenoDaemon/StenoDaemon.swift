@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 
 @main
-struct StenoDaemon: AsyncParsableCommand {
+struct StenoDaemon: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "steno-daemon",
         abstract: "Headless recording, transcription, and analysis daemon for Steno",

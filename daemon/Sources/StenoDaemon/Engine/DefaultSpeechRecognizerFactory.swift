@@ -95,7 +95,10 @@ private struct Pipeline: @unchecked Sendable {
                 }
 
                 group.addTask {
-                    try await self.analyzer.start(inputSequence: self.inputSequence)
+                    // MUST run on @MainActor — crashes with SIGTRAP otherwise
+                    try await Task { @MainActor in
+                        try await self.analyzer.start(inputSequence: self.inputSequence)
+                    }.value
 
                     for try await result in self.transcriber.results {
                         let text = String(result.text.characters)
