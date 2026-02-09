@@ -257,19 +257,24 @@ All services are injected, never instantiated internally. The daemon's `Recordin
 ## macOS 26 Speech API Notes
 
 ### SpeechAnalyzer API (used by daemon)
+
+ALL Speech framework interaction — construction, start, results iteration, and
+finalization — MUST happen on `@MainActor`. CLI executables crash with SIGTRAP
+if any Speech framework work happens off the main actor.
+
 ```swift
-let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
-    reportingOptions: [.volatileResults], attributeOptions: [])
-let analyzer = SpeechAnalyzer(modules: [transcriber])
-
-// MUST run on @MainActor — crashes with SIGTRAP otherwise
+// ALL of this MUST run inside Task { @MainActor in }
 try await Task { @MainActor in
-    try await analyzer.start(inputSequence: inputSequence)
-}.value
+    let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+        reportingOptions: [.volatileResults], attributeOptions: [])
+    let analyzer = SpeechAnalyzer(modules: [transcriber])
 
-for try await result in transcriber.results {
-    // result.text, result.isFinal
-}
+    try await analyzer.start(inputSequence: inputSequence)
+
+    for try await result in transcriber.results {
+        // result.text, result.isFinal
+    }
+}.value
 ```
 
 ### Critical: Main RunLoop Required
@@ -292,5 +297,5 @@ for try await result in transcriber.results {
 - Business logic in views
 - Committing secrets, credentials, or sensitive data (this is a public repo!)
 - Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
-- Calling `SpeechAnalyzer.start()` off the main actor (crashes with SIGTRAP)
+- ANY Speech framework interaction off the main actor (construction, start, results — all crash with SIGTRAP)
 - **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.

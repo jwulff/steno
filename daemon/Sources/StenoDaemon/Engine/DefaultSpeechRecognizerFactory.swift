@@ -12,16 +12,21 @@ public final class DefaultSpeechRecognizerFactory: SpeechRecognizerFactory, Send
     }
 }
 
+/// Shared reference so the handle's `stop()` can reach the analyzer
+/// created on `@MainActor` inside `Pipeline.run()`.
+private final class AnalyzerRef: @unchecked Sendable {
+    var analyzer: SpeechAnalyzer?
+}
+
 /// Real speech recognizer handle wrapping SpeechAnalyzer.
 ///
-/// Uses `@unchecked Sendable` because `SpeechAnalyzer` and `SpeechTranscriber`
-/// are not yet marked Sendable by Apple. Access is serialized: `transcribe` sets
-/// up state synchronously, then a single Task drives the pipeline.
+/// ALL Speech framework interaction (construction, start, results iteration,
+/// finalization) runs on `@MainActor`. CLI executables crash with SIGTRAP
+/// if any Speech framework work happens off the main actor.
 final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Sendable {
     private let locale: Locale
     private let format: AVAudioFormat
-    private var analyzer: SpeechAnalyzer?
-    private var transcriber: SpeechTranscriber?
+    private let analyzerRef = AnalyzerRef()
 
     init(locale: Locale, format: AVAudioFormat) {
         self.locale = locale
@@ -30,28 +35,14 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
 
     func transcribe(buffers: AsyncStream<AVAudioPCMBuffer>)
         -> AsyncThrowingStream<RecognizerResult, Error> {
-        // Set up all Speech framework objects synchronously.
-        let transcriber = SpeechTranscriber(
-            locale: self.locale,
-            transcriptionOptions: [],
-            reportingOptions: [.volatileResults],
-            attributeOptions: []
-        )
-        self.transcriber = transcriber
-
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        self.analyzer = analyzer
-
         let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
 
-        // Package everything into a Sendable struct so a single `sending`
-        // boundary transfer is clean.
         let pipeline = Pipeline(
             buffers: buffers,
-            analyzer: analyzer,
-            transcriber: transcriber,
+            locale: locale,
             inputSequence: inputSequence,
-            inputBuilder: inputBuilder
+            inputBuilder: inputBuilder,
+            analyzerRef: analyzerRef
         )
 
         return AsyncThrowingStream { continuation in
@@ -66,23 +57,27 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
 
     func stop() async {
         do {
-            try await analyzer?.finalizeAndFinishThroughEndOfInput()
+            try await Task { @MainActor in
+                try await self.analyzerRef.analyzer?.finalizeAndFinishThroughEndOfInput()
+            }.value
         } catch {
             // Ignore cleanup errors
         }
-        analyzer = nil
-        transcriber = nil
+        analyzerRef.analyzer = nil
     }
 }
 
-/// Packages all pipeline state into a Sendable value that can cross
+/// Packages pipeline state into a Sendable value that can cross
 /// the `sending` boundary of `Task.detached` without capture issues.
+///
+/// Speech framework objects are created inside `run()` on `@MainActor`,
+/// not passed in from outside.
 private struct Pipeline: @unchecked Sendable {
     let buffers: AsyncStream<AVAudioPCMBuffer>
-    let analyzer: SpeechAnalyzer
-    let transcriber: SpeechTranscriber
+    let locale: Locale
     let inputSequence: AsyncStream<AnalyzerInput>
     let inputBuilder: AsyncStream<AnalyzerInput>.Continuation
+    let analyzerRef: AnalyzerRef
 
     func run(continuation: AsyncThrowingStream<RecognizerResult, Error>.Continuation) async {
         do {
@@ -95,19 +90,30 @@ private struct Pipeline: @unchecked Sendable {
                 }
 
                 group.addTask {
-                    // MUST run on @MainActor — crashes with SIGTRAP otherwise
+                    // ALL Speech framework work MUST happen on @MainActor —
+                    // construction, start, and results iteration.
+                    // CLI executables crash with SIGTRAP otherwise.
                     try await Task { @MainActor in
-                        try await self.analyzer.start(inputSequence: self.inputSequence)
-                    }.value
+                        let transcriber = SpeechTranscriber(
+                            locale: self.locale,
+                            transcriptionOptions: [],
+                            reportingOptions: [.volatileResults],
+                            attributeOptions: []
+                        )
+                        let analyzer = SpeechAnalyzer(modules: [transcriber])
+                        self.analyzerRef.analyzer = analyzer
 
-                    for try await result in self.transcriber.results {
-                        let text = String(result.text.characters)
-                        continuation.yield(RecognizerResult(
-                            text: text,
-                            isFinal: result.isFinal,
-                            source: .microphone
-                        ))
-                    }
+                        try await analyzer.start(inputSequence: self.inputSequence)
+
+                        for try await result in transcriber.results {
+                            let text = String(result.text.characters)
+                            continuation.yield(RecognizerResult(
+                                text: text,
+                                isFinal: result.isFinal,
+                                source: .microphone
+                            ))
+                        }
+                    }.value
                 }
 
                 // Wait for the results stream to finish, then cancel the feeder
