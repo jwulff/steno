@@ -91,6 +91,8 @@ steno/
 ├── README.md
 ├── daemon/                        # Swift daemon (steno-daemon)
 │   ├── Package.swift
+│   ├── Info.plist                 # Embedded into binary via -sectcreate
+│   ├── Speech.entitlements        # Code-signing entitlements for Speech framework
 │   ├── Sources/StenoDaemon/
 │   │   ├── StenoDaemon.swift      # @main entry point
 │   │   ├── Commands/              # run, status, install, uninstall
@@ -128,8 +130,13 @@ steno/
 cd daemon
 swift build            # Build
 swift test             # Run tests (169 tests)
-swift run steno-daemon run   # Run daemon (foreground)
+
+# Run daemon (must code-sign with entitlements first)
+codesign --force --sign - --entitlements Speech.entitlements .build/debug/steno-daemon
+.build/debug/steno-daemon run
 ```
+
+**Important:** `swift run` does NOT work for the daemon because it skips code-signing. The binary must be ad-hoc signed with `Speech.entitlements` to load Apple's private Speech framework dylibs. Always build, sign, then run the binary directly.
 
 ### TUI (Go)
 ```bash
@@ -280,6 +287,15 @@ try await Task { @MainActor in
 ### Critical: Main RunLoop Required
 `SpeechAnalyzer` requires the main RunLoop to be alive. The daemon uses `ParsableCommand` (not `AsyncParsableCommand`) and calls `dispatchMain()` after launching async work in a `Task {}`.
 
+### Required Entitlements and Info.plist
+CLI tools using Speech.framework MUST have:
+1. **Embedded Info.plist** (`-sectcreate __TEXT __info_plist Info.plist`) with `CFBundleIdentifier` and `NSSpeechRecognitionUsageDescription`
+2. **Code-signing with entitlements** (`codesign --force --sign - --entitlements Speech.entitlements`):
+   - `com.apple.developer.speech-recognition` — allows on-device speech recognition
+   - `com.apple.security.cs.disable-library-validation` — lets the CLI load Apple's private Speech dylibs
+
+Without these, Speech.framework crashes with SIGTRAP (precondition failure) on the cooperative thread pool when speech recognition starts.
+
 ### Required Permissions
 - Microphone access (AVCaptureDevice)
 - Speech recognition
@@ -298,4 +314,5 @@ try await Task { @MainActor in
 - Committing secrets, credentials, or sensitive data (this is a public repo!)
 - Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
 - ANY Speech framework interaction off the main actor (construction, start, results — all crash with SIGTRAP)
-- **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
+- **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`, entitlements, code-signing), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
+- Running `swift run steno-daemon` without code-signing (crashes — always build, sign with entitlements, then run binary directly)
