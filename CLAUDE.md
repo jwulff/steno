@@ -1,4 +1,4 @@
-# Steno - macOS Speech-to-Text TUI
+# Steno - macOS Speech-to-Text
 
 ---
 
@@ -32,16 +32,37 @@ When in doubt, add it to `.gitignore` first.
 
 ---
 
-## Project Overview
+## Architecture
 
-A macOS TUI app that uses Apple's Speech framework (SpeechAnalyzer/SpeechTranscriber from macOS 26) for real-time microphone transcription.
+Steno is a two-process system:
 
-**Tech Stack:**
-- Swift 6.2+ / Swift Package (executable)
-- SwiftTUI for terminal UI
-- swift-argument-parser for CLI
-- macOS 26 SpeechAnalyzer API (on-device, 55% faster than Whisper)
-- Swift Testing framework
+```
+┌─────────────────┐         Unix socket          ┌──────────────────────┐
+│   steno-tui     │◄──── NDJSON commands ────────►│   steno-daemon       │
+│   (Go/bubbletea)│◄──── NDJSON events ──────────►│   (Swift)            │
+│                 │                               │                      │
+│  - Live display │                               │  - Microphone capture│
+│  - Topic panel  │      SQLite (read-only)       │  - System audio      │
+│  - Level meters │◄─────────────────────────────►│  - SpeechAnalyzer    │
+│  - Scrollback   │                               │  - Topic extraction  │
+└─────────────────┘                               │  - Segment storage   │
+                                                  └──────────────────────┘
+```
+
+**Daemon** (`daemon/`): Swift 6.2+ headless service. Captures audio (mic + ScreenCaptureKit system audio), runs SpeechAnalyzer/SpeechTranscriber (macOS 26), persists segments to SQLite (GRDB), extracts topics via on-device LLMs. Exposes a Unix socket at `~/Library/Application Support/Steno/steno.sock` with NDJSON protocol.
+
+**TUI** (`tui/`): Go thin client. Connects to the daemon, subscribes to events, reads topics from SQLite (read-only, WAL mode). Bubbletea for Elm-architecture state management, lipgloss for styling.
+
+**Legacy TUI** (`Sources/Steno/`): Original Swift/SwiftTUI monolith. Still builds and runs standalone. Will be removed once the Go TUI is fully stable.
+
+---
+
+## Tech Stack
+
+- **Daemon**: Swift 6.2+, swift-argument-parser, GRDB (SQLite), SpeechAnalyzer API (macOS 26)
+- **TUI**: Go 1.24+, bubbletea, lipgloss, modernc.org/sqlite (pure Go, no CGo)
+- **IPC**: Unix domain socket, NDJSON (newline-delimited JSON)
+- **Testing**: Swift Testing framework (daemon), Go testing (TUI)
 
 ---
 
@@ -65,57 +86,64 @@ A macOS TUI app that uses Apple's Speech framework (SpeechAnalyzer/SpeechTranscr
 ## Repository Structure
 
 ```
-steno/main/
+steno/
 ├── CLAUDE.md
-├── Package.swift
-├── changes/
-├── .githooks/
-├── .claude/
-├── Sources/Steno/
-│   ├── main.swift
-│   ├── App/
-│   │   ├── StenoApp.swift
-│   │   └── TranscriptionViewModel.swift
-│   ├── Views/
-│   │   ├── MainView.swift
-│   │   └── TranscriptView.swift
-│   ├── Speech/
-│   │   ├── SpeechRecognitionService.swift  # Protocol
-│   │   ├── SpeechAnalyzerService.swift
-│   │   └── AudioCaptureManager.swift
-│   ├── Permissions/
-│   │   ├── PermissionService.swift         # Protocol
-│   │   └── SystemPermissionService.swift
-│   ├── Models/
-│   │   ├── Transcript.swift
-│   │   └── TranscriptSegment.swift
-│   └── Storage/
-│       └── TranscriptRepository.swift
-└── Tests/StenoTests/
-    ├── Models/
-    ├── ViewModel/
-    ├── Speech/
-    ├── Mocks/
-    └── Integration/
+├── README.md
+├── daemon/                        # Swift daemon (steno-daemon)
+│   ├── Package.swift
+│   ├── Sources/StenoDaemon/
+│   │   ├── StenoDaemon.swift      # @main entry point
+│   │   ├── Commands/              # run, status, install, uninstall
+│   │   ├── Audio/                 # AudioSource protocol + SystemAudioSource
+│   │   ├── Engine/                # RecordingEngine, SpeechRecognizerFactory
+│   │   ├── Dispatch/              # CommandDispatcher, EventBroadcaster
+│   │   ├── Socket/                # UnixSocketServer, DaemonProtocol
+│   │   ├── Infrastructure/        # Paths, PIDFile, SignalHandler
+│   │   ├── Models/                # Domain models
+│   │   ├── Permissions/           # TCC permission checks
+│   │   ├── Services/              # Summarization, topic extraction
+│   │   └── Storage/               # SQLite via GRDB
+│   └── Tests/StenoDaemonTests/
+├── tui/                           # Go TUI (steno-tui)
+│   ├── go.mod
+│   ├── main.go
+│   └── internal/
+│       ├── app/                   # Bubbletea Model, messages, keymap
+│       ├── daemon/                # Socket client, protocol types
+│       ├── db/                    # SQLite read-only queries
+│       └── ui/                    # Lipgloss styles
+├── schema/                        # SQLite schema contract (README.md)
+├── Sources/Steno/                 # Legacy Swift TUI (monolith)
+├── Tests/StenoTests/
+├── changes/                       # Change documentation per PR
+└── .githooks/                     # Pre-push test runner
 ```
 
 ---
 
 ## Build & Test Commands
 
-### Build
+### Daemon (Swift)
 ```bash
-swift build
+cd daemon
+swift build            # Build
+swift test             # Run tests (169 tests)
+swift run steno-daemon run   # Run daemon (foreground)
 ```
 
-### Run Tests
+### TUI (Go)
 ```bash
-swift test
+cd tui
+go build -o steno-tui .   # Build
+go test ./...              # Run tests (37 tests)
+go run .                   # Run TUI (connects to daemon)
 ```
 
-### Run App
+### Legacy TUI (Swift)
 ```bash
-swift run steno
+swift build    # Build
+swift test     # Run tests (137 tests)
+swift run steno   # Run monolith
 ```
 
 ---
@@ -139,7 +167,7 @@ git worktree remove ../feature-NAME
 
 ## Testing Conventions
 
-### Swift Testing Framework
+### Swift Testing Framework (daemon + legacy)
 ```swift
 import Testing
 
@@ -151,9 +179,23 @@ struct TranscriptSegmentTests {
 }
 ```
 
+### Go Testing (TUI)
+```go
+func TestProtocolRoundTrip(t *testing.T) {
+    cmd := daemon.Command{Cmd: "start", Device: "MacBook Pro Microphone"}
+    data, _ := json.Marshal(cmd)
+    var decoded daemon.Command
+    json.Unmarshal(data, &decoded)
+    if decoded.Cmd != "start" {
+        t.Errorf("expected start, got %s", decoded.Cmd)
+    }
+}
+```
+
 ### Test File Naming
-- Tests mirror source structure: `Models/Transcript.swift` → `Models/TranscriptTests.swift`
-- Mocks go in `Tests/StenoTests/Mocks/`
+- Swift: Tests mirror source structure — `Models/Transcript.swift` → `Models/TranscriptTests.swift`
+- Go: Tests live alongside source — `daemon/client.go` → `daemon/client_test.go`
+- Mocks go in `Tests/.../Mocks/` (Swift) or `internal/testutil/` (Go)
 
 ### Test Attestation
 
@@ -164,74 +206,79 @@ Every commit must include:
 
 ---
 
+## Daemon Protocol (NDJSON)
+
+### Commands (client → daemon)
+```json
+{"cmd":"start","device":"MacBook Pro Microphone","systemAudio":true}
+{"cmd":"stop"}
+{"cmd":"status"}
+{"cmd":"devices"}
+{"cmd":"subscribe"}
+```
+
+### Responses (daemon → client, synchronous)
+```json
+{"ok":true,"recording":true,"sessionId":"...","status":"Recording"}
+{"ok":false,"error":"No microphone permission"}
+```
+
+### Events (daemon → subscribed clients, streaming)
+```json
+{"event":"partial","text":"hello world","source":"microphone"}
+{"event":"segment","text":"Hello world.","source":"microphone","seqNum":1}
+{"event":"level","mic":0.42,"sys":0.15}
+{"event":"status","recording":true,"sessionId":"..."}
+{"event":"topics","sessionId":"..."}
+{"event":"error","message":"...","transient":true}
+```
+
+---
+
 ## Code Conventions
 
-### Protocol-First Design
+### Protocol-First Design (Swift)
 ```swift
-// 1. Define protocol first
-protocol SpeechRecognitionService: Sendable {
-    var isListening: Bool { get async }
-    func startTranscription(locale: Locale) -> AsyncThrowingStream<TranscriptionResult, Error>
-    func stopTranscription() async
-}
-
-// 2. Then implement
-final class SpeechAnalyzerService: SpeechRecognitionService {
-    // ...
+protocol SpeechRecognizerFactory: Sendable {
+    func makeRecognizer(locale: Locale, format: AVAudioFormat, source: AudioSourceType)
+        async throws -> SpeechRecognizerHandle
 }
 ```
 
 ### Dependency Injection
-```swift
-// Good: Dependencies injected
-@Observable
-final class TranscriptionViewModel {
-    init(speechService: SpeechRecognitionService, permissionService: PermissionService) {
-        // ...
-    }
-}
-
-// Bad: Hardcoded dependencies
-@Observable
-final class TranscriptionViewModel {
-    let speechService = SpeechAnalyzerService()  // Not testable!
-}
-```
+All services are injected, never instantiated internally. The daemon's `RecordingEngine` takes factories and services as init parameters.
 
 ### Naming
-- Views: `MainView`, `TranscriptView`
-- ViewModels: `TranscriptionViewModel`
-- Models: `Transcript`, `TranscriptSegment`
-- Services: `SpeechRecognitionService` (protocol), `SpeechAnalyzerService` (impl)
-- Mocks: `MockSpeechService`, `MockPermissionService`
+- **Swift**: `RecordingEngine` (actor), `SpeechRecognizerFactory` (protocol), `DefaultSpeechRecognizerFactory` (impl), `MockSpeechRecognizerFactory` (test)
+- **Go**: `daemon.Client`, `daemon.Command`, `db.Store`, `app.Model`
 
 ---
 
 ## macOS 26 Speech API Notes
 
-### SpeechAnalyzer API
+### SpeechAnalyzer API (used by daemon)
 ```swift
-import Speech
+let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+    reportingOptions: [.volatileResults], attributeOptions: [])
+let analyzer = SpeechAnalyzer(modules: [transcriber])
 
-let analyzer = SpeechAnalyzer()
-let transcriber = SpeechTranscriber(analyzer: analyzer, locale: .current)
+// MUST run on @MainActor — crashes with SIGTRAP otherwise
+try await Task { @MainActor in
+    try await analyzer.start(inputSequence: inputSequence)
+}.value
 
 for try await result in transcriber.results {
-    // Handle transcription result
+    // result.text, result.isFinal
 }
 ```
 
+### Critical: Main RunLoop Required
+`SpeechAnalyzer` requires the main RunLoop to be alive. The daemon uses `ParsableCommand` (not `AsyncParsableCommand`) and calls `dispatchMain()` after launching async work in a `Task {}`.
+
 ### Required Permissions
 - Microphone access (AVCaptureDevice)
-- Speech recognition (SFSpeechRecognizer or new API)
-
-### Info.plist Keys
-```xml
-<key>NSMicrophoneUsageDescription</key>
-<string>Steno needs microphone access to transcribe your speech.</string>
-<key>NSSpeechRecognitionUsageDescription</key>
-<string>Steno uses on-device speech recognition to convert your speech to text.</string>
-```
+- Speech recognition
+- Screen & System Audio Recording (for system audio via ScreenCaptureKit)
 
 ---
 
@@ -244,3 +291,5 @@ for try await result in transcriber.results {
 - Force unwrapping optionals
 - Business logic in views
 - Committing secrets, credentials, or sensitive data (this is a public repo!)
+- Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
+- Calling `SpeechAnalyzer.start()` off the main actor (crashes with SIGTRAP)
