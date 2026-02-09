@@ -91,6 +91,8 @@ steno/
 ├── README.md
 ├── daemon/                        # Swift daemon (steno-daemon)
 │   ├── Package.swift
+│   ├── Info.plist                 # Embedded into binary via -sectcreate
+│   ├── Speech.entitlements        # Code-signing entitlements for Speech framework
 │   ├── Sources/StenoDaemon/
 │   │   ├── StenoDaemon.swift      # @main entry point
 │   │   ├── Commands/              # run, status, install, uninstall
@@ -128,8 +130,13 @@ steno/
 cd daemon
 swift build            # Build
 swift test             # Run tests (169 tests)
-swift run steno-daemon run   # Run daemon (foreground)
+
+# Run daemon (must code-sign with entitlements first)
+codesign --force --sign - --entitlements Speech.entitlements .build/debug/steno-daemon
+.build/debug/steno-daemon run
 ```
+
+**Important:** `swift run` does NOT work for the daemon because it skips code-signing. The binary must be ad-hoc signed with `Speech.entitlements` to load Apple's private Speech framework dylibs. Always build, sign, then run the binary directly.
 
 ### TUI (Go)
 ```bash
@@ -257,23 +264,37 @@ All services are injected, never instantiated internally. The daemon's `Recordin
 ## macOS 26 Speech API Notes
 
 ### SpeechAnalyzer API (used by daemon)
+
+ALL Speech framework interaction — construction, start, results iteration, and
+finalization — MUST happen on `@MainActor`. CLI executables crash with SIGTRAP
+if any Speech framework work happens off the main actor.
+
 ```swift
-let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
-    reportingOptions: [.volatileResults], attributeOptions: [])
-let analyzer = SpeechAnalyzer(modules: [transcriber])
-
-// MUST run on @MainActor — crashes with SIGTRAP otherwise
+// ALL of this MUST run inside Task { @MainActor in }
 try await Task { @MainActor in
-    try await analyzer.start(inputSequence: inputSequence)
-}.value
+    let transcriber = SpeechTranscriber(locale: locale, transcriptionOptions: [],
+        reportingOptions: [.volatileResults], attributeOptions: [])
+    let analyzer = SpeechAnalyzer(modules: [transcriber])
 
-for try await result in transcriber.results {
-    // result.text, result.isFinal
-}
+    try await analyzer.start(inputSequence: inputSequence)
+
+    for try await result in transcriber.results {
+        // result.text, result.isFinal
+    }
+}.value
 ```
 
 ### Critical: Main RunLoop Required
 `SpeechAnalyzer` requires the main RunLoop to be alive. The daemon uses `ParsableCommand` (not `AsyncParsableCommand`) and calls `dispatchMain()` after launching async work in a `Task {}`.
+
+### Required Entitlements and Info.plist
+CLI tools using Speech.framework MUST have:
+1. **Embedded Info.plist** (`-sectcreate __TEXT __info_plist Info.plist`) with `CFBundleIdentifier` and `NSSpeechRecognitionUsageDescription`
+2. **Code-signing with entitlements** (`codesign --force --sign - --entitlements Speech.entitlements`):
+   - `com.apple.developer.speech-recognition` — allows on-device speech recognition
+   - `com.apple.security.cs.disable-library-validation` — lets the CLI load Apple's private Speech dylibs
+
+Without these, Speech.framework crashes with SIGTRAP (precondition failure) on the cooperative thread pool when speech recognition starts.
 
 ### Required Permissions
 - Microphone access (AVCaptureDevice)
@@ -292,5 +313,6 @@ for try await result in transcriber.results {
 - Business logic in views
 - Committing secrets, credentials, or sensitive data (this is a public repo!)
 - Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
-- Calling `SpeechAnalyzer.start()` off the main actor (crashes with SIGTRAP)
-- **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
+- ANY Speech framework interaction off the main actor (construction, start, results — all crash with SIGTRAP)
+- **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`, entitlements, code-signing), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
+- Running `swift run steno-daemon` without code-signing (crashes — always build, sign with entitlements, then run binary directly)
