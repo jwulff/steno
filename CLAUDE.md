@@ -293,3 +293,4 @@ for try await result in transcriber.results {
 - Committing secrets, credentials, or sensitive data (this is a public repo!)
 - Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
 - Calling `SpeechAnalyzer.start()` off the main actor (crashes with SIGTRAP)
+- **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
