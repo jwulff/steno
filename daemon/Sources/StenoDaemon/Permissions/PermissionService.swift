@@ -1,40 +1,33 @@
 import Foundation
 
-/// Status of required permissions for speech recognition.
+/// Status of required permissions.
+///
+/// Only checks microphone access. macOS 26 SpeechAnalyzer does not require
+/// the `com.apple.developer.speech-recognition` entitlement or TCC check —
+/// that was only needed for the legacy SFSpeechRecognizer API.
 public struct PermissionStatus: Sendable, Equatable {
     /// Whether microphone access is granted.
     public let microphoneGranted: Bool
 
-    /// Whether speech recognition is authorized.
-    public let speechRecognitionGranted: Bool
-
     /// Whether all required permissions are granted.
     public var allGranted: Bool {
-        microphoneGranted && speechRecognitionGranted
+        microphoneGranted
     }
 
     /// Error message if permissions are denied.
     public var errorMessage: String? {
-        var missing: [String] = []
-        if !microphoneGranted {
-            missing.append("Microphone access")
-        }
-        if !speechRecognitionGranted {
-            missing.append("Speech recognition")
-        }
-        return missing.isEmpty ? nil : "Missing permissions: \(missing.joined(separator: ", "))"
+        microphoneGranted ? nil : "Missing permissions: Microphone access"
     }
 
-    public init(microphoneGranted: Bool, speechRecognitionGranted: Bool) {
+    public init(microphoneGranted: Bool) {
         self.microphoneGranted = microphoneGranted
-        self.speechRecognitionGranted = speechRecognitionGranted
     }
 
     /// All permissions granted.
-    public static let granted = PermissionStatus(microphoneGranted: true, speechRecognitionGranted: true)
+    public static let granted = PermissionStatus(microphoneGranted: true)
 
     /// All permissions denied.
-    public static let denied = PermissionStatus(microphoneGranted: false, speechRecognitionGranted: false)
+    public static let denied = PermissionStatus(microphoneGranted: false)
 }
 
 /// Protocol for checking and requesting system permissions.
@@ -42,10 +35,6 @@ public protocol PermissionService: Sendable {
     /// Requests microphone access from the user.
     /// - Returns: Whether access was granted.
     func requestMicrophoneAccess() async -> Bool
-
-    /// Requests speech recognition authorization.
-    /// - Returns: The current permission status after the request.
-    func requestSpeechRecognitionAccess() async -> PermissionStatus
 
     /// Checks current permission status without prompting.
     /// - Returns: The current permission status.

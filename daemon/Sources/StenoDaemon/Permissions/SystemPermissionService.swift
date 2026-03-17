@@ -1,8 +1,11 @@
 import Foundation
 import AVFoundation
-import Speech
 
 /// Real implementation of PermissionService using system APIs.
+///
+/// Only checks microphone access via AVCaptureDevice. Speech recognition
+/// permission is not checked because macOS 26 SpeechAnalyzer does not
+/// require the legacy SFSpeechRecognizer entitlement or TCC grant.
 public final class SystemPermissionService: PermissionService, Sendable {
 
     public init() {}
@@ -15,29 +18,8 @@ public final class SystemPermissionService: PermissionService, Sendable {
         }
     }
 
-    public func requestSpeechRecognitionAccess() async -> PermissionStatus {
-        let speechStatus = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status)
-            }
-        }
-
-        let micGranted = await requestMicrophoneAccess()
-        let speechGranted = speechStatus == .authorized
-
-        return PermissionStatus(
-            microphoneGranted: micGranted,
-            speechRecognitionGranted: speechGranted
-        )
-    }
-
     public func checkPermissions() async -> PermissionStatus {
         let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        let speechStatus = SFSpeechRecognizer.authorizationStatus()
-
-        return PermissionStatus(
-            microphoneGranted: micStatus == .authorized,
-            speechRecognitionGranted: speechStatus == .authorized
-        )
+        return PermissionStatus(microphoneGranted: micStatus == .authorized)
     }
 }
