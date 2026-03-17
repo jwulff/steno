@@ -149,8 +149,13 @@ make clean              # Remove all build artifacts
 
 ### Why `swift run` doesn't work for the daemon
 `swift run` skips code-signing. SpeechAnalyzer requires entitlements
-(`speech-recognition`, `disable-library-validation`) to avoid SIGTRAP.
+(`disable-library-validation`, `allow-jit`) to avoid SIGTRAP.
 Use `make run-daemon` instead, which builds, signs, and runs the debug binary.
+
+**Do NOT use `com.apple.developer.speech-recognition`** — it's a restricted
+entitlement that requires a provisioning profile. CLI binaries can't embed
+profiles, so AMFI kills the process (SIGKILL). macOS 26 SpeechAnalyzer
+does not need this entitlement.
 
 ---
 
