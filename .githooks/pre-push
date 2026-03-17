@@ -23,7 +23,7 @@
 
 # === CONFIGURATION ===
 # Customize this for your project (auto-detected if not set)
-TEST_COMMAND=""
+TEST_COMMAND="make test"
 
 # Detect test command if not configured
 detect_test_command() {

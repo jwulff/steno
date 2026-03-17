@@ -89,8 +89,10 @@ Steno is a two-process system:
 steno/
 ├── CLAUDE.md
 ├── README.md
+├── Makefile                       # Build, sign, test, run (start here)
 ├── daemon/                        # Swift daemon (steno-daemon)
 │   ├── Package.swift
+│   ├── Resources/                 # Entitlements + Info.plist for signing
 │   ├── Sources/StenoDaemon/
 │   │   ├── StenoDaemon.swift      # @main entry point
 │   │   ├── Commands/              # run, status, install, uninstall
@@ -115,36 +117,40 @@ steno/
 ├── schema/                        # SQLite schema contract (README.md)
 ├── Sources/Steno/                 # Legacy Swift TUI (monolith)
 ├── Tests/StenoTests/
+├── Resources/                     # Legacy entitlements
 ├── changes/                       # Change documentation per PR
-└── .githooks/                     # Pre-push test runner
+└── .githooks/                     # Pre-push test runner (runs make test)
 ```
 
 ---
 
 ## Build & Test Commands
 
-### Daemon (Swift)
 ```bash
-cd daemon
-swift build            # Build
-swift test             # Run tests (169 tests)
-swift run steno-daemon run   # Run daemon (foreground)
+make build            # Build daemon (release) + TUI
+make test             # Run ALL tests (daemon + TUI + legacy)
+make run-daemon       # Build, sign, and run daemon (debug mode)
+make run-tui          # Build and run TUI
 ```
 
-### TUI (Go)
+### Individual targets
 ```bash
-cd tui
-go build -o steno-tui .   # Build
-go test ./...              # Run tests (37 tests)
-go run .                   # Run TUI (connects to daemon)
+make build-daemon       # Swift release build with embedded Info.plist
+make build-daemon-debug # Swift debug build (faster iteration)
+make build-tui          # Go build
+make sign-daemon        # Ad-hoc code-sign the release daemon binary
+make sign-daemon-debug  # Ad-hoc code-sign the debug daemon binary
+make test-daemon        # swift test (daemon only)
+make test-tui           # go test ./... (TUI only)
+make test-legacy        # swift test (legacy monolith)
+make install            # Install signed binaries to /usr/local/bin
+make clean              # Remove all build artifacts
 ```
 
-### Legacy TUI (Swift)
-```bash
-swift build    # Build
-swift test     # Run tests (137 tests)
-swift run steno   # Run monolith
-```
+### Why `swift run` doesn't work for the daemon
+`swift run` skips code-signing. SpeechAnalyzer requires entitlements
+(`speech-recognition`, `disable-library-validation`) to avoid SIGTRAP.
+Use `make run-daemon` instead, which builds, signs, and runs the debug binary.
 
 ---
 

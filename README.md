@@ -39,13 +39,20 @@ Requires Swift 6.2+ and Go 1.24+.
 ```bash
 git clone https://github.com/jwulff/steno.git
 cd steno
+make build       # Build daemon (release) + TUI
+make sign-daemon # Code-sign daemon for speech recognition
+```
 
-# Build daemon
-cd daemon && swift build -c release
-# Binary: daemon/.build/release/steno-daemon
+Binaries: `daemon/.build/release/steno-daemon` and `tui/steno-tui`.
 
-# Build TUI
-cd ../tui && go build -o steno-tui .
+> **Note:** The daemon must be code-signed to use macOS speech recognition.
+> `make sign-daemon` applies an ad-hoc signature with the required entitlements.
+> Running via `swift run` skips code-signing and will crash (SIGTRAP).
+
+### Install
+
+```bash
+make install  # Copies signed binaries to /usr/local/bin
 ```
 
 ### Install Daemon as launchd Service
@@ -56,26 +63,14 @@ steno-daemon install
 
 This creates a launchd plist that starts the daemon automatically on login.
 
-### Signed Binary
-
-For microphone access without Gatekeeper warnings:
-
-```bash
-cd daemon
-swift build -c release
-codesign --force --sign - \
-  --entitlements ../Resources/Steno.entitlements \
-  .build/release/steno-daemon
-```
-
 ## Usage
 
 ```bash
-# Start the daemon (foreground)
-steno-daemon run
+# Terminal 1: Start the daemon
+make run-daemon
 
-# In another terminal, start the TUI
-cd tui && go run .
+# Terminal 2: Start the TUI
+make run-tui
 ```
 
 ### Controls
@@ -135,11 +130,12 @@ steno/
 ## Development
 
 ```bash
-# Run daemon tests
-cd daemon && swift test
-
-# Run TUI tests
-cd tui && go test ./...
+make test          # Run all test suites (daemon + TUI + legacy)
+make test-daemon   # Daemon tests only
+make test-tui      # TUI tests only
+make run-daemon    # Build, sign, and run daemon (debug)
+make run-tui       # Build and run TUI
+make clean         # Remove all build artifacts
 ```
 
 See [CLAUDE.md](CLAUDE.md) for development conventions.
