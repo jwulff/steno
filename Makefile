@@ -14,9 +14,12 @@ DAEMON_DEBUG   = $(DAEMON_DIR)/.build/debug
 DAEMON_BIN = steno-daemon
 TUI_BIN    = steno-tui
 
-# Signing
-ENTITLEMENTS  = $(DAEMON_DIR)/Resources/StenoDaemon.entitlements
-INFO_PLIST    = Resources/Info.plist
+# Signing — ad-hoc is correct for local CLI use. Apple Development
+# certificates trigger provisioning profile validation which fails
+# for bare CLI binaries (no bundle to embed a profile in).
+CODESIGN_IDENTITY ?= -
+ENTITLEMENTS      = $(DAEMON_DIR)/Resources/StenoDaemon.entitlements
+INFO_PLIST        = Resources/Info.plist
 
 # Install location
 PREFIX = /usr/local/bin
@@ -41,12 +44,12 @@ build-tui:
 # --- Sign ---
 
 sign-daemon: build-daemon
-	codesign --force --sign - \
+	codesign --force --sign "$(CODESIGN_IDENTITY)" \
 		--entitlements $(ENTITLEMENTS) \
 		$(DAEMON_RELEASE)/$(DAEMON_BIN)
 
 sign-daemon-debug: build-daemon-debug
-	codesign --force --sign - \
+	codesign --force --sign "$(CODESIGN_IDENTITY)" \
 		--entitlements $(ENTITLEMENTS) \
 		$(DAEMON_DEBUG)/$(DAEMON_BIN)
 
