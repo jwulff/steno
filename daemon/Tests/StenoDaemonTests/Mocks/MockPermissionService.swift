@@ -5,7 +5,7 @@ import Foundation
 /// Uses @MainActor to avoid concurrency issues in tests.
 @MainActor
 final class MockPermissionService: PermissionService {
-    /// The status to return from checkPermissions and requestSpeechRecognitionAccess.
+    /// The status to return from checkPermissions.
     var permissionStatus: PermissionStatus = .granted
 
     /// The value to return from requestMicrophoneAccess.
@@ -14,9 +14,6 @@ final class MockPermissionService: PermissionService {
     /// Tracks if requestMicrophoneAccess was called.
     private(set) var microphoneAccessRequested = false
 
-    /// Tracks if requestSpeechRecognitionAccess was called.
-    private(set) var speechRecognitionRequested = false
-
     /// Tracks if checkPermissions was called.
     private(set) var permissionsChecked = false
 
@@ -24,13 +21,6 @@ final class MockPermissionService: PermissionService {
         await MainActor.run {
             self.microphoneAccessRequested = true
             return self.microphoneAccessGranted
-        }
-    }
-
-    nonisolated func requestSpeechRecognitionAccess() async -> PermissionStatus {
-        await MainActor.run {
-            self.speechRecognitionRequested = true
-            return self.permissionStatus
         }
     }
 
@@ -48,7 +38,6 @@ final class MockPermissionService: PermissionService {
         permissionStatus = .granted
         microphoneAccessGranted = true
         microphoneAccessRequested = false
-        speechRecognitionRequested = false
         permissionsChecked = false
     }
 
