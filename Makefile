@@ -15,8 +15,8 @@ DAEMON_BIN = steno-daemon
 TUI_BIN    = steno-tui
 
 # Signing
-ENTITLEMENTS = $(DAEMON_DIR)/Resources/StenoDaemon.entitlements
-INFO_PLIST   = $(DAEMON_DIR)/Resources/Info.plist
+ENTITLEMENTS  = $(DAEMON_DIR)/Resources/StenoDaemon.entitlements
+INFO_PLIST    = Resources/Info.plist
 
 # Install location
 PREFIX = /usr/local/bin
@@ -28,12 +28,12 @@ build: build-daemon build-tui
 build-daemon:
 	cd $(DAEMON_DIR) && swift build -c release \
 		-Xlinker -sectcreate -Xlinker __TEXT \
-		-Xlinker __info_plist -Xlinker Resources/Info.plist
+		-Xlinker __info_plist -Xlinker $(INFO_PLIST)
 
 build-daemon-debug:
 	cd $(DAEMON_DIR) && swift build \
 		-Xlinker -sectcreate -Xlinker __TEXT \
-		-Xlinker __info_plist -Xlinker Resources/Info.plist
+		-Xlinker __info_plist -Xlinker $(INFO_PLIST)
 
 build-tui:
 	cd $(TUI_DIR) && go build -o $(TUI_BIN) .
