@@ -79,7 +79,6 @@ func (s *Store) GetOverview() (*Overview, error) {
 	overview.ActiveSession = active
 
 	// Recent sessions with counts (last 5)
-	// Collect sessions first, then query counts (avoids holding rows open during count queries).
 	recentRows, err := s.db.Query(`
 		SELECT id, locale, startedAt, endedAt, title, status, createdAt
 		FROM sessions
@@ -236,6 +235,41 @@ func (s *Store) ActiveSession() (*Session, error) {
 	return &sess, nil
 }
 
+// LatestSession returns the most recent session regardless of status.
+func (s *Store) LatestSession() (*Session, error) {
+	row := s.db.QueryRow(`
+		SELECT id, locale, startedAt, endedAt, title, status, createdAt
+		FROM sessions
+		ORDER BY startedAt DESC
+		LIMIT 1
+	`)
+
+	var sess Session
+	var startedAt, createdAt float64
+	var endedAt sql.NullFloat64
+	var title sql.NullString
+
+	if err := row.Scan(&sess.ID, &sess.Locale, &startedAt, &endedAt,
+		&title, &sess.Status, &createdAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("scan session: %w", err)
+	}
+
+	sess.StartedAt = timeFromUnix(startedAt)
+	sess.CreatedAt = timeFromUnix(createdAt)
+	if endedAt.Valid {
+		t := timeFromUnix(endedAt.Float64)
+		sess.EndedAt = &t
+	}
+	if title.Valid {
+		sess.Title = title.String
+	}
+
+	return &sess, nil
+}
+
 // TopicsForSession returns all topics for a session, ordered by segment range.
 func (s *Store) TopicsForSession(sessionID string) ([]Topic, error) {
 	rows, err := s.db.Query(`
@@ -329,6 +363,21 @@ func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segme
 	return scanSegments(rows)
 }
 
+// SegmentsForRange returns segments within a sequence number range for a session.
+func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
+	rows, err := s.db.Query(`
+		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+		FROM segments
+		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
+		ORDER BY sequenceNumber ASC
+	`, sessionID, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("query segments: %w", err)
+	}
+	defer rows.Close()
+	return scanSegments(rows)
+}
+
 // SegmentsForTimeRange returns segments within a time window for a session.
 func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time) ([]Segment, error) {
 	query := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
@@ -357,7 +406,7 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 // SearchSegments searches segment text using LIKE.
 func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, error) {
 	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
-		FROM segments WHERE text LIKE ?`
+		FROM segments WHERE text LIKE ? ESCAPE '\'`
 	args := []any{"%" + escapeLike(query) + "%"}
 
 	if sessionID != "" {
@@ -382,7 +431,7 @@ func (s *Store) SearchTopics(query string, limit int) ([]Topic, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, title, summary, segmentRangeStart, segmentRangeEnd, createdAt
 		FROM topics
-		WHERE title LIKE ? OR summary LIKE ?
+		WHERE title LIKE ? ESCAPE '\' OR summary LIKE ? ESCAPE '\'
 		ORDER BY createdAt DESC
 		LIMIT ?
 	`, pattern, pattern, limit)
@@ -408,7 +457,7 @@ func (s *Store) SearchTopics(query string, limit int) ([]Topic, error) {
 // SearchSummaries searches summary content using LIKE.
 func (s *Store) SearchSummaries(query, sessionID string, limit int) ([]Summary, error) {
 	sqlQuery := `SELECT id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt
-		FROM summaries WHERE content LIKE ?`
+		FROM summaries WHERE content LIKE ? ESCAPE '\'`
 	args := []any{"%" + escapeLike(query) + "%"}
 
 	if sessionID != "" {
@@ -511,9 +560,11 @@ func timeFromUnix(ts float64) time.Time {
 	return time.Unix(sec, nsec)
 }
 
-// escapeLike escapes SQL LIKE special characters.
+// escapeLike escapes SQL LIKE special characters using backslash as escape char.
+// All LIKE queries using this must include ESCAPE '\' clause.
 func escapeLike(s string) string {
-	s = strings.ReplaceAll(s, "%", "\\%")
-	s = strings.ReplaceAll(s, "_", "\\_")
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "%", `\%`)
+	s = strings.ReplaceAll(s, "_", `\_`)
 	return s
 }

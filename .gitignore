@@ -39,3 +39,4 @@ tui/steno-tui
 
 # Claude Code local settings
 .claude/settings.local.json
+cmd/steno/steno

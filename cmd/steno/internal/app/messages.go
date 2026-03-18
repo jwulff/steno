@@ -1,6 +1,6 @@
 package app
 
-import "github.com/jwulff/steno/tui/internal/daemon"
+import "github.com/jwulff/steno/internal/daemon"
 
 // DaemonConnectedMsg is sent when both daemon connections are established.
 type DaemonConnectedMsg struct {

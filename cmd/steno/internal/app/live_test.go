@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jwulff/steno/tui/internal/daemon"
+	"github.com/jwulff/steno/internal/daemon"
 
 	tea "github.com/charmbracelet/bubbletea"
 )

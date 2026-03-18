@@ -1,16 +1,18 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/jwulff/steno/tui/internal/daemon"
-	"github.com/jwulff/steno/tui/internal/db"
-	"github.com/jwulff/steno/tui/internal/ui"
+	"github.com/jwulff/steno/internal/daemon"
+	"github.com/jwulff/steno/internal/db"
+	"github.com/jwulff/steno/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -113,10 +115,16 @@ func (m Model) Init() tea.Cmd {
 	return connectCmd()
 }
 
-// connectCmd attempts to connect to the daemon with two connections:
+// connectCmd ensures the daemon is running and connects with two connections:
 // one for commands, one for event subscription.
 func connectCmd() tea.Cmd {
 	return func() tea.Msg {
+		// Ensure daemon is running (auto-start if needed)
+		mgr := daemon.NewManager()
+		if err := mgr.EnsureRunning(context.Background()); err != nil {
+			return DaemonConnectErrorMsg{Err: err}
+		}
+
 		sockPath := daemon.SocketPath()
 		client, err := daemon.Connect(sockPath)
 		if err != nil {
@@ -274,7 +282,11 @@ func loadSummaryCmd(store *db.Store, sessionID string) tea.Cmd {
 // openStoreCmd opens the SQLite store.
 func openStoreCmd() tea.Cmd {
 	return func() tea.Msg {
-		store, err := db.Open(db.DefaultDBPath())
+		dbPath := db.DefaultDBPath()
+		if p := os.Getenv("STENO_DB"); p != "" {
+			dbPath = p
+		}
+		store, err := db.Open(dbPath)
 		if err != nil {
 			return nil // silently ignore if DB not available yet
 		}
@@ -315,6 +327,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case DaemonConnectErrorMsg:
 		m.connected = false
 		m.connError = msg.Err.Error()
+		// If the daemon binary isn't found, don't reconnect — it's a fatal config error
+		if strings.Contains(m.connError, "not found") {
+			m.reconnecting = false
+			m.statusText = "Daemon not found"
+			return m, nil
+		}
 		m.reconnecting = true
 		m.statusText = "Daemon not running. Reconnecting..."
 		return m, reconnectCmd(m.reconnectAttempt)
@@ -949,10 +967,13 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		if m.reconnecting {
 			lines = append(lines, "")
 			lines = append(lines, ui.ErrorTextStyle.Render("  Daemon disconnected. Reconnecting..."))
+			if m.connError != "" {
+				lines = append(lines, ui.DimStyle.Render("  "+m.connError))
+			}
 		} else if m.connError != "" {
 			lines = append(lines, "")
-			lines = append(lines, ui.ErrorStyle.Render("  Daemon not running."))
-			lines = append(lines, ui.DimStyle.Render("  Start with: steno-daemon run"))
+			lines = append(lines, ui.ErrorStyle.Render("  "+m.connError))
+			lines = append(lines, ui.DimStyle.Render("  Install with: make install"))
 		} else {
 			lines = append(lines, ui.DimStyle.Render("  Connecting to steno-daemon..."))
 		}

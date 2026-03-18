@@ -49,3 +49,25 @@ type Summary struct {
 	ModelID           string
 	CreatedAt         time.Time
 }
+
+// SessionCounts holds aggregate counts for a session.
+type SessionCounts struct {
+	Segments  int
+	Topics    int
+	Summaries int
+}
+
+// Overview holds high-level database summary info.
+type Overview struct {
+	TotalSessions  int
+	ActiveSession  *Session
+	RecentSessions []SessionWithCounts
+	EarliestSession *time.Time
+	LatestSession   *time.Time
+}
+
+// SessionWithCounts pairs a session with its aggregate counts.
+type SessionWithCounts struct {
+	Session Session
+	Counts  SessionCounts
+}

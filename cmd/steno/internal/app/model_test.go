@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/jwulff/steno/tui/internal/daemon"
+	"github.com/jwulff/steno/internal/daemon"
 )
 
 func TestNewModel(t *testing.T) {

@@ -1,12 +1,12 @@
 // Package tools registers MCP tool handlers for querying the steno database.
-package tools
+package mcp
 
 import (
 	"encoding/json"
 	"fmt"
 	"time"
 
-	"github.com/jwulff/steno/mcp/internal/db"
+	"github.com/jwulff/steno/internal/db"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )

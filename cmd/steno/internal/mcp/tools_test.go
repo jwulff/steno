@@ -1,4 +1,4 @@
-package tools
+package mcp
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/jwulff/steno/mcp/internal/db"
+	"github.com/jwulff/steno/internal/db"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	_ "modernc.org/sqlite"
