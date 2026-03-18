@@ -60,7 +60,12 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
 
     func segments(for sessionId: UUID) async throws -> [StoredSegment] {
-        (segments[sessionId] ?? []).sorted { $0.sequenceNumber < $1.sequenceNumber }
+        (segments[sessionId] ?? []).sorted {
+            if $0.startedAt == $1.startedAt {
+                return $0.sequenceNumber < $1.sequenceNumber
+            }
+            return $0.startedAt < $1.startedAt
+        }
     }
 
     func segments(from: Date, to: Date) async throws -> [StoredSegment] {

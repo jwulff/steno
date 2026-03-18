@@ -63,7 +63,8 @@ struct EventBroadcasterTests {
         let client = MockClientConnection()
         await broadcaster.subscribe(client: client, events: [.segment])
 
-        let segmentStart = Date()
+        // Use a fixed epoch timestamp to avoid floating-point comparison issues after JSON round-trip
+        let segmentStart = Date(timeIntervalSince1970: 1700000000)
         let segment = StoredSegment(
             sessionId: UUID(),
             text: "test segment",
@@ -82,7 +83,7 @@ struct EventBroadcasterTests {
         #expect(events[0].text == "test segment")
         #expect(events[0].source == "systemAudio")
         #expect(events[0].sequenceNumber == 5)
-        #expect(events[0].startedAt == segmentStart.timeIntervalSince1970)
+        #expect(events[0].startedAt == 1700000000)
     }
 
     @Test func statusEventMapped() async throws {

@@ -196,6 +196,31 @@ func TestSegmentUsesStartedAtTimestamp(t *testing.T) {
 	}
 }
 
+func TestSegmentsInsertedInChronologicalOrder(t *testing.T) {
+	m := New()
+	m.connected = true
+
+	// Simulate dual-source: sys finishes first but mic started earlier
+	sysStarted := float64(1700000001) // T+1
+	micStarted := float64(1700000000) // T+0
+
+	seq1 := 1
+	m.handleEvent(daemon.Event{Event: "segment", Text: "sys first", Source: "systemAudio", SequenceNumber: &seq1, StartedAt: &sysStarted})
+	seq2 := 2
+	m.handleEvent(daemon.Event{Event: "segment", Text: "mic first", Source: "microphone", SequenceNumber: &seq2, StartedAt: &micStarted})
+
+	if len(m.entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(m.entries))
+	}
+	// mic should be first (earlier startedAt) despite arriving second
+	if m.entries[0].Text != "mic first" {
+		t.Errorf("entries[0].Text = %q, want %q", m.entries[0].Text, "mic first")
+	}
+	if m.entries[1].Text != "sys first" {
+		t.Errorf("entries[1].Text = %q, want %q", m.entries[1].Text, "sys first")
+	}
+}
+
 func TestLevelEvent(t *testing.T) {
 	m := New()
 	mic := float32(0.8)

@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -395,7 +397,8 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 	case "segment":
 		ts := time.Now()
 		if ev.StartedAt != nil {
-			ts = time.Unix(int64(*ev.StartedAt), int64((*ev.StartedAt-float64(int64(*ev.StartedAt)))*1e9))
+			sec, frac := math.Modf(*ev.StartedAt)
+			ts = time.Unix(int64(sec), int64(frac*1e9))
 		}
 		entry := TranscriptEntry{
 			Text:      ev.Text,
@@ -405,7 +408,14 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		if ev.SequenceNumber != nil {
 			entry.SeqNum = *ev.SequenceNumber
 		}
-		m.entries = append(m.entries, entry)
+		// Insert in chronological order — segments may arrive out of speech order
+		// when dual sources are active
+		i := sort.Search(len(m.entries), func(j int) bool {
+			return m.entries[j].Timestamp.After(ts)
+		})
+		m.entries = append(m.entries, TranscriptEntry{})
+		copy(m.entries[i+1:], m.entries[i:])
+		m.entries[i] = entry
 		delete(m.partials, ev.Source)
 		if m.transcriptLive {
 			m.scrollToBottom()
