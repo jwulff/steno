@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -281,7 +282,11 @@ func loadSummaryCmd(store *db.Store, sessionID string) tea.Cmd {
 // openStoreCmd opens the SQLite store.
 func openStoreCmd() tea.Cmd {
 	return func() tea.Msg {
-		store, err := db.Open(db.DefaultDBPath())
+		dbPath := db.DefaultDBPath()
+		if p := os.Getenv("STENO_DB"); p != "" {
+			dbPath = p
+		}
+		store, err := db.Open(dbPath)
 		if err != nil {
 			return nil // silently ignore if DB not available yet
 		}
