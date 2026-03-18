@@ -1,20 +1,18 @@
-.PHONY: build build-daemon build-daemon-debug build-tui build-mcp \
+.PHONY: build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
-       run-daemon run-tui run-mcp \
-       test test-daemon test-tui test-mcp test-legacy \
+       run-daemon run-steno run-mcp \
+       test test-daemon test-steno test-legacy \
        clean install
 
 # Directories
 DAEMON_DIR    = daemon
-TUI_DIR       = tui
-MCP_DIR       = mcp
+STENO_DIR     = cmd/steno
 DAEMON_RELEASE = $(DAEMON_DIR)/.build/release
 DAEMON_DEBUG   = $(DAEMON_DIR)/.build/debug
 
 # Binaries
 DAEMON_BIN = steno-daemon
-TUI_BIN    = steno-tui
-MCP_BIN    = steno-mcp
+STENO_BIN  = steno
 
 # Signing — ad-hoc is correct for local CLI use. Apple Development
 # certificates trigger provisioning profile validation which fails
@@ -28,7 +26,7 @@ PREFIX = /usr/local/bin
 
 # --- Build ---
 
-build: build-daemon build-tui build-mcp
+build: build-daemon build-steno
 
 build-daemon:
 	cd $(DAEMON_DIR) && swift build -c release \
@@ -40,11 +38,8 @@ build-daemon-debug:
 		-Xlinker -sectcreate -Xlinker __TEXT \
 		-Xlinker __info_plist -Xlinker $(INFO_PLIST)
 
-build-tui:
-	cd $(TUI_DIR) && go build -o $(TUI_BIN) .
-
-build-mcp:
-	cd $(MCP_DIR) && go build -o $(MCP_BIN) .
+build-steno:
+	cd $(STENO_DIR) && go build -o $(STENO_BIN) .
 
 # --- Sign ---
 
@@ -63,24 +58,21 @@ sign-daemon-debug: build-daemon-debug
 run-daemon: sign-daemon-debug
 	$(DAEMON_DEBUG)/$(DAEMON_BIN) run
 
-run-tui: build-tui
-	$(TUI_DIR)/$(TUI_BIN)
+run-steno: build-steno
+	$(STENO_DIR)/$(STENO_BIN)
 
-run-mcp: build-mcp
-	$(MCP_DIR)/$(MCP_BIN)
+run-mcp: build-steno
+	$(STENO_DIR)/$(STENO_BIN) --mcp
 
 # --- Test ---
 
-test: test-daemon test-tui test-mcp test-legacy
+test: test-daemon test-steno test-legacy
 
 test-daemon:
 	cd $(DAEMON_DIR) && swift test
 
-test-tui:
-	cd $(TUI_DIR) && go test ./...
-
-test-mcp:
-	cd $(MCP_DIR) && go test ./...
+test-steno:
+	cd $(STENO_DIR) && go test ./...
 
 test-legacy:
 	swift test
@@ -89,19 +81,18 @@ test-legacy:
 
 clean:
 	cd $(DAEMON_DIR) && swift package clean
-	rm -f $(TUI_DIR)/$(TUI_BIN)
-	rm -f $(MCP_DIR)/$(MCP_BIN)
+	rm -f $(STENO_DIR)/$(STENO_BIN)
 	swift package clean
 
 # --- Install ---
 
-install: sign-daemon build-tui build-mcp
+install: sign-daemon build-steno
 	install -d $(PREFIX)
 	install -m 755 $(DAEMON_RELEASE)/$(DAEMON_BIN) $(PREFIX)/$(DAEMON_BIN)
-	install -m 755 $(TUI_DIR)/$(TUI_BIN) $(PREFIX)/$(TUI_BIN)
-	install -m 755 $(MCP_DIR)/$(MCP_BIN) $(PREFIX)/$(MCP_BIN)
+	install -m 755 $(STENO_DIR)/$(STENO_BIN) $(PREFIX)/$(STENO_BIN)
+	@# Remove old binaries from previous three-binary layout
+	@rm -f $(PREFIX)/steno-tui $(PREFIX)/steno-mcp 2>/dev/null || true
 	@echo ""
 	@echo "Installed to $(PREFIX):"
 	@echo "  $(PREFIX)/$(DAEMON_BIN)"
-	@echo "  $(PREFIX)/$(TUI_BIN)"
-	@echo "  $(PREFIX)/$(MCP_BIN)"
+	@echo "  $(PREFIX)/$(STENO_BIN)  (TUI default, --mcp for MCP server)"
