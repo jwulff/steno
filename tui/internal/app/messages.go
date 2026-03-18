@@ -93,9 +93,29 @@ type TopicsLoadedMsg struct {
 
 // TopicLoaded carries a topic from the database.
 type TopicLoaded struct {
-	ID      string
-	Title   string
-	Summary string
+	ID                string
+	Title             string
+	Summary           string
+	SegmentRangeStart int
+	SegmentRangeEnd   int
+}
+
+// TopicSegmentsLoadedMsg carries segments for an expanded topic.
+type TopicSegmentsLoadedMsg struct {
+	TopicID  string
+	Segments []TopicSegment
+}
+
+// TopicSegment is a segment belonging to a topic.
+type TopicSegment struct {
+	Text   string
+	Source string
+	SeqNum int
+}
+
+// SummaryLoadedMsg carries the latest session summary.
+type SummaryLoadedMsg struct {
+	Content string
 }
 
 // ReconnectTickMsg triggers a reconnection attempt.

@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -104,6 +105,83 @@ func TestTopicsForSession(t *testing.T) {
 	}
 	if topics[0].SegmentRangeStart != 1 || topics[0].SegmentRangeEnd != 5 {
 		t.Errorf("topics[0] range = %d-%d, want 1-5", topics[0].SegmentRangeStart, topics[0].SegmentRangeEnd)
+	}
+}
+
+func TestSegmentsForRange(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	now := float64(time.Now().Unix())
+
+	rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-1', 'en_US', ?, 'active', ?)`, now, now)
+
+	// Insert segments with sequence numbers 1-5
+	for i := 1; i <= 5; i++ {
+		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-1', ?, ?, ?, ?, ?, 'microphone')`,
+			fmt.Sprintf("seg-%d", i), fmt.Sprintf("Segment %d text", i), now, now+1, i, now)
+	}
+
+	store := &Store{db: rawDB}
+
+	// Get segments 2-4
+	segments, err := store.SegmentsForRange("sess-1", 2, 4)
+	if err != nil {
+		t.Fatalf("SegmentsForRange: %v", err)
+	}
+	if len(segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segments))
+	}
+	if segments[0].Text != "Segment 2 text" {
+		t.Errorf("segments[0].Text = %q, want %q", segments[0].Text, "Segment 2 text")
+	}
+	if segments[2].SequenceNumber != 4 {
+		t.Errorf("segments[2].SequenceNumber = %d, want 4", segments[2].SequenceNumber)
+	}
+}
+
+func TestLatestSummary(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	now := float64(time.Now().Unix())
+
+	rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-1', 'en_US', ?, 'active', ?)`, now, now)
+
+	rawDB.Exec(`INSERT INTO summaries (id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt)
+		VALUES ('sum-1', 'sess-1', 'First summary', 'rolling', 1, 5, 'model-1', ?)`, now)
+	rawDB.Exec(`INSERT INTO summaries (id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt)
+		VALUES ('sum-2', 'sess-1', 'Latest summary', 'rolling', 1, 10, 'model-1', ?)`, now+10)
+
+	store := &Store{db: rawDB}
+
+	summary, err := store.LatestSummary("sess-1")
+	if err != nil {
+		t.Fatalf("LatestSummary: %v", err)
+	}
+	if summary == nil {
+		t.Fatal("expected summary, got nil")
+	}
+	if summary.Content != "Latest summary" {
+		t.Errorf("Content = %q, want %q", summary.Content, "Latest summary")
+	}
+}
+
+func TestLatestSummaryNone(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	store := &Store{db: rawDB}
+
+	summary, err := store.LatestSummary("nonexistent")
+	if err != nil {
+		t.Fatalf("LatestSummary: %v", err)
+	}
+	if summary != nil {
+		t.Errorf("expected nil, got summary %q", summary.ID)
 	}
 }
 
