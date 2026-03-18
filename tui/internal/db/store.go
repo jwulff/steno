@@ -141,6 +141,63 @@ func (s *Store) LatestSession() (*Session, error) {
 	return &sess, nil
 }
 
+// SegmentsForRange returns segments within a sequence number range for a session.
+func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
+	rows, err := s.db.Query(`
+		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+		FROM segments
+		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
+		ORDER BY sequenceNumber ASC
+	`, sessionID, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("query segments: %w", err)
+	}
+	defer rows.Close()
+
+	var segments []Segment
+	for rows.Next() {
+		var seg Segment
+		var startedAt, endedAt, createdAt float64
+		var confidence sql.NullFloat64
+		if err := rows.Scan(&seg.ID, &seg.SessionID, &seg.Text,
+			&startedAt, &endedAt, &confidence, &seg.SequenceNumber, &createdAt, &seg.Source); err != nil {
+			return nil, fmt.Errorf("scan segment: %w", err)
+		}
+		seg.StartedAt = timeFromUnix(startedAt)
+		seg.EndedAt = timeFromUnix(endedAt)
+		seg.CreatedAt = timeFromUnix(createdAt)
+		if confidence.Valid {
+			c := confidence.Float64
+			seg.Confidence = &c
+		}
+		segments = append(segments, seg)
+	}
+	return segments, rows.Err()
+}
+
+// LatestSummary returns the most recent summary for a session.
+func (s *Store) LatestSummary(sessionID string) (*Summary, error) {
+	row := s.db.QueryRow(`
+		SELECT id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt
+		FROM summaries
+		WHERE sessionId = ?
+		ORDER BY createdAt DESC, rowid DESC
+		LIMIT 1
+	`, sessionID)
+
+	var sum Summary
+	var createdAt float64
+	if err := row.Scan(&sum.ID, &sum.SessionID, &sum.Content, &sum.SummaryType,
+		&sum.SegmentRangeStart, &sum.SegmentRangeEnd, &sum.ModelID, &createdAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("scan summary: %w", err)
+	}
+	sum.CreatedAt = timeFromUnix(createdAt)
+	return &sum, nil
+}
+
 func timeFromUnix(ts float64) time.Time {
 	sec := int64(ts)
 	nsec := int64((ts - float64(sec)) * 1e9)

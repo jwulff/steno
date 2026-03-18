@@ -31,10 +31,13 @@ type TranscriptEntry struct {
 
 // TopicDisplay holds a topic for display in the topic panel.
 type TopicDisplay struct {
-	ID       string
-	Title    string
-	Summary  string
-	Expanded bool
+	ID                string
+	Title             string
+	Summary           string
+	SegmentRangeStart int
+	SegmentRangeEnd   int
+	Expanded          bool
+	Segments          []TopicSegment // loaded on expand
 }
 
 // Model is the root bubbletea model for the steno TUI.
@@ -66,6 +69,10 @@ type Model struct {
 	topics            []TopicDisplay
 	selectedTopic     int
 	modelProcessing   bool
+
+	// Summary
+	summaryText       string
+	showSummary       bool
 
 	// UI state
 	focusedPanel      PanelFocus
@@ -221,12 +228,44 @@ func loadTopicsCmd(store *db.Store, sessionID string) tea.Cmd {
 		var loaded []TopicLoaded
 		for _, t := range topics {
 			loaded = append(loaded, TopicLoaded{
-				ID:      t.ID,
-				Title:   t.Title,
-				Summary: t.Summary,
+				ID:                t.ID,
+				Title:             t.Title,
+				Summary:           t.Summary,
+				SegmentRangeStart: t.SegmentRangeStart,
+				SegmentRangeEnd:   t.SegmentRangeEnd,
 			})
 		}
 		return TopicsLoadedMsg{Topics: loaded}
+	}
+}
+
+// loadTopicSegmentsCmd reads segments for a topic's range from SQLite.
+func loadTopicSegmentsCmd(store *db.Store, sessionID, topicID string, start, end int) tea.Cmd {
+	return func() tea.Msg {
+		segments, err := store.SegmentsForRange(sessionID, start, end)
+		if err != nil {
+			return TopicSegmentsLoadedMsg{TopicID: topicID}
+		}
+		loaded := make([]TopicSegment, 0, len(segments))
+		for _, s := range segments {
+			loaded = append(loaded, TopicSegment{
+				Text:   s.Text,
+				Source: s.Source,
+				SeqNum: s.SequenceNumber,
+			})
+		}
+		return TopicSegmentsLoadedMsg{TopicID: topicID, Segments: loaded}
+	}
+}
+
+// loadSummaryCmd reads the latest summary from SQLite.
+func loadSummaryCmd(store *db.Store, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		summary, err := store.LatestSummary(sessionID)
+		if err != nil || summary == nil {
+			return SummaryLoadedMsg{}
+		}
+		return SummaryLoadedMsg{Content: summary.Content}
 	}
 }
 
@@ -362,14 +401,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.topics = m.topics[:0]
 		for _, t := range msg.Topics {
 			m.topics = append(m.topics, TopicDisplay{
-				ID:      t.ID,
-				Title:   t.Title,
-				Summary: t.Summary,
+				ID:                t.ID,
+				Title:             t.Title,
+				Summary:           t.Summary,
+				SegmentRangeStart: t.SegmentRangeStart,
+				SegmentRangeEnd:   t.SegmentRangeEnd,
 			})
 		}
 		if m.selectedTopic >= len(m.topics) {
 			m.selectedTopic = max(0, len(m.topics)-1)
 		}
+		return m, nil
+
+	case TopicSegmentsLoadedMsg:
+		for i := range m.topics {
+			if m.topics[i].ID == msg.TopicID {
+				m.topics[i].Segments = msg.Segments
+				break
+			}
+		}
+		return m, nil
+
+	case SummaryLoadedMsg:
+		m.summaryText = msg.Content
 		return m, nil
 
 	case ClearTransientErrorMsg:
@@ -498,7 +552,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "enter":
 		if m.focusedPanel == FocusTopics && m.selectedTopic < len(m.topics) {
-			m.topics[m.selectedTopic].Expanded = !m.topics[m.selectedTopic].Expanded
+			topic := &m.topics[m.selectedTopic]
+			topic.Expanded = !topic.Expanded
+			if topic.Expanded && topic.Segments == nil && m.store != nil && m.sessionID != "" {
+				return m, loadTopicSegmentsCmd(m.store, m.sessionID, topic.ID,
+					topic.SegmentRangeStart, topic.SegmentRangeEnd)
+			}
+		}
+		return m, nil
+
+	case "s", "S":
+		m.showSummary = !m.showSummary
+		if m.showSummary && m.store != nil && m.sessionID != "" {
+			return m, loadSummaryCmd(m.store, m.sessionID)
 		}
 		return m, nil
 
@@ -768,9 +834,31 @@ func (m Model) renderTopicPanel(width, height int) string {
 			lines = append(lines, truncateToWidth(line, width))
 
 			if topic.Expanded {
+				// Summary
 				wrapped := wrapText(topic.Summary, max(10, width-6))
 				for _, wl := range wrapped {
 					lines = append(lines, ui.DimStyle.Render("    "+wl))
+				}
+				// Segment range
+				rangeText := fmt.Sprintf("    segments %d-%d", topic.SegmentRangeStart, topic.SegmentRangeEnd)
+				lines = append(lines, ui.DimStyle.Render(rangeText))
+				// Segments (if loaded)
+				if len(topic.Segments) > 0 {
+					for _, seg := range topic.Segments {
+						srcLabel := "MIC"
+						if seg.Source == "systemAudio" {
+							srcLabel = "SYS"
+						}
+						prefix := fmt.Sprintf("      [%s] ", srcLabel)
+						segWrapped := wrapText(seg.Text, max(10, width-len(prefix)-2))
+						for j, sl := range segWrapped {
+							if j == 0 {
+								lines = append(lines, ui.DimStyle.Render(prefix+sl))
+							} else {
+								lines = append(lines, ui.DimStyle.Render(strings.Repeat(" ", len(prefix))+sl))
+							}
+						}
+					}
 				}
 			}
 		}
@@ -802,6 +890,10 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		badge = ui.ScrollBadgeStyle.Render(" SCROLL")
 	}
 
+	if m.showSummary {
+		badge = ui.MagentaStyle.Render(" SUMMARY")
+	}
+
 	if m.focusedPanel == FocusTranscript {
 		header = ui.PanelTitleActiveStyle.Render("TRANSCRIPT") + badge
 	} else {
@@ -812,6 +904,34 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 	lines = append(lines, header)
 
 	contentHeight := height - 1 // subtract header line
+
+	// Summary view overlay
+	if m.showSummary {
+		lines = append(lines, "")
+		if m.summaryText == "" {
+			lines = append(lines, ui.DimStyle.Render("  No summary yet."))
+			lines = append(lines, ui.DimStyle.Render("  Summaries are generated as you speak."))
+		} else {
+			textWidth := max(10, width-4)
+			wrapped := wrapText(m.summaryText, textWidth)
+			for _, wl := range wrapped {
+				lines = append(lines, "  "+wl)
+			}
+		}
+		lines = append(lines, "")
+		lines = append(lines, ui.DimStyle.Render("  Press s to return to transcript"))
+
+		for len(lines) < height {
+			lines = append(lines, strings.Repeat(" ", width))
+		}
+		if len(lines) > height {
+			lines = lines[:height]
+		}
+		for i, l := range lines {
+			lines[i] = padRight(l, width)
+		}
+		return strings.Join(lines, "\n")
+	}
 
 	if !m.connected {
 		if m.reconnecting {
@@ -917,6 +1037,7 @@ func (m Model) renderFooter() string {
 		parts = append(parts, ui.FooterKeyStyle.Render("Tab")+ui.FooterDescStyle.Render(" Focus"))
 		parts = append(parts, ui.FooterKeyStyle.Render("j/k")+ui.FooterDescStyle.Render(" Nav"))
 		parts = append(parts, ui.FooterKeyStyle.Render("↑↓")+ui.FooterDescStyle.Render(" Scroll"))
+		parts = append(parts, ui.FooterKeyStyle.Render("s")+ui.FooterDescStyle.Render(" Summary"))
 	}
 
 	parts = append(parts, ui.FooterKeyStyle.Render("q")+ui.FooterDescStyle.Render(" Quit"))

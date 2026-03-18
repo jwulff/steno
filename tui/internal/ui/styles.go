@@ -96,4 +96,8 @@ var (
 
 	SpinnerStyle = lipgloss.NewStyle().
 			Foreground(ColorMagenta)
+
+	MagentaStyle = lipgloss.NewStyle().
+			Foreground(ColorMagenta).
+			Bold(true)
 )
