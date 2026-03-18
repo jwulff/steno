@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -113,10 +114,16 @@ func (m Model) Init() tea.Cmd {
 	return connectCmd()
 }
 
-// connectCmd attempts to connect to the daemon with two connections:
+// connectCmd ensures the daemon is running and connects with two connections:
 // one for commands, one for event subscription.
 func connectCmd() tea.Cmd {
 	return func() tea.Msg {
+		// Ensure daemon is running (auto-start if needed)
+		mgr := daemon.NewManager()
+		if err := mgr.EnsureRunning(context.Background()); err != nil {
+			return DaemonConnectErrorMsg{Err: err}
+		}
+
 		sockPath := daemon.SocketPath()
 		client, err := daemon.Connect(sockPath)
 		if err != nil {
