@@ -61,6 +61,14 @@ actor MockRecordingEngineDelegate: RecordingEngineDelegate {
         }
     }
 
+    /// All audio level events.
+    var levels: [(mic: Float, system: Float)] {
+        events.compactMap {
+            if case .audioLevel(let mic, let system) = $0 { return (mic, system) }
+            return nil
+        }
+    }
+
     func reset() {
         events.removeAll()
     }
