@@ -246,7 +246,7 @@ func loadTopicSegmentsCmd(store *db.Store, sessionID, topicID string, start, end
 		if err != nil {
 			return TopicSegmentsLoadedMsg{TopicID: topicID}
 		}
-		var loaded []TopicSegment
+		loaded := make([]TopicSegment, 0, len(segments))
 		for _, s := range segments {
 			loaded = append(loaded, TopicSegment{
 				Text:   s.Text,
@@ -849,13 +849,13 @@ func (m Model) renderTopicPanel(width, height int) string {
 						if seg.Source == "systemAudio" {
 							srcLabel = "SYS"
 						}
-						segLine := fmt.Sprintf("      [%s] %s", srcLabel, seg.Text)
-						segWrapped := wrapText(segLine, max(10, width-4))
+						prefix := fmt.Sprintf("      [%s] ", srcLabel)
+						segWrapped := wrapText(seg.Text, max(10, width-len(prefix)-2))
 						for j, sl := range segWrapped {
 							if j == 0 {
-								lines = append(lines, ui.DimStyle.Render(sl))
+								lines = append(lines, ui.DimStyle.Render(prefix+sl))
 							} else {
-								lines = append(lines, ui.DimStyle.Render("            "+sl))
+								lines = append(lines, ui.DimStyle.Render(strings.Repeat(" ", len(prefix))+sl))
 							}
 						}
 					}

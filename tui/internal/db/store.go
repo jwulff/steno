@@ -181,7 +181,7 @@ func (s *Store) LatestSummary(sessionID string) (*Summary, error) {
 		SELECT id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt
 		FROM summaries
 		WHERE sessionId = ?
-		ORDER BY createdAt DESC
+		ORDER BY createdAt DESC, rowid DESC
 		LIMIT 1
 	`, sessionID)
 
