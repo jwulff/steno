@@ -122,10 +122,16 @@ public actor RecordingEngine {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: device)
             micStopClosure = stopMic
 
-            let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format)
+            // Wrap buffer stream to compute mic levels as buffers pass through
+            let micBuffers = tappedStream(buffers, isMic: true)
+
+            // Start level throttle (emits audioLevel events at 10Hz)
+            startLevelThrottle()
+
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .microphone)
             micRecognizerHandle = recognizer
 
-            let results = recognizer.transcribe(buffers: buffers)
+            let results = recognizer.transcribe(buffers: micBuffers)
             recognizerTask = Task { [weak self] in
                 do {
                     for try await result in results {
@@ -262,10 +268,13 @@ public actor RecordingEngine {
 
         do {
             let (buffers, format) = try await source.start()
-            let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format)
+
+            let sysBuffers = tappedStream(buffers, isMic: false)
+
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .systemAudio)
             sysRecognizerHandle = recognizer
 
-            let results = recognizer.transcribe(buffers: buffers)
+            let results = recognizer.transcribe(buffers: sysBuffers)
             systemRecognizerTask = Task { [weak self] in
                 do {
                     for try await result in results {
@@ -279,6 +288,75 @@ public actor RecordingEngine {
             await emit(.error("System audio failed: \(error)", isTransient: true))
         }
     }
+
+    // MARK: - Level Metering
+
+    /// Wrap a buffer stream to compute peak levels as buffers pass through.
+    /// Returns a new AsyncStream that yields the same buffers.
+    private func tappedStream(
+        _ source: AsyncStream<AVAudioPCMBuffer>,
+        isMic: Bool
+    ) -> AsyncStream<AVAudioPCMBuffer> {
+        struct Box: @unchecked Sendable {
+            let source: AsyncStream<AVAudioPCMBuffer>
+            let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+        }
+        let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        let box = Box(source: source, continuation: cont)
+        Task.detached { [weak self] in
+            for await buffer in box.source {
+                let peak = RecordingEngine.peakLevel(buffer)
+                if isMic {
+                    await self?.updateMicLevel(peak)
+                } else {
+                    await self?.updateSystemLevel(peak)
+                }
+                nonisolated(unsafe) let b = buffer
+                box.continuation.yield(b)
+            }
+            box.continuation.finish()
+        }
+        return stream
+    }
+
+    private func updateMicLevel(_ peak: Float) {
+        pendingMicLevel = max(pendingMicLevel, peak)
+    }
+
+    private func updateSystemLevel(_ peak: Float) {
+        pendingSystemLevel = max(pendingSystemLevel, peak)
+    }
+
+    /// Start a 10Hz throttle task that emits audioLevel events.
+    private func startLevelThrottle() {
+        guard levelThrottleTask == nil else { return }
+        levelThrottleTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                await self?.emitAndResetLevels()
+            }
+        }
+    }
+
+    private func emitAndResetLevels() async {
+        await emit(.audioLevel(mic: pendingMicLevel, system: pendingSystemLevel))
+        pendingMicLevel = 0
+        pendingSystemLevel = 0
+    }
+
+    /// Compute peak amplitude from a buffer.
+    private static func peakLevel(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channelData = buffer.floatChannelData?[0] else { return 0 }
+        let frameLength = Int(buffer.frameLength)
+        var peak: Float = 0
+        for i in 0..<frameLength {
+            let sample = abs(channelData[i])
+            if sample > peak { peak = sample }
+        }
+        return peak
+    }
+
+    // MARK: - Cleanup
 
     private func cleanup() async {
         recognizerTask?.cancel()

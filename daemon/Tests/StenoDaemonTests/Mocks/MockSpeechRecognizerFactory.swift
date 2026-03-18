@@ -66,10 +66,13 @@ final class MockSpeechRecognizerFactory: SpeechRecognizerFactory, @unchecked Sen
     private(set) var recognizerCreated = false
     private(set) var lastLocale: Locale?
 
-    func makeRecognizer(locale: Locale, format: AVAudioFormat)
+    private(set) var lastSource: AudioSourceType?
+
+    func makeRecognizer(locale: Locale, format: AVAudioFormat, source: AudioSourceType)
         async throws -> SpeechRecognizerHandle {
         recognizerCreated = true
         lastLocale = locale
+        lastSource = source
 
         if let error = factoryError {
             throw error

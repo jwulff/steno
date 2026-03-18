@@ -35,7 +35,7 @@ public protocol SpeechRecognizerHandle: Sendable {
 
 /// Factory for creating speech recognizer instances.
 public protocol SpeechRecognizerFactory: Sendable {
-    /// Create a new recognizer for the given locale and audio format.
-    func makeRecognizer(locale: Locale, format: AVAudioFormat)
+    /// Create a new recognizer for the given locale, audio format, and source type.
+    func makeRecognizer(locale: Locale, format: AVAudioFormat, source: AudioSourceType)
         async throws -> SpeechRecognizerHandle
 }

@@ -6,9 +6,9 @@ import Speech
 public final class DefaultSpeechRecognizerFactory: SpeechRecognizerFactory, Sendable {
     public init() {}
 
-    public func makeRecognizer(locale: Locale, format: AVAudioFormat)
+    public func makeRecognizer(locale: Locale, format: AVAudioFormat, source: AudioSourceType)
         async throws -> SpeechRecognizerHandle {
-        DefaultSpeechRecognizerHandle(locale: locale, inputFormat: format)
+        DefaultSpeechRecognizerHandle(locale: locale, inputFormat: format, source: source)
     }
 }
 
@@ -20,12 +20,14 @@ public final class DefaultSpeechRecognizerFactory: SpeechRecognizerFactory, Send
 final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Sendable {
     private let locale: Locale
     private let inputFormat: AVAudioFormat
+    private let source: AudioSourceType
     private var analyzer: SpeechAnalyzer?
     private var transcriber: SpeechTranscriber?
 
-    init(locale: Locale, inputFormat: AVAudioFormat) {
+    init(locale: Locale, inputFormat: AVAudioFormat, source: AudioSourceType) {
         self.locale = locale
         self.inputFormat = inputFormat
+        self.source = source
     }
 
     func transcribe(buffers: AsyncStream<AVAudioPCMBuffer>)
@@ -46,6 +48,7 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
         let pipeline = Pipeline(
             buffers: buffers,
             inputFormat: inputFormat,
+            source: source,
             analyzer: analyzer,
             transcriber: transcriber,
             inputSequence: inputSequence,
@@ -78,6 +81,7 @@ final class DefaultSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Se
 private struct Pipeline: @unchecked Sendable {
     let buffers: AsyncStream<AVAudioPCMBuffer>
     let inputFormat: AVAudioFormat
+    let source: AudioSourceType
     let analyzer: SpeechAnalyzer
     let transcriber: SpeechTranscriber
     let inputSequence: AsyncStream<AnalyzerInput>
@@ -133,7 +137,7 @@ private struct Pipeline: @unchecked Sendable {
                         continuation.yield(RecognizerResult(
                             text: text,
                             isFinal: result.isFinal,
-                            source: .microphone
+                            source: self.source
                         ))
                     }
                 }
