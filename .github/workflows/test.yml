@@ -60,8 +60,8 @@ jobs:
           INSTALLED=$(swift --version | head -1)
           echo "Installed: $INSTALLED"
 
-          # Check required Swift version from Package.swift
-          REQUIRED=$(grep swift-tools-version Package.swift | head -1 | sed 's/.*swift-tools-version: *//' | tr -d ' ')
+          # Check required Swift version from daemon/Package.swift
+          REQUIRED=$(grep swift-tools-version daemon/Package.swift | head -1 | sed 's/.*swift-tools-version: *//' | tr -d ' ')
           echo "Required: Swift $REQUIRED"
 
           # Extract major.minor from installed version
@@ -77,15 +77,21 @@ jobs:
             echo "✅ Swift version compatible"
           fi
 
+      - name: Setup Go
+        if: steps.check-swift.outputs.version_ok == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
       - name: Build
         id: build
         if: steps.check-swift.outputs.version_ok == 'true'
-        run: swift build -v
+        run: make build
 
       - name: Run tests
         id: test
         if: steps.check-swift.outputs.version_ok == 'true'
-        run: swift test -v
+        run: make test
 
   result:
     name: CI Result

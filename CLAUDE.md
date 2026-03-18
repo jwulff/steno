@@ -53,7 +53,6 @@ Steno is a two-process system:
 
 **Steno** (`cmd/steno/`): Go binary providing both TUI and MCP server modes. Default mode shows the bubbletea TUI; `--mcp` flag runs MCP stdio server. Auto-starts the daemon if not already running. Connects via Unix socket, reads topics from SQLite (read-only, WAL mode).
 
-**Legacy TUI** (`Sources/Steno/`): Original Swift/SwiftTUI monolith. Still builds and runs standalone. Will be removed.
 
 ---
 
@@ -116,9 +115,6 @@ steno/
 │       ├── mcp/                   # MCP tool handlers
 │       └── ui/                    # Lipgloss styles
 ├── schema/                        # SQLite schema contract (README.md)
-├── Sources/Steno/                 # Legacy Swift TUI (monolith)
-├── Tests/StenoTests/
-├── Resources/                     # Legacy entitlements
 ├── changes/                       # Change documentation per PR
 └── .githooks/                     # Pre-push test runner (runs make test)
 ```
@@ -129,7 +125,7 @@ steno/
 
 ```bash
 make build            # Build daemon (release) + steno
-make test             # Run ALL tests (daemon + steno + legacy)
+make test             # Run ALL tests (daemon + steno)
 make run-daemon       # Build, sign, and run daemon (debug mode)
 make run-steno        # Build and run TUI
 make run-mcp          # Build and run MCP server
@@ -144,7 +140,6 @@ make sign-daemon        # Ad-hoc code-sign the release daemon binary
 make sign-daemon-debug  # Ad-hoc code-sign the debug daemon binary
 make test-daemon        # swift test (daemon only)
 make test-steno         # go test ./... (steno only)
-make test-legacy        # swift test (legacy monolith)
 make install            # Install signed binaries to ~/.local/bin
 make clean              # Remove all build artifacts
 ```
@@ -180,7 +175,7 @@ git worktree remove ../feature-NAME
 
 ## Testing Conventions
 
-### Swift Testing Framework (daemon + legacy)
+### Swift Testing Framework (daemon)
 ```swift
 import Testing
 

@@ -26,7 +26,7 @@ DerivedData/
 *.o
 *.a
 *.dylib
-tui/steno-tui
+dist/
 
 # Signing
 *.p12
