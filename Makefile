@@ -1,7 +1,7 @@
 .PHONY: build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
        run-daemon run-steno run-mcp \
-       test test-daemon test-steno test-legacy \
+       test test-daemon test-steno \
        clean install
 
 # Directories
@@ -67,7 +67,7 @@ run-mcp: build-steno
 
 # --- Test ---
 
-test: test-daemon test-steno test-legacy
+test: test-daemon test-steno
 
 test-daemon:
 	cd $(DAEMON_DIR) && swift test
@@ -75,15 +75,11 @@ test-daemon:
 test-steno:
 	cd $(STENO_DIR) && go test ./...
 
-test-legacy:
-	swift test
-
 # --- Clean ---
 
 clean:
 	cd $(DAEMON_DIR) && swift package clean
 	rm -f $(STENO_DIR)/$(STENO_BIN)
-	swift package clean
 
 # --- Install ---
 

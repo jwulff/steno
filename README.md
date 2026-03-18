@@ -145,16 +145,14 @@ steno/
 │       ├── db/                # SQLite read-only queries (shared by TUI + MCP)
 │       ├── mcp/               # MCP tool handlers
 │       └── ui/                # Lipgloss styles
-├── schema/                    # SQLite schema contract
-├── Sources/Steno/             # Legacy Swift TUI (will be removed)
-└── Tests/StenoTests/
+└── schema/                    # SQLite schema contract
 ```
 
 ## Development
 
 ```bash
 make build          # Build daemon (release) + steno
-make test           # Run all test suites (daemon + steno + legacy)
+make test           # Run all test suites (daemon + steno)
 make test-daemon    # Daemon tests only (Swift)
 make test-steno     # Steno tests only (Go)
 make run-daemon     # Build, sign, and run daemon (debug)

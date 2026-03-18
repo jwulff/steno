@@ -1,10 +1,9 @@
 # Steno SQLite Schema
 
-This directory documents the SQLite schema shared between all three Steno components:
+This directory documents the SQLite schema shared between Steno's two components:
 
 - **steno-daemon** (Swift) — writes sessions, segments, summaries, topics
-- **steno** (Go TUI) — reads for display
-- **steno-mcp** (Go) — reads for AI queries via MCP
+- **steno** (Go) — reads for TUI display and MCP queries
 
 ## Database Location
 
