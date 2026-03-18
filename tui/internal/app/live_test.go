@@ -156,7 +156,7 @@ func TestLiveTUIFlow(t *testing.T) {
 	}
 	fmt.Printf("  Total: %d events\n", total)
 	fmt.Printf("  Transcript entries: %d\n", len(m.entries))
-	fmt.Printf("  Partial text: %q\n", m.partialText)
+	fmt.Printf("  Partial text: %v\n", m.partials)
 
 	if total == 0 {
 		t.Error("expected at least some events during 5s recording")

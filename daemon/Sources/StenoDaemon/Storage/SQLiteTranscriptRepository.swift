@@ -89,7 +89,7 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         try await dbQueue.read { db in
             try SegmentRecord
                 .filter(Column("sessionId") == sessionId.uuidString)
-                .order(Column("sequenceNumber").asc)
+                .order(Column("startedAt").asc, Column("sequenceNumber").asc)
                 .fetchAll(db)
                 .compactMap { $0.toDomain() }
         }

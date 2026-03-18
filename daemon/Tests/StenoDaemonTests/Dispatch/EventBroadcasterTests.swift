@@ -63,10 +63,11 @@ struct EventBroadcasterTests {
         let client = MockClientConnection()
         await broadcaster.subscribe(client: client, events: [.segment])
 
+        let segmentStart = Date()
         let segment = StoredSegment(
             sessionId: UUID(),
             text: "test segment",
-            startedAt: Date(),
+            startedAt: segmentStart,
             endedAt: Date(),
             sequenceNumber: 5,
             source: .systemAudio
@@ -81,6 +82,7 @@ struct EventBroadcasterTests {
         #expect(events[0].text == "test segment")
         #expect(events[0].source == "systemAudio")
         #expect(events[0].sequenceNumber == 5)
+        #expect(events[0].startedAt == segmentStart.timeIntervalSince1970)
     }
 
     @Test func statusEventMapped() async throws {

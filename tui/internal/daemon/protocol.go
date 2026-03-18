@@ -38,6 +38,7 @@ type Event struct {
 	Transient       *bool    `json:"transient,omitempty"`
 	Recording       *bool    `json:"recording,omitempty"`
 	ModelProcessing *bool    `json:"modelProcessing,omitempty"`
+	StartedAt       *float64 `json:"startedAt,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.
