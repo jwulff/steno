@@ -406,7 +406,7 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 // SearchSegments searches segment text using LIKE.
 func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, error) {
 	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
-		FROM segments WHERE text LIKE ?`
+		FROM segments WHERE text LIKE ? ESCAPE '\'`
 	args := []any{"%" + escapeLike(query) + "%"}
 
 	if sessionID != "" {
@@ -431,7 +431,7 @@ func (s *Store) SearchTopics(query string, limit int) ([]Topic, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, title, summary, segmentRangeStart, segmentRangeEnd, createdAt
 		FROM topics
-		WHERE title LIKE ? OR summary LIKE ?
+		WHERE title LIKE ? ESCAPE '\' OR summary LIKE ? ESCAPE '\'
 		ORDER BY createdAt DESC
 		LIMIT ?
 	`, pattern, pattern, limit)
@@ -457,7 +457,7 @@ func (s *Store) SearchTopics(query string, limit int) ([]Topic, error) {
 // SearchSummaries searches summary content using LIKE.
 func (s *Store) SearchSummaries(query, sessionID string, limit int) ([]Summary, error) {
 	sqlQuery := `SELECT id, sessionId, content, summaryType, segmentRangeStart, segmentRangeEnd, modelId, createdAt
-		FROM summaries WHERE content LIKE ?`
+		FROM summaries WHERE content LIKE ? ESCAPE '\'`
 	args := []any{"%" + escapeLike(query) + "%"}
 
 	if sessionID != "" {
@@ -560,9 +560,11 @@ func timeFromUnix(ts float64) time.Time {
 	return time.Unix(sec, nsec)
 }
 
-// escapeLike escapes SQL LIKE special characters.
+// escapeLike escapes SQL LIKE special characters using backslash as escape char.
+// All LIKE queries using this must include ESCAPE '\' clause.
 func escapeLike(s string) string {
-	s = strings.ReplaceAll(s, "%", "\\%")
-	s = strings.ReplaceAll(s, "_", "\\_")
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "%", `\%`)
+	s = strings.ReplaceAll(s, "_", `\_`)
 	return s
 }

@@ -42,6 +42,11 @@ func runMCP() {
 		dbPath = p
 	}
 
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "steno: No steno database found at %s\nRun steno to start recording first.\n", dbPath)
+		os.Exit(1)
+	}
+
 	store, err := db.Open(dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "steno: %v\n", err)
