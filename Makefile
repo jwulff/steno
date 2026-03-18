@@ -1,18 +1,20 @@
-.PHONY: build build-daemon build-daemon-debug build-tui \
+.PHONY: build build-daemon build-daemon-debug build-tui build-mcp \
        sign-daemon sign-daemon-debug \
-       run-daemon run-tui \
-       test test-daemon test-tui test-legacy \
+       run-daemon run-tui run-mcp \
+       test test-daemon test-tui test-mcp test-legacy \
        clean install
 
 # Directories
 DAEMON_DIR    = daemon
 TUI_DIR       = tui
+MCP_DIR       = mcp
 DAEMON_RELEASE = $(DAEMON_DIR)/.build/release
 DAEMON_DEBUG   = $(DAEMON_DIR)/.build/debug
 
 # Binaries
 DAEMON_BIN = steno-daemon
 TUI_BIN    = steno-tui
+MCP_BIN    = steno-mcp
 
 # Signing — ad-hoc is correct for local CLI use. Apple Development
 # certificates trigger provisioning profile validation which fails
@@ -26,7 +28,7 @@ PREFIX = /usr/local/bin
 
 # --- Build ---
 
-build: build-daemon build-tui
+build: build-daemon build-tui build-mcp
 
 build-daemon:
 	cd $(DAEMON_DIR) && swift build -c release \
@@ -40,6 +42,9 @@ build-daemon-debug:
 
 build-tui:
 	cd $(TUI_DIR) && go build -o $(TUI_BIN) .
+
+build-mcp:
+	cd $(MCP_DIR) && go build -o $(MCP_BIN) .
 
 # --- Sign ---
 
@@ -61,15 +66,21 @@ run-daemon: sign-daemon-debug
 run-tui: build-tui
 	$(TUI_DIR)/$(TUI_BIN)
 
+run-mcp: build-mcp
+	$(MCP_DIR)/$(MCP_BIN)
+
 # --- Test ---
 
-test: test-daemon test-tui test-legacy
+test: test-daemon test-tui test-mcp test-legacy
 
 test-daemon:
 	cd $(DAEMON_DIR) && swift test
 
 test-tui:
 	cd $(TUI_DIR) && go test ./...
+
+test-mcp:
+	cd $(MCP_DIR) && go test ./...
 
 test-legacy:
 	swift test
@@ -79,15 +90,18 @@ test-legacy:
 clean:
 	cd $(DAEMON_DIR) && swift package clean
 	rm -f $(TUI_DIR)/$(TUI_BIN)
+	rm -f $(MCP_DIR)/$(MCP_BIN)
 	swift package clean
 
 # --- Install ---
 
-install: sign-daemon build-tui
+install: sign-daemon build-tui build-mcp
 	install -d $(PREFIX)
 	install -m 755 $(DAEMON_RELEASE)/$(DAEMON_BIN) $(PREFIX)/$(DAEMON_BIN)
 	install -m 755 $(TUI_DIR)/$(TUI_BIN) $(PREFIX)/$(TUI_BIN)
+	install -m 755 $(MCP_DIR)/$(MCP_BIN) $(PREFIX)/$(MCP_BIN)
 	@echo ""
 	@echo "Installed to $(PREFIX):"
 	@echo "  $(PREFIX)/$(DAEMON_BIN)"
 	@echo "  $(PREFIX)/$(TUI_BIN)"
+	@echo "  $(PREFIX)/$(MCP_BIN)"
