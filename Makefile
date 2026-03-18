@@ -21,8 +21,9 @@ CODESIGN_IDENTITY ?= -
 ENTITLEMENTS      = $(DAEMON_DIR)/Resources/StenoDaemon.entitlements
 INFO_PLIST        = Resources/Info.plist
 
-# Install location
-PREFIX = /usr/local/bin
+# Install location — ~/.local/bin by default (no sudo needed).
+# Override with: make install PREFIX=/usr/local/bin
+PREFIX = $(HOME)/.local/bin
 
 # --- Build ---
 
