@@ -6,72 +6,46 @@ Steno uses Apple's SpeechAnalyzer API (macOS 26) for real-time transcription tha
 
 ![Steno transcribing a Seahawks press conference with 15 auto-extracted topics](assets/screenshot.png)
 
-## Architecture
-
-Steno is a two-process system: a Swift daemon handles audio capture, speech recognition, and AI-powered topic extraction, while a Go TUI provides the interactive terminal interface.
-
-```
-┌─────────────────┐         Unix socket          ┌──────────────────────┐
-│   steno-tui     │◄──── NDJSON commands ────────►│   steno-daemon       │
-│   (Go/bubbletea)│◄──── NDJSON events ──────────►│   (Swift)            │
-│                 │                               │                      │
-│  - Live display │                               │  - Microphone capture│
-│  - Topic panel  │      SQLite (read-only)       │  - System audio      │
-│  - Level meters │◄─────────────────────────────►│  - SpeechAnalyzer    │
-│  - Scrollback   │                               │  - Topic extraction  │
-└─────────────────┘                               │  - Segment storage   │
-                                                  └──────────────────────┘
-```
-
-The daemon runs as a background service. The TUI connects via Unix socket at `~/Library/Application Support/Steno/steno.sock` and reads persisted topics from SQLite.
-
 ## Requirements
 
 - macOS 26 (Tahoe) or later
+- Apple Silicon (arm64)
 - Microphone access
 
-## Installation
+## Install
 
-### From Source
+### Download (recommended)
+
+Download the latest release from [GitHub Releases](https://github.com/jwulff/steno/releases/latest):
+
+```bash
+# Download and extract
+curl -LO https://github.com/jwulff/steno/releases/latest/download/steno-darwin-arm64.tar.gz
+tar xzf steno-darwin-arm64.tar.gz
+
+# Install to ~/.local/bin (make sure it's in your PATH)
+mkdir -p ~/.local/bin
+mv steno steno-daemon ~/.local/bin/
+```
+
+### From source
 
 Requires Swift 6.2+ and Go 1.24+.
 
 ```bash
 git clone https://github.com/jwulff/steno.git
 cd steno
-make build       # Build daemon (release) + TUI
-make sign-daemon # Code-sign daemon for speech recognition
+make install   # Builds, signs, and installs to ~/.local/bin
 ```
-
-Binaries: `daemon/.build/release/steno-daemon` and `tui/steno-tui`.
-
-> **Note:** The daemon must be code-signed to use macOS speech recognition.
-> `make sign-daemon` applies an ad-hoc signature with the required entitlements.
-> Running via `swift run` skips code-signing and will crash (SIGTRAP).
-
-### Install
-
-```bash
-make install  # Copies signed binaries to /usr/local/bin
-```
-
-### Install Daemon as launchd Service
-
-```bash
-steno-daemon install
-```
-
-This creates a launchd plist that starts the daemon automatically on login.
 
 ## Usage
 
 ```bash
-# Terminal 1: Start the daemon
-make run-daemon
-
-# Terminal 2: Start the TUI
-make run-tui
+steno            # Launch TUI — auto-starts the daemon
+steno --mcp      # Run as MCP stdio server (for Claude Desktop, etc.)
 ```
+
+That's it. Running `steno` automatically starts the daemon in the background if it isn't already running. The daemon survives after you quit the TUI — it keeps recording and persisting transcripts to SQLite.
 
 ### Controls
 
@@ -86,15 +60,63 @@ make run-tui
 | `Up`/`Down` | Scroll transcript |
 | `q` | Quit |
 
+### MCP Server
+
+Steno includes a built-in [MCP](https://modelcontextprotocol.io) server for querying your transcript database from AI tools like Claude Desktop.
+
+Add to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "steno": {
+      "command": "steno",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+Available tools: `get_overview`, `list_sessions`, `get_session`, `get_transcript`, `search`.
+
+### Daemon Management
+
+The daemon runs as a background process. You can also manage it independently:
+
+```bash
+steno-daemon run         # Run daemon in foreground
+steno-daemon status      # Check if daemon is running
+steno-daemon install     # Install as launchd service (auto-start on login)
+steno-daemon uninstall   # Remove launchd service
+```
+
 ## How It Works
 
 Steno uses the SpeechAnalyzer API introduced in macOS 26, which provides:
 
-- **On-device processing** - Your audio never leaves your Mac
-- **Low latency** - Real-time transcription as you speak
-- **High accuracy** - 55% faster than Whisper Large V3 Turbo in Apple's benchmarks
+- **On-device processing** — your audio never leaves your Mac
+- **Low latency** — real-time transcription as you speak
+- **High accuracy** — 55% faster than Whisper Large V3 Turbo in Apple's benchmarks
 
-The daemon captures audio from the microphone (and optionally system audio via ScreenCaptureKit), runs it through SpeechAnalyzer for transcription, persists segments to SQLite, and extracts topics using on-device LLMs. The TUI subscribes to a live event stream for real-time display.
+## Architecture
+
+Steno is a two-process system: a Swift daemon handles audio capture and speech recognition, while a Go binary provides the TUI and MCP server.
+
+```
+┌─────────────────┐         Unix socket          ┌──────────────────────┐
+│   steno         │◄──── NDJSON commands ────────►│   steno-daemon       │
+│   (Go)          │◄──── NDJSON events ──────────►│   (Swift)            │
+│                 │                               │                      │
+│  - TUI display  │                               │  - Microphone capture│
+│  - MCP server   │      SQLite (read-only)       │  - System audio      │
+│  - Daemon mgmt  │◄─────────────────────────────►│  - SpeechAnalyzer    │
+│  - Level meters │                               │  - Topic extraction  │
+└─────────────────┘                               │  - Segment storage   │
+                                                  └──────────────────────┘
+```
+
+- **`steno`** (Go) — TUI + MCP server + daemon lifecycle management. Connects to the daemon via Unix socket, reads topics from SQLite.
+- **`steno-daemon`** (Swift) — Captures mic + system audio via ScreenCaptureKit, runs SpeechAnalyzer/SpeechTranscriber, persists segments to SQLite (GRDB), extracts topics via on-device LLMs.
 
 ## Project Structure
 
@@ -114,28 +136,32 @@ steno/
 │   │   ├── Socket/            # Unix socket server, NDJSON protocol
 │   │   └── Storage/           # SQLite via GRDB
 │   └── Tests/StenoDaemonTests/
-├── tui/                       # Go TUI (steno-tui)
+├── cmd/steno/                 # Go binary (steno)
 │   ├── go.mod
-│   ├── main.go
+│   ├── main.go                # Entry point: --mcp flag dispatches mode
 │   └── internal/
-│       ├── app/               # Bubbletea model, messages, keybindings
-│       ├── daemon/            # Unix socket client, protocol types
-│       ├── db/                # SQLite read-only queries (topics)
+│       ├── app/               # Bubbletea TUI model, messages, keybindings
+│       ├── daemon/            # Socket client, protocol types, lifecycle manager
+│       ├── db/                # SQLite read-only queries (shared by TUI + MCP)
+│       ├── mcp/               # MCP tool handlers
 │       └── ui/                # Lipgloss styles
 ├── schema/                    # SQLite schema contract
-├── Sources/Steno/             # Original Swift TUI (legacy)
+├── Sources/Steno/             # Legacy Swift TUI (will be removed)
 └── Tests/StenoTests/
 ```
 
 ## Development
 
 ```bash
-make test          # Run all test suites (daemon + TUI + legacy)
-make test-daemon   # Daemon tests only
-make test-tui      # TUI tests only
-make run-daemon    # Build, sign, and run daemon (debug)
-make run-tui       # Build and run TUI
-make clean         # Remove all build artifacts
+make build          # Build daemon (release) + steno
+make test           # Run all test suites (daemon + steno + legacy)
+make test-daemon    # Daemon tests only (Swift)
+make test-steno     # Steno tests only (Go)
+make run-daemon     # Build, sign, and run daemon (debug)
+make run-steno      # Build and run TUI
+make run-mcp        # Build and run MCP server
+make clean          # Remove all build artifacts
+make install        # Install to ~/.local/bin (override with PREFIX=)
 ```
 
 See [CLAUDE.md](CLAUDE.md) for development conventions.

@@ -38,31 +38,31 @@ Steno is a two-process system:
 
 ```
 ┌─────────────────┐         Unix socket          ┌──────────────────────┐
-│   steno-tui     │◄──── NDJSON commands ────────►│   steno-daemon       │
-│   (Go/bubbletea)│◄──── NDJSON events ──────────►│   (Swift)            │
+│   steno         │◄──── NDJSON commands ────────►│   steno-daemon       │
+│   (Go)          │◄──── NDJSON events ──────────►│   (Swift)            │
 │                 │                               │                      │
-│  - Live display │                               │  - Microphone capture│
-│  - Topic panel  │      SQLite (read-only)       │  - System audio      │
-│  - Level meters │◄─────────────────────────────►│  - SpeechAnalyzer    │
-│  - Scrollback   │                               │  - Topic extraction  │
+│  - TUI display  │                               │  - Microphone capture│
+│  - MCP server   │      SQLite (read-only)       │  - System audio      │
+│  - Daemon mgmt  │◄─────────────────────────────►│  - SpeechAnalyzer    │
+│  - Level meters │                               │  - Topic extraction  │
 └─────────────────┘                               │  - Segment storage   │
                                                   └──────────────────────┘
 ```
 
 **Daemon** (`daemon/`): Swift 6.2+ headless service. Captures audio (mic + ScreenCaptureKit system audio), runs SpeechAnalyzer/SpeechTranscriber (macOS 26), persists segments to SQLite (GRDB), extracts topics via on-device LLMs. Exposes a Unix socket at `~/Library/Application Support/Steno/steno.sock` with NDJSON protocol.
 
-**TUI** (`tui/`): Go thin client. Connects to the daemon, subscribes to events, reads topics from SQLite (read-only, WAL mode). Bubbletea for Elm-architecture state management, lipgloss for styling.
+**Steno** (`cmd/steno/`): Go binary providing both TUI and MCP server modes. Default mode shows the bubbletea TUI; `--mcp` flag runs MCP stdio server. Auto-starts the daemon if not already running. Connects via Unix socket, reads topics from SQLite (read-only, WAL mode).
 
-**Legacy TUI** (`Sources/Steno/`): Original Swift/SwiftTUI monolith. Still builds and runs standalone. Will be removed once the Go TUI is fully stable.
+**Legacy TUI** (`Sources/Steno/`): Original Swift/SwiftTUI monolith. Still builds and runs standalone. Will be removed.
 
 ---
 
 ## Tech Stack
 
 - **Daemon**: Swift 6.2+, swift-argument-parser, GRDB (SQLite), SpeechAnalyzer API (macOS 26)
-- **TUI**: Go 1.24+, bubbletea, lipgloss, modernc.org/sqlite (pure Go, no CGo)
+- **Steno**: Go 1.24+, bubbletea, lipgloss, mcp-go, modernc.org/sqlite (pure Go, no CGo)
 - **IPC**: Unix domain socket, NDJSON (newline-delimited JSON)
-- **Testing**: Swift Testing framework (daemon), Go testing (TUI)
+- **Testing**: Swift Testing framework (daemon), Go testing (steno)
 
 ---
 
@@ -106,13 +106,14 @@ steno/
 │   │   ├── Services/              # Summarization, topic extraction
 │   │   └── Storage/               # SQLite via GRDB
 │   └── Tests/StenoDaemonTests/
-├── tui/                           # Go TUI (steno-tui)
+├── cmd/steno/                     # Go binary (steno: TUI + MCP)
 │   ├── go.mod
-│   ├── main.go
+│   ├── main.go                    # --mcp flag dispatches mode
 │   └── internal/
 │       ├── app/                   # Bubbletea Model, messages, keymap
-│       ├── daemon/                # Socket client, protocol types
-│       ├── db/                    # SQLite read-only queries
+│       ├── daemon/                # Socket client, protocol, lifecycle manager
+│       ├── db/                    # SQLite read-only queries (shared TUI + MCP)
+│       ├── mcp/                   # MCP tool handlers
 │       └── ui/                    # Lipgloss styles
 ├── schema/                        # SQLite schema contract (README.md)
 ├── Sources/Steno/                 # Legacy Swift TUI (monolith)
@@ -127,23 +128,24 @@ steno/
 ## Build & Test Commands
 
 ```bash
-make build            # Build daemon (release) + TUI
-make test             # Run ALL tests (daemon + TUI + legacy)
+make build            # Build daemon (release) + steno
+make test             # Run ALL tests (daemon + steno + legacy)
 make run-daemon       # Build, sign, and run daemon (debug mode)
-make run-tui          # Build and run TUI
+make run-steno        # Build and run TUI
+make run-mcp          # Build and run MCP server
 ```
 
 ### Individual targets
 ```bash
 make build-daemon       # Swift release build with embedded Info.plist
 make build-daemon-debug # Swift debug build (faster iteration)
-make build-tui          # Go build
+make build-steno        # Go build
 make sign-daemon        # Ad-hoc code-sign the release daemon binary
 make sign-daemon-debug  # Ad-hoc code-sign the debug daemon binary
 make test-daemon        # swift test (daemon only)
-make test-tui           # go test ./... (TUI only)
+make test-steno         # go test ./... (steno only)
 make test-legacy        # swift test (legacy monolith)
-make install            # Install signed binaries to /usr/local/bin
+make install            # Install signed binaries to ~/.local/bin
 make clean              # Remove all build artifacts
 ```
 
