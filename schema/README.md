@@ -4,7 +4,7 @@ This directory documents the SQLite schema shared between all three Steno compon
 
 - **steno-daemon** (Swift) — writes sessions, segments, summaries, topics
 - **steno** (Go TUI) — reads for display
-- **steno-mcp** (TypeScript) — reads for AI queries
+- **steno-mcp** (Go) — reads for AI queries via MCP
 
 ## Database Location
 
