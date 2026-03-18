@@ -56,8 +56,12 @@ final class MockSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Senda
 
 /// Mock factory that creates MockSpeechRecognizerHandle instances.
 final class MockSpeechRecognizerFactory: SpeechRecognizerFactory, @unchecked Sendable {
-    /// The handle returned by makeRecognizer.
-    let handle = MockSpeechRecognizerHandle()
+    /// Per-source handles for dual-source tests.
+    let micHandle = MockSpeechRecognizerHandle()
+    let sysHandle = MockSpeechRecognizerHandle()
+
+    /// Backward-compatible handle — returns micHandle for existing single-source tests.
+    var handle: MockSpeechRecognizerHandle { micHandle }
 
     /// Error to throw from makeRecognizer.
     var factoryError: Error?
@@ -78,6 +82,9 @@ final class MockSpeechRecognizerFactory: SpeechRecognizerFactory, @unchecked Sen
             throw error
         }
 
-        return handle
+        switch source {
+        case .microphone: return micHandle
+        case .systemAudio: return sysHandle
+        }
     }
 }

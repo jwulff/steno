@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,9 +59,8 @@ type Model struct {
 	deviceIndex  int
 
 	// Transcript
-	entries     []TranscriptEntry
-	partialText string
-	partialSrc  string
+	entries  []TranscriptEntry
+	partials map[string]string // source -> partial text
 
 	// Audio levels
 	micLevel float32
@@ -103,6 +104,7 @@ func New() Model {
 		statusText:     "Connecting to steno-daemon...",
 		transcriptLive: true,
 		focusedPanel:   FocusTranscript,
+		partials:       make(map[string]string),
 	}
 }
 
@@ -361,8 +363,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		r := msg.Response
 		if r.OK {
 			m.recording = false
-			m.partialText = ""
-			m.partialSrc = ""
+			m.partials = make(map[string]string)
 			m.statusText = "Idle"
 		} else {
 			m.errorMessage = r.Error
@@ -441,21 +442,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 	switch ev.Event {
 	case "partial":
-		m.partialText = ev.Text
-		m.partialSrc = ev.Source
+		if ev.Text == "" {
+			delete(m.partials, ev.Source)
+		} else {
+			m.partials[ev.Source] = ev.Text
+		}
 
 	case "segment":
+		ts := time.Now()
+		if ev.StartedAt != nil {
+			sec, frac := math.Modf(*ev.StartedAt)
+			ts = time.Unix(int64(sec), int64(frac*1e9))
+		}
 		entry := TranscriptEntry{
 			Text:      ev.Text,
 			Source:    ev.Source,
-			Timestamp: time.Now(),
+			Timestamp: ts,
 		}
 		if ev.SequenceNumber != nil {
 			entry.SeqNum = *ev.SequenceNumber
 		}
-		m.entries = append(m.entries, entry)
-		m.partialText = ""
-		m.partialSrc = ""
+		// Insert in chronological order — segments may arrive out of speech order
+		// when dual sources are active
+		i := sort.Search(len(m.entries), func(j int) bool {
+			return m.entries[j].Timestamp.After(ts)
+		})
+		m.entries = append(m.entries, TranscriptEntry{})
+		copy(m.entries[i+1:], m.entries[i:])
+		m.entries[i] = entry
+		delete(m.partials, ev.Source)
 		if m.transcriptLive {
 			m.scrollToBottom()
 		}
@@ -475,7 +490,7 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 				m.statusText = "Recording"
 			} else {
 				m.statusText = "Idle"
-				m.partialText = ""
+				m.partials = make(map[string]string)
 			}
 		}
 
@@ -625,10 +640,7 @@ func (m *Model) scrollToBottom() {
 }
 
 func (m Model) maxTranscriptScroll() int {
-	totalLines := len(m.entries)
-	if m.partialText != "" {
-		totalLines++
-	}
+	totalLines := len(m.entries) + len(m.partials)
 	visible := m.transcriptVisibleLines()
 	if totalLines <= visible {
 		return 0
@@ -944,7 +956,7 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		} else {
 			lines = append(lines, ui.DimStyle.Render("  Connecting to steno-daemon..."))
 		}
-	} else if len(m.entries) == 0 && m.partialText == "" {
+	} else if len(m.entries) == 0 && len(m.partials) == 0 {
 		lines = append(lines, "")
 		lines = append(lines, ui.DimStyle.Render("  Press Space to start recording"))
 	} else {
@@ -970,14 +982,19 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			}
 		}
 
-		// Partial text
-		if m.partialText != "" {
+		// Partial text — render each source's partial as a separate line
+		// Deterministic order: microphone first, then systemAudio
+		for _, pSource := range []string{"microphone", "systemAudio"} {
+			pText, ok := m.partials[pSource]
+			if !ok {
+				continue
+			}
 			ts := ui.TimestampStyle.Render(time.Now().Format("[15:04:05]"))
 			src := ui.PartialTextStyle.Render("[MIC] ")
-			if m.partialSrc == "systemAudio" {
+			if pSource == "systemAudio" {
 				src = ui.PartialTextStyle.Render("[SYS] ")
 			}
-			wrapped := wrapText(m.partialText+"▌", textWidth)
+			wrapped := wrapText(pText+"▌", textWidth)
 			partial := ui.PartialTextStyle.Render(wrapped[0])
 			displayLines = append(displayLines, ts+" "+src+partial)
 			for _, wl := range wrapped[1:] {

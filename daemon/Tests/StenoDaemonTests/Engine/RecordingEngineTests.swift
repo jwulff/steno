@@ -250,6 +250,49 @@ struct RecordingEngineTests {
         await engine.stop()
     }
 
+    @Test func dualSourceSegmentsPersistIndependently() async throws {
+        let rf = MockSpeechRecognizerFactory()
+
+        let (engine, repo, _, _, _, _, delegate) = await makeEngine(recognizerFactory: rf)
+
+        let session = try await engine.start(systemAudio: true)
+
+        // Give system audio time to start
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Emit results from both sources independently
+        rf.micHandle.emit(RecognizerResult(text: "mic partial", isFinal: false, source: .microphone))
+        try await Task.sleep(for: .milliseconds(20))
+
+        rf.sysHandle.emit(RecognizerResult(text: "sys partial", isFinal: false, source: .systemAudio))
+        try await Task.sleep(for: .milliseconds(20))
+
+        rf.micHandle.emit(RecognizerResult(text: "mic final", isFinal: true, confidence: 0.9, source: .microphone))
+        try await Task.sleep(for: .milliseconds(20))
+
+        rf.sysHandle.emit(RecognizerResult(text: "sys final", isFinal: true, confidence: 0.8, source: .systemAudio))
+        try await Task.sleep(for: .milliseconds(50))
+
+        // Assert: both segments persisted with correct sources
+        let segments = try await repo.segments(for: session.id)
+        #expect(segments.count == 2)
+        #expect(segments.contains(where: { $0.text == "mic final" && $0.source == .microphone }))
+        #expect(segments.contains(where: { $0.text == "sys final" && $0.source == .systemAudio }))
+
+        // Assert: sequential sequence numbers
+        let seqNums = segments.map(\.sequenceNumber).sorted()
+        #expect(seqNums == [1, 2])
+
+        // Assert: delegate received separate partial events per source
+        let partials = await delegate.partialTexts
+        let micPartials = partials.filter { $0.1 == .microphone }
+        let sysPartials = partials.filter { $0.1 == .systemAudio }
+        #expect(!micPartials.isEmpty)
+        #expect(!sysPartials.isEmpty)
+
+        await engine.stop()
+    }
+
     @Test func doubleStartThrowsAlreadyRecording() async throws {
         let (engine, _, _, _, _, _, _) = await makeEngine()
 

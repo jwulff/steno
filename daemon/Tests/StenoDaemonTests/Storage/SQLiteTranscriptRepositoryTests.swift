@@ -275,6 +275,50 @@ struct SQLiteTranscriptRepositoryTests {
         #expect(segments[0].source == .microphone)
     }
 
+    @Test func segmentsOrderedByStartedAtNotSequenceNumber() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+        let baseTime = Date()
+
+        // Segment A: lower seqNum but later startedAt
+        let segmentA = StoredSegment(
+            id: UUID(),
+            sessionId: session.id,
+            text: "Segment A (later speech)",
+            startedAt: baseTime.addingTimeInterval(2),
+            endedAt: baseTime.addingTimeInterval(3),
+            confidence: nil,
+            sequenceNumber: 1,
+            createdAt: baseTime,
+            source: .microphone
+        )
+
+        // Segment B: higher seqNum but earlier startedAt
+        let segmentB = StoredSegment(
+            id: UUID(),
+            sessionId: session.id,
+            text: "Segment B (earlier speech)",
+            startedAt: baseTime,
+            endedAt: baseTime.addingTimeInterval(1),
+            confidence: nil,
+            sequenceNumber: 2,
+            createdAt: baseTime,
+            source: .systemAudio
+        )
+
+        try await repo.saveSegment(segmentA)
+        try await repo.saveSegment(segmentB)
+
+        let segments = try await repo.segments(for: session.id)
+
+        #expect(segments.count == 2)
+        // B should come first because it started earlier
+        #expect(segments[0].text == "Segment B (earlier speech)")
+        #expect(segments[1].text == "Segment A (later speech)")
+    }
+
     // MARK: - Summary Tests
 
     @Test func saveAndFetchSummary() async throws {

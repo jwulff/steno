@@ -126,11 +126,98 @@ func TestPartialEvent(t *testing.T) {
 
 	m.handleEvent(ev)
 
-	if m.partialText != "testing partial" {
-		t.Errorf("partialText = %q", m.partialText)
+	if m.partials["microphone"] != "testing partial" {
+		t.Errorf("partials[microphone] = %q", m.partials["microphone"])
 	}
-	if m.partialSrc != "microphone" {
-		t.Errorf("partialSrc = %q", m.partialSrc)
+}
+
+func TestDualSourcePartialsTrackedIndependently(t *testing.T) {
+	m := New()
+	m.connected = true
+
+	// Send mic partial
+	m.handleEvent(daemon.Event{Event: "partial", Text: "hello from mic", Source: "microphone"})
+	// Send sys partial
+	m.handleEvent(daemon.Event{Event: "partial", Text: "hello from sys", Source: "systemAudio"})
+
+	if m.partials["microphone"] != "hello from mic" {
+		t.Errorf("partials[microphone] = %q, want %q", m.partials["microphone"], "hello from mic")
+	}
+	if m.partials["systemAudio"] != "hello from sys" {
+		t.Errorf("partials[systemAudio] = %q, want %q", m.partials["systemAudio"], "hello from sys")
+	}
+}
+
+func TestSegmentClearsOnlyItsSourcePartial(t *testing.T) {
+	m := New()
+	m.connected = true
+
+	// Set both partials
+	m.handleEvent(daemon.Event{Event: "partial", Text: "mic partial", Source: "microphone"})
+	m.handleEvent(daemon.Event{Event: "partial", Text: "sys partial", Source: "systemAudio"})
+
+	// Finalize mic segment — should clear only mic partial
+	seq := 1
+	m.handleEvent(daemon.Event{Event: "segment", Text: "mic final", Source: "microphone", SequenceNumber: &seq})
+
+	if _, ok := m.partials["microphone"]; ok {
+		t.Error("mic partial should be cleared after mic segment")
+	}
+	if m.partials["systemAudio"] != "sys partial" {
+		t.Errorf("sys partial should remain, got %q", m.partials["systemAudio"])
+	}
+}
+
+func TestSegmentUsesStartedAtTimestamp(t *testing.T) {
+	m := New()
+	m.connected = true
+
+	startedAt := float64(1700000000.5)
+	seq := 1
+	ev := daemon.Event{
+		Event:          "segment",
+		Text:           "timestamped segment",
+		Source:         "microphone",
+		SequenceNumber: &seq,
+		StartedAt:      &startedAt,
+	}
+
+	m.handleEvent(ev)
+
+	if len(m.entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(m.entries))
+	}
+	// Should use the startedAt timestamp, not time.Now()
+	expected := float64(1700000000.5)
+	got := float64(m.entries[0].Timestamp.Unix()) + float64(m.entries[0].Timestamp.Nanosecond())/1e9
+	diff := got - expected
+	if diff < -1 || diff > 1 {
+		t.Errorf("timestamp = %v, want ~%v (diff=%v)", got, expected, diff)
+	}
+}
+
+func TestSegmentsInsertedInChronologicalOrder(t *testing.T) {
+	m := New()
+	m.connected = true
+
+	// Simulate dual-source: sys finishes first but mic started earlier
+	sysStarted := float64(1700000001) // T+1
+	micStarted := float64(1700000000) // T+0
+
+	seq1 := 1
+	m.handleEvent(daemon.Event{Event: "segment", Text: "sys first", Source: "systemAudio", SequenceNumber: &seq1, StartedAt: &sysStarted})
+	seq2 := 2
+	m.handleEvent(daemon.Event{Event: "segment", Text: "mic first", Source: "microphone", SequenceNumber: &seq2, StartedAt: &micStarted})
+
+	if len(m.entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(m.entries))
+	}
+	// mic should be first (earlier startedAt) despite arriving second
+	if m.entries[0].Text != "mic first" {
+		t.Errorf("entries[0].Text = %q, want %q", m.entries[0].Text, "mic first")
+	}
+	if m.entries[1].Text != "sys first" {
+		t.Errorf("entries[1].Text = %q, want %q", m.entries[1].Text, "sys first")
 	}
 }
 

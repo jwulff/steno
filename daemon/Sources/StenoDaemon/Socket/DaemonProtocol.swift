@@ -82,6 +82,7 @@ public struct DaemonEvent: Codable, Sendable {
     public var transient: Bool?
     public var recording: Bool?
     public var modelProcessing: Bool?
+    public var startedAt: Double?
 
     public init(
         event: String,
@@ -95,7 +96,8 @@ public struct DaemonEvent: Codable, Sendable {
         message: String? = nil,
         transient: Bool? = nil,
         recording: Bool? = nil,
-        modelProcessing: Bool? = nil
+        modelProcessing: Bool? = nil,
+        startedAt: Double? = nil
     ) {
         self.event = event
         self.text = text
@@ -109,5 +111,6 @@ public struct DaemonEvent: Codable, Sendable {
         self.transient = transient
         self.recording = recording
         self.modelProcessing = modelProcessing
+        self.startedAt = startedAt
     }
 }

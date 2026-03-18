@@ -126,10 +126,12 @@ public actor RollingSummaryCoordinator {
         let allSegments = try await repository.segments(for: sessionId)
         let segments = allSegments.filter { $0.sequenceNumber >= fromSequence }
 
-        guard let lastSegment = segments.last else {
+        guard !segments.isEmpty else {
             logSummary("No segments to summarize")
             return nil
         }
+
+        let maxSequenceNumber = segments.map(\.sequenceNumber).max()!
 
         let available = await summarizer.isAvailable
         logSummary("Model available: \(available)")
@@ -237,7 +239,7 @@ public actor RollingSummaryCoordinator {
             sessionId: sessionId,
             content: briefSummary,
             segmentRangeStart: fromSequence,
-            segmentRangeEnd: lastSegment.sequenceNumber,
+            segmentRangeEnd: maxSequenceNumber,
             modelId: "apple-foundation-model"
         )
 

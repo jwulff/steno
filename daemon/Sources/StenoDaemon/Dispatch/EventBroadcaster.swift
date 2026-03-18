@@ -85,7 +85,8 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 text: segment.text,
                 source: segment.source.rawValue,
                 sessionId: segment.sessionId.uuidString,
-                sequenceNumber: segment.sequenceNumber
+                sequenceNumber: segment.sequenceNumber,
+                startedAt: segment.startedAt.timeIntervalSince1970
             ))
 
         case .topicsUpdated(let topics):
