@@ -302,3 +302,38 @@ for try await result in transcriber.results {
 - Using `AsyncParsableCommand` with `dispatchMain()` (crashes — use `ParsableCommand`)
 - Calling `SpeechAnalyzer.start()` off the main actor (crashes with SIGTRAP)
 - **NEVER fall back to legacy speech APIs** (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`). The solution to SpeechAnalyzer/SpeechTranscriber issues is always to fix the runtime environment (main RunLoop, `@MainActor`, `dispatchMain()`), not to downgrade APIs. We use macOS 26 `SpeechAnalyzer`/`SpeechTranscriber` exclusively.
+
+---
+
+## Pre-Push Checklist
+
+Before pushing any branch, verify:
+
+1. **Run the full test suite**: `make test` (runs both `test-daemon` and `test-steno`)
+2. **Verify the build succeeds**: `make build` (release build for both daemon and steno)
+3. **Include test attestation** in the commit message: `[steno-tests-passed: X tests in Ys]`
+4. **No warnings or errors** in either the Swift or Go build output
+
+The `.githooks/pre-push` hook runs `make test` automatically, but run it manually first to catch failures before the push attempt.
+
+---
+
+## Debugging Discipline
+
+1. **Check API response format assumptions early** — When working with the NDJSON protocol, SpeechAnalyzer results, or SQLite queries, verify the actual shape of data before writing parsing code. Log or print the raw response first.
+2. **Reproduce before fixing** — Write a failing test that demonstrates the bug before writing any fix. The test proves the bug exists and prevents regressions.
+3. **Check nil/optional handling** — Swift force unwraps (`!`) are an anti-pattern in this project (see Anti-Patterns). Audit `nil` paths in Swift and zero-value paths in Go, especially:
+   - Socket responses that may lack expected fields
+   - SQLite query results that return no rows
+   - SpeechAnalyzer results where `text` or `isFinal` may not be present
+   - JSON decoding where fields may be missing or have unexpected types
+4. **Isolate the layer** — Determine whether the bug is in the daemon (Swift), steno (Go), the IPC protocol, or SQLite before diving into code. Use `make run-daemon` with debug logging to inspect daemon behavior independently.
+
+---
+
+## Deployment Checklist
+
+1. **All changes committed and pushed** — No uncommitted work. Branch is up to date with remote.
+2. **CI green** — All checks pass on the PR before merging.
+3. **Verify the build artifacts** — After merging, run `make build && make sign-daemon` and confirm the signed binary works: `make run-daemon` should start without SIGTRAP or SIGKILL.
+4. **Install and verify** — Run `make install` to place binaries in `~/.local/bin`, then launch `steno` from a fresh shell to confirm the new version is picked up.
