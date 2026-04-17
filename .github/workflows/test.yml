@@ -79,7 +79,7 @@ jobs:
 
       - name: Setup Go
         if: steps.check-swift.outputs.version_ok == 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.24'
 
