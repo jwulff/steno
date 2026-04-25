@@ -34,6 +34,90 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         return session
     }
 
+    public func recoverOrphansAndOpenFresh(locale: Locale) async throws -> Session {
+        // Atomic sweep + insert in a single GRDB write transaction.
+        //
+        // The UPDATE runs FIRST, BEFORE the INSERT. SQLite executes the
+        // statements in this block in submission order, so the UPDATE
+        // matches only the pre-existing 'active' rows; the new row
+        // (inserted afterwards) is not visible to the WHERE clause.
+        //
+        // GRDB's `dbQueue.write` serializes against all other writers, so
+        // no concurrent willSleep handler (or any other writer) can observe
+        // the half-state where the orphans are interrupted but the new
+        // session has not yet been inserted.
+        let session = Session(
+            id: UUID(),
+            locale: locale,
+            startedAt: Date(),
+            endedAt: nil,
+            title: nil,
+            status: .active,
+            lastDedupedSegmentSeq: 0,
+            pauseExpiresAt: nil,
+            pausedIndefinitely: false
+        )
+
+        try await dbQueue.write { db in
+            // Sweep: orphan close uses MAX(segments.endedAt) per the plan,
+            // falling back to the orphan's startedAt for zero-segment rows.
+            try db.execute(sql: """
+                UPDATE sessions
+                SET status = ?,
+                    endedAt = COALESCE(
+                        (SELECT MAX(endedAt) FROM segments WHERE sessionId = sessions.id),
+                        startedAt
+                    )
+                WHERE status = ?
+            """, arguments: [
+                Session.Status.interrupted.rawValue,
+                Session.Status.active.rawValue
+            ])
+
+            // Insert the new active session.
+            try SessionRecord.from(session).insert(db)
+        }
+
+        return session
+    }
+
+    public func sweepActiveOrphans() async throws {
+        try await dbQueue.write { db in
+            try db.execute(sql: """
+                UPDATE sessions
+                SET status = ?,
+                    endedAt = COALESCE(
+                        (SELECT MAX(endedAt) FROM segments WHERE sessionId = sessions.id),
+                        startedAt
+                    )
+                WHERE status = ?
+            """, arguments: [
+                Session.Status.interrupted.rawValue,
+                Session.Status.active.rawValue
+            ])
+        }
+    }
+
+    /// Read the most-recently-modified session (by `endedAt` if present,
+    /// else `startedAt`). Used by U4's pause-state-restore check on
+    /// daemon-start: a paused session may have been the last write before
+    /// the daemon was killed, and we must not surprise-resume into recording.
+    public func mostRecentlyModifiedSession() async throws -> Session? {
+        try await dbQueue.read { db in
+            try SessionRecord
+                .fetchAll(
+                    db,
+                    sql: """
+                        SELECT * FROM sessions
+                        ORDER BY COALESCE(endedAt, startedAt) DESC
+                        LIMIT 1
+                    """
+                )
+                .first?
+                .toDomain()
+        }
+    }
+
     public func endSession(_ sessionId: UUID) async throws {
         try await dbQueue.write { db in
             try db.execute(

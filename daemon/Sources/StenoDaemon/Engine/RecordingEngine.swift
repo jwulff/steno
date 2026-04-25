@@ -112,6 +112,58 @@ public actor RecordingEngine {
             throw error
         }
 
+        let result = try await bringUpPipelines(
+            session: session,
+            locale: locale,
+            device: device,
+            systemAudio: systemAudio
+        )
+        // Persist last-known device + systemAudio so the next daemon-start
+        // auto-start can restore the user's selection. Failure to save is
+        // non-fatal — log via emit and continue.
+        await persistLastKnownAudioConfig(device: device, systemAudio: systemAudio)
+        return result
+    }
+
+    /// Best-effort settings persistence after a successful start. Failure
+    /// is non-fatal: we emit a transient error event and continue. The
+    /// recording session is unaffected — settings persistence is a
+    /// next-launch convenience, not a runtime requirement.
+    private func persistLastKnownAudioConfig(device: String?, systemAudio: Bool) async {
+        var settings = StenoSettings.load()
+        settings.lastDevice = device
+        settings.lastSystemAudioEnabled = systemAudio
+        do {
+            try settings.save()
+        } catch {
+            await emit(.error("Failed to save last-known audio config: \(error)", isTransient: true))
+        }
+    }
+
+    /// Bring up mic + (optional) system audio pipelines around an
+    /// already-acquired `Session`. Extracted from `start(...)` so the
+    /// auto-start path (`recoverOrphansAndAutoStart`) can reuse the
+    /// pipeline-bringup machinery with a session created by
+    /// `repository.recoverOrphansAndOpenFresh()` instead of
+    /// `repository.createSession()`.
+    ///
+    /// Caller invariants:
+    /// - Status has already been transitioned to `.starting`.
+    /// - Permissions have already been checked.
+    /// - The session row already exists in the repository.
+    ///
+    /// Postconditions on success: status is `.recording`, all engine
+    /// pipeline state is initialized.
+    /// Postconditions on failure: cleanup runs, status transitions to `.error`,
+    /// and an audio-source error is thrown. The session row in the DB is
+    /// NOT rolled back — the caller decides whether to leave it active or
+    /// close it.
+    private func bringUpPipelines(
+        session: Session,
+        locale: Locale,
+        device: String?,
+        systemAudio: Bool
+    ) async throws -> Session {
         currentSession = session
         currentDevice = device
         currentSequenceNumber = 0
@@ -144,6 +196,7 @@ public actor RecordingEngine {
         } catch {
             await cleanup()
             await setStatus(.error)
+            await emit(.error("Audio source failed: \(error.localizedDescription)", isTransient: false))
             throw RecordingEngineError.audioSourceFailed(error.localizedDescription)
         }
 
@@ -155,6 +208,100 @@ public actor RecordingEngine {
 
         await setStatus(.recording)
         return session
+    }
+
+    /// Sweep stranded `active` sessions to `interrupted`, then auto-start
+    /// recording into a fresh active session. Used on daemon start
+    /// (LaunchAgent relaunch, login, post-crash) to fulfil R1/R9: the
+    /// daemon must not land in `idle` after first launch.
+    ///
+    /// Privacy-critical: if the most-recently-modified session shows an
+    /// active pause (`paused_indefinitely=1` OR `pause_expires_at` in the
+    /// future), the daemon DOES still sweep orphans (those are stranded
+    /// rows from a prior crash, separate from pause state) but does NOT
+    /// open a fresh active session and does NOT bring up pipelines. The
+    /// engine remains in `.idle`. U10 will own the actual paused engine
+    /// state and the resume-from-restored-pause path; until U10 lands, a
+    /// pause restored across restart simply leaves the daemon idle until
+    /// the user explicitly resumes via the TUI.
+    ///
+    /// On audio-source / recognizer failure mid-bringup: the orphan sweep
+    /// has already committed and remains so — that is the load-bearing
+    /// invariant of this method. Status transitions to `.error`; the
+    /// caller (RunCommand) does NOT crash the daemon.
+    ///
+    /// - Parameters:
+    ///   - locale: Locale for speech recognition (default: `.current`).
+    ///   - device: Optional audio device identifier (default: nil = system default).
+    ///   - systemAudio: Whether to also capture system audio (default: true,
+    ///                  matching the always-on recording goal).
+    /// - Returns: The newly opened active session, or nil if the privacy
+    ///   check determined the daemon must remain paused.
+    @discardableResult
+    public func recoverOrphansAndAutoStart(
+        locale: Locale = .current,
+        device: String? = nil,
+        systemAudio: Bool = true
+    ) async throws -> Session? {
+        guard status == .idle || status == .error else {
+            throw RecordingEngineError.alreadyRecording
+        }
+
+        // Privacy-critical pause-state restore check (ties to U10).
+        // If the most-recently-modified session is still in a paused state,
+        // sweep orphans separately but do NOT open a fresh active session
+        // and do NOT bring up pipelines. The engine stays in `.idle`.
+        if let mostRecent = try? await repository.mostRecentlyModifiedSession() {
+            let now = Date()
+            let pauseStillActive = mostRecent.pausedIndefinitely
+                || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
+            if pauseStillActive {
+                // Sweep orphans even though we're not auto-starting. Orphans
+                // are stranded `active` rows from a prior crash — they need
+                // to be closed regardless of the user's pause intent. Use
+                // the no-insert variant so we do NOT surprise-resume into
+                // a fresh recording session.
+                try? await repository.sweepActiveOrphans()
+                await emit(.error(
+                    "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
+                    ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
+                    " — not auto-starting (U10 will restore paused engine state)",
+                    isTransient: false
+                ))
+                return nil
+            }
+        }
+
+        await setStatus(.starting)
+
+        // Check permissions BEFORE the orphan sweep so a permission failure
+        // doesn't force us to swallow a successful sweep.
+        let permissions = await permissionService.checkPermissions()
+        guard permissions.allGranted else {
+            await setStatus(.error)
+            let message = permissions.errorMessage ?? "Permissions denied"
+            await emit(.error(message, isTransient: false))
+            throw RecordingEngineError.permissionDenied(message)
+        }
+
+        // Atomic sweep + fresh-session insert.
+        let session: Session
+        do {
+            session = try await repository.recoverOrphansAndOpenFresh(locale: locale)
+        } catch {
+            await setStatus(.error)
+            await emit(.error("Failed to recover orphans and open session: \(error)", isTransient: false))
+            throw error
+        }
+
+        let result = try await bringUpPipelines(
+            session: session,
+            locale: locale,
+            device: device,
+            systemAudio: systemAudio
+        )
+        await persistLastKnownAudioConfig(device: device, systemAudio: systemAudio)
+        return result
     }
 
     /// Stop recording and finalize the session.

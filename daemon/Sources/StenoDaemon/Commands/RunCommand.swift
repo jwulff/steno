@@ -79,6 +79,28 @@ struct RunCommand: ParsableCommand {
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
 
+                // U6: register IOKit power observer here, BEFORE auto-start.
+                // The observer must be installed first so a willSleep arriving
+                // during the orphan sweep is queued (the actor serializes),
+                // not lost. U6 will land that observer; the slot is here.
+
+                // 5b. Auto-start recording. R1/R9: the daemon must never
+                // sit in `idle` after launch. Failure is logged but does
+                // NOT crash the daemon — the engine surfaces the error
+                // (e.g., mic permission denied) and the user can grant
+                // permission and trigger a retry via the TUI. Settings
+                // restore the last-known device + systemAudio choice.
+                let settings = StenoSettings.load()
+                do {
+                    _ = try await engine.recoverOrphansAndAutoStart(
+                        locale: .current,
+                        device: settings.lastDevice,
+                        systemAudio: settings.lastSystemAudioEnabled
+                    )
+                } catch {
+                    log.error("Auto-start failed: \(error). Engine remains in error state; awaiting external resume.")
+                }
+
                 // 6. Start socket server
                 let server = UnixSocketServer()
                 let sockPath = socketPath ?? DaemonPaths.socketPath

@@ -25,6 +25,46 @@ actor MockTranscriptRepository: TranscriptRepository {
         return session
     }
 
+    func sweepActiveOrphans() async throws {
+        for (id, var session) in sessions where session.status == .active {
+            let segs = segments[id] ?? []
+            let endedAt = segs.map(\.endedAt).max() ?? session.startedAt
+            session.status = .interrupted
+            session.endedAt = endedAt
+            sessions[id] = session
+        }
+    }
+
+    func recoverOrphansAndOpenFresh(locale: Locale) async throws -> Session {
+        // Simulate the single-transaction sweep + insert.
+        // 1. Mark every active session as interrupted with endedAt computed
+        //    from MAX(segments.endedAt) or fallback to startedAt.
+        let now = Date()
+        for (id, var session) in sessions where session.status == .active {
+            let segs = segments[id] ?? []
+            let endedAt = segs.map(\.endedAt).max() ?? session.startedAt
+            session.status = .interrupted
+            session.endedAt = endedAt
+            sessions[id] = session
+        }
+        // 2. Open a fresh active session (NOT subject to the prior sweep).
+        let fresh = Session(
+            id: UUID(),
+            locale: locale,
+            startedAt: now,
+            endedAt: nil,
+            title: nil,
+            status: .active,
+            lastDedupedSegmentSeq: 0,
+            pauseExpiresAt: nil,
+            pausedIndefinitely: false
+        )
+        sessions[fresh.id] = fresh
+        segments[fresh.id] = []
+        summaries[fresh.id] = []
+        return fresh
+    }
+
     func endSession(_ sessionId: UUID) async throws {
         guard var session = sessions[sessionId] else { return }
         session = Session(
@@ -44,6 +84,15 @@ actor MockTranscriptRepository: TranscriptRepository {
 
     func allSessions() async throws -> [Session] {
         sessions.values.sorted { $0.startedAt > $1.startedAt }
+    }
+
+    func mostRecentlyModifiedSession() async throws -> Session? {
+        // ORDER BY COALESCE(endedAt, startedAt) DESC.
+        sessions.values.sorted { lhs, rhs in
+            let lk = lhs.endedAt ?? lhs.startedAt
+            let rk = rhs.endedAt ?? rhs.startedAt
+            return lk > rk
+        }.first
     }
 
     func deleteSession(_ id: UUID) async throws {
@@ -100,5 +149,15 @@ actor MockTranscriptRepository: TranscriptRepository {
 
     func topics(for sessionId: UUID) async throws -> [Topic] {
         (topics[sessionId] ?? []).sorted { $0.segmentRange.lowerBound < $1.segmentRange.lowerBound }
+    }
+
+    // MARK: - Test Helpers
+
+    /// Seed a session row directly. Used by U4 tests that need to simulate
+    /// pre-existing orphan/paused rows without going through `createSession`.
+    func seed(_ session: Session) {
+        sessions[session.id] = session
+        if segments[session.id] == nil { segments[session.id] = [] }
+        if summaries[session.id] == nil { summaries[session.id] = [] }
     }
 }

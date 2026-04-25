@@ -13,6 +13,32 @@ public protocol TranscriptRepository: Sendable {
     /// - Returns: The created session.
     func createSession(locale: Locale) async throws -> Session
 
+    /// Mark any stranded `active` sessions as `interrupted` and atomically
+    /// open a fresh active session. Both operations run inside a single
+    /// SQLite transaction so concurrent writers (e.g. a willSleep handler)
+    /// never observe the half-state between sweep and new-session-insert,
+    /// and so the UPDATE cannot accidentally match the just-inserted new row.
+    ///
+    /// Each interrupted session's `endedAt` is set to
+    /// `COALESCE(MAX(segments.endedAt), startedAt)` — orphans with zero
+    /// segments close to their `startedAt` (their cascade-delete eligibility
+    /// is U12's concern, not this method's).
+    ///
+    /// - Parameter locale: The locale for the newly opened session.
+    /// - Returns: The newly opened active session.
+    func recoverOrphansAndOpenFresh(locale: Locale) async throws -> Session
+
+    /// Mark any stranded `active` sessions as `interrupted` WITHOUT opening
+    /// a fresh session. Used by U4's daemon-start path when the privacy
+    /// check finds an active pause: orphans must still be closed (they are
+    /// stranded rows from a prior crash, separate from the user's pause
+    /// intent), but a fresh active session must NOT be opened, since that
+    /// would surprise-resume recording.
+    ///
+    /// Uses the same `endedAt = COALESCE(MAX(segments.endedAt), startedAt)`
+    /// rule as `recoverOrphansAndOpenFresh`.
+    func sweepActiveOrphans() async throws
+
     /// Mark a session as completed.
     ///
     /// - Parameter sessionId: The ID of the session to end.
@@ -28,6 +54,15 @@ public protocol TranscriptRepository: Sendable {
     ///
     /// - Returns: Array of all sessions.
     func allSessions() async throws -> [Session]
+
+    /// Retrieve the most-recently-modified session, ordered by
+    /// `COALESCE(endedAt, startedAt) DESC`. Used by U4's daemon-start
+    /// privacy check: if the most recent session is paused (indefinitely
+    /// or via an unexpired `pause_expires_at`), the daemon must NOT
+    /// auto-start recording.
+    ///
+    /// - Returns: The most-recently-modified session, or nil if the DB is empty.
+    func mostRecentlyModifiedSession() async throws -> Session?
 
     /// Delete a session and all associated segments and summaries.
     ///
