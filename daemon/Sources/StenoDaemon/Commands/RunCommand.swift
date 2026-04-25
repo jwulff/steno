@@ -16,6 +16,18 @@ struct RunCommand: ParsableCommand {
     func run() throws {
         let log = DaemonLogger.daemon
 
+        // 0. Refuse to start on pre-macOS-26 systems. Without this, an old
+        // system would spin in launchd's KeepAlive loop forever (U5's backoff
+        // doesn't cover misconfigured-host failures). See MacOSVersionGate
+        // for why this is a runtime check rather than `#available`.
+        let gate = MacOSVersionGate.check(
+            currentVersion: ProcessInfo.processInfo.operatingSystemVersion
+        )
+        if !gate.isSupported, let message = gate.message {
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+            throw ExitCode.failure
+        }
+
         // 1. Ensure base directory
         try DaemonPaths.ensureBaseDirectory()
 
