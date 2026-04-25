@@ -18,6 +18,13 @@ public enum DatabaseConfiguration {
         var config = Configuration()
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
+            // WAL on the writer is load-bearing for concurrent reads from the
+            // Go TUI/MCP client. The Go side opens the DB read-only with a
+            // WAL DSN, but DSN flags cannot change `journal_mode` — only the
+            // writer can switch a database to WAL mode. Without this PRAGMA,
+            // the writer stays in default rollback-journal mode and reads
+            // serialize against migration writes.
+            try db.execute(sql: "PRAGMA journal_mode = WAL")
         }
 
         let dbQueue = try DatabaseQueue(path: url.path, configuration: config)
@@ -33,6 +40,10 @@ public enum DatabaseConfiguration {
         var config = Configuration()
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA foreign_keys = ON")
+            // In-memory databases do not support WAL mode (`PRAGMA journal_mode = WAL`
+            // returns "memory" and remains in MEMORY journaling). We don't issue
+            // the PRAGMA here on purpose — the writer-WAL invariant only matters
+            // for cross-process reads against the on-disk file.
         }
 
         let dbQueue = try DatabaseQueue(configuration: config)
@@ -127,6 +138,48 @@ public enum DatabaseConfiguration {
             """)
 
             try db.execute(sql: "CREATE INDEX idx_topics_session ON topics(sessionId)")
+        }
+
+        // Always-on recording (R5, R10, R11, R13): additive columns for
+        // cross-source dedup, in-place heal markers, mic-level metering, and
+        // session-level pause/dedup-cursor metadata. All segment additions are
+        // nullable; session additions have safe defaults so prior rows migrate
+        // cleanly. `dedup_score` and `opened_by` are intentionally deferred —
+        // see the plan's "Refinements" section.
+        migrator.registerMigration("20260425_001_dedup_and_heal") { db in
+            // Segments: dedup pointer + method, in-place heal marker, mic peak dBFS.
+            try db.execute(sql: """
+                ALTER TABLE segments ADD COLUMN duplicate_of TEXT
+                    REFERENCES segments(id) ON DELETE SET NULL
+            """)
+            try db.execute(sql: """
+                ALTER TABLE segments ADD COLUMN dedup_method TEXT
+                    CHECK(dedup_method IS NULL OR dedup_method IN ('exact', 'normalized', 'fuzzy'))
+            """)
+            try db.execute(sql: "ALTER TABLE segments ADD COLUMN heal_marker TEXT")
+            try db.execute(sql: "ALTER TABLE segments ADD COLUMN mic_peak_db REAL")
+
+            // Sessions: dedup cursor + pause-state-survives-restart fields.
+            // `paused_indefinitely` is a privacy-critical disambiguator (see U10
+            // daemon-start rule). Both flags default to a non-paused, cursor-zero
+            // state so prior rows migrate cleanly.
+            try db.execute(sql: """
+                ALTER TABLE sessions ADD COLUMN last_deduped_segment_seq INTEGER NOT NULL DEFAULT 0
+            """)
+            try db.execute(sql: "ALTER TABLE sessions ADD COLUMN pause_expires_at REAL")
+            try db.execute(sql: """
+                ALTER TABLE sessions ADD COLUMN paused_indefinitely INTEGER NOT NULL DEFAULT 0
+            """)
+
+            // Partial index keyed on the columns the default TUI/MCP query uses:
+            //   WHERE sessionId = ? AND duplicate_of IS NULL ORDER BY sequenceNumber
+            // The partial WHERE clause keeps the index small (only non-duplicate rows)
+            // and SQLite's planner picks it for that exact query shape.
+            try db.execute(sql: """
+                CREATE INDEX idx_segments_dedup
+                ON segments(sessionId, sequenceNumber)
+                WHERE duplicate_of IS NULL
+            """)
         }
 
         return migrator

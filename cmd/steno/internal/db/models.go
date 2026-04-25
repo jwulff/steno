@@ -12,6 +12,18 @@ type Session struct {
 	Title     string
 	Status    string
 	CreatedAt time.Time
+
+	// LastDedupedSegmentSeq is the cursor advanced by the daemon's
+	// DedupCoordinator. The migration backfills 0 for pre-existing rows.
+	LastDedupedSegmentSeq int
+
+	// PauseExpiresAt is the wall-clock expiry of a timed pause. Nil when
+	// the session is not paused or the pause is indefinite.
+	PauseExpiresAt *time.Time
+
+	// PausedIndefinitely is true when pause has no auto-resume. Privacy-
+	// critical: a corrupted/unmigrated row must not surprise-resume.
+	PausedIndefinitely bool
 }
 
 // Segment represents a finalized transcript segment.
@@ -25,6 +37,26 @@ type Segment struct {
 	SequenceNumber int
 	CreatedAt      time.Time
 	Source         string
+
+	// DuplicateOf points at the canonical segment this row duplicates,
+	// when the daemon's DedupCoordinator (U11) has marked it. Nil means
+	// canonical / not yet evaluated. The default TUI/MCP query in U9
+	// filters `WHERE duplicate_of IS NULL`.
+	DuplicateOf *string
+
+	// DedupMethod is one of "exact" | "normalized" | "fuzzy" when
+	// DuplicateOf is set; nil otherwise.
+	DedupMethod *string
+
+	// HealMarker is a free-text annotation written when an in-place
+	// pipeline restart preserves the session across a gap (e.g.
+	// "after_gap:12s").
+	HealMarker *string
+
+	// MicPeakDB is the peak dBFS observed during this segment, used by
+	// the daemon's audio-level heuristic for dedup. Nil for non-mic
+	// segments and pre-migration rows.
+	MicPeakDB *float64
 }
 
 // Topic represents an extracted topic.
