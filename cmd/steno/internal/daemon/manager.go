@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// ghostDetectionGracePeriod is how long after the PID file appears we still
+// give a daemon the benefit of the doubt for a missing socket. Past this,
+// a PID-alive-socket-dead daemon is treated as a ghost and respawned.
+const ghostDetectionGracePeriod = 5 * time.Second
+
+// ghostTerminationDeadline is how long we wait for SIGTERM to take effect
+// before escalating to SIGKILL when reaping a ghost daemon.
+const ghostTerminationDeadline = 3 * time.Second
+
 // Manager handles daemon lifecycle: finding the binary, checking if it's
 // running, starting it, and waiting for the socket to become available.
 type Manager struct {
@@ -194,24 +203,42 @@ func (m *Manager) readLogTail(n int) string {
 
 // EnsureRunning checks if the daemon is running and starts it if not.
 // Returns nil when the daemon is ready to accept connections.
+//
+// When a PID file exists and points at a live process but the socket is
+// unreachable past the grace period, the daemon is treated as a ghost,
+// terminated, and respawned. See recoverGhostIfNeeded.
 func (m *Manager) EnsureRunning(ctx context.Context) error {
-	running, _, err := m.IsRunning()
+	running, pid, err := m.IsRunning()
 	if err != nil {
 		return err
 	}
 
+	needSpawn := !running
+
 	if running {
-		// Verify socket is actually connectable
+		// Verify socket is actually connectable.
 		conn, err := net.DialTimeout("unix", m.socketPath(), time.Second)
 		if err == nil {
 			conn.Close()
 			return nil
 		}
-		// PID exists but socket doesn't work — daemon may be starting or broken
+		// PID exists but socket doesn't work — could be a daemon mid-startup
+		// (still binding the socket) or a ghost (process alive, listener dead
+		// or socket file deleted). recoverGhostIfNeeded uses PID-file age to
+		// decide; if the daemon should have come up by now it kills and
+		// cleans up so we can spawn a fresh one.
+		recovered, rerr := m.recoverGhostIfNeeded(pid)
+		if rerr != nil {
+			return rerr
+		}
+		if recovered {
+			needSpawn = true
+		}
 	}
 
-	if !running {
-		// Clean up stale files from a previous crash
+	if needSpawn {
+		// Clean up stale files from a previous crash (no-op if recoverGhostIfNeeded
+		// already cleaned them).
 		m.CleanStale()
 
 		binaryPath, err := FindBinary()
@@ -224,8 +251,86 @@ func (m *Manager) EnsureRunning(ctx context.Context) error {
 		}
 	}
 
-	// Wait for socket with a 30-second timeout
+	// Wait for socket with a 30-second timeout.
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	return m.WaitForSocket(waitCtx)
+}
+
+// recoverGhostIfNeeded inspects a daemon whose PID is alive but whose socket
+// is unreachable. If the PID file is older than ghostDetectionGracePeriod,
+// the daemon is considered a ghost: it is killed (SIGTERM, escalating to
+// SIGKILL after ghostTerminationDeadline) and the stale PID/socket files are
+// cleaned. Returns (true, nil) when a ghost was reaped, (false, nil) when
+// the daemon is still within its startup grace window.
+func (m *Manager) recoverGhostIfNeeded(pid int) (bool, error) {
+	info, err := os.Stat(m.pidPath())
+	if err != nil {
+		// No PID file means there's nothing to recover from this path —
+		// the caller will fall through to the spawn branch.
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat pid file: %w", err)
+	}
+
+	age := time.Since(info.ModTime())
+	if age < ghostDetectionGracePeriod {
+		// Daemon may legitimately still be binding its socket. Caller will
+		// fall through to WaitForSocket.
+		return false, nil
+	}
+
+	// Stderr — the TUI redirects stdout for the bubbletea render.
+	fmt.Fprintf(os.Stderr,
+		"ghost daemon detected (PID %d, socket unreachable, PID file age %s) — killing and respawning\n",
+		pid, age.Round(time.Millisecond))
+
+	if err := m.killGhost(pid); err != nil {
+		return false, err
+	}
+	if err := m.CleanStale(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// killGhost sends SIGTERM to pid, polls for exit up to ghostTerminationDeadline,
+// then escalates to SIGKILL if the process is still alive. Returns nil if the
+// process is gone (or was already gone) by the time we return.
+func (m *Manager) killGhost(pid int) error {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		// On Unix FindProcess never fails; defensively treat as already gone.
+		return nil
+	}
+
+	// SIGTERM first. ESRCH means the process already exited — also fine.
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("SIGTERM ghost daemon pid %d: %w", pid, err)
+	}
+
+	// Poll for the process to exit.
+	deadline := time.Now().Add(ghostTerminationDeadline)
+	for time.Now().Before(deadline) {
+		if process.Signal(syscall.Signal(0)) != nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Still alive — escalate to SIGKILL.
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("SIGKILL ghost daemon pid %d: %w", pid, err)
+	}
+
+	// Brief wait for the kernel to reap; bounded so tests don't hang.
+	killDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(killDeadline) {
+		if process.Signal(syscall.Signal(0)) != nil {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil
 }
