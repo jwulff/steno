@@ -3,10 +3,41 @@ import Foundation
 
 /// In-memory mock implementation of TranscriptRepository for testing.
 actor MockTranscriptRepository: TranscriptRepository {
+    /// Test-only error used by the throw-injection helpers.
+    struct InjectedError: Error, Equatable {
+        let message: String
+        init(_ message: String = "injected") { self.message = message }
+    }
+
     private var sessions: [UUID: Session] = [:]
     private var segments: [UUID: [StoredSegment]] = [:]
     private var summaries: [UUID: [Summary]] = [:]
     private var topics: [UUID: [Topic]] = [:]
+
+    // MARK: - Failure-injection knobs (test-only)
+    //
+    // U4 / U10 fail-safe assertions need to verify behavior when the
+    // repository surfaces a real error. Each knob, when set, causes the
+    // matching method to throw `InjectedError` instead of running its
+    // normal logic. Defaults are nil, so unset tests behave as before.
+
+    private var mostRecentlyModifiedSessionError: Error?
+    private var sweepActiveOrphansError: Error?
+    private var recoverOrphansAndOpenFreshError: Error?
+    private var openFreshSessionError: Error?
+
+    func setMostRecentlyModifiedSessionError(_ error: Error?) {
+        mostRecentlyModifiedSessionError = error
+    }
+    func setSweepActiveOrphansError(_ error: Error?) {
+        sweepActiveOrphansError = error
+    }
+    func setRecoverOrphansAndOpenFreshError(_ error: Error?) {
+        recoverOrphansAndOpenFreshError = error
+    }
+    func setOpenFreshSessionError(_ error: Error?) {
+        openFreshSessionError = error
+    }
 
     // MARK: - Sessions
 
@@ -26,6 +57,7 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
 
     func sweepActiveOrphans() async throws {
+        if let error = sweepActiveOrphansError { throw error }
         for (id, var session) in sessions where session.status == .active {
             let segs = segments[id] ?? []
             let endedAt = segs.map(\.endedAt).max() ?? session.startedAt
@@ -36,6 +68,7 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
 
     func recoverOrphansAndOpenFresh(locale: Locale) async throws -> Session {
+        if let error = recoverOrphansAndOpenFreshError { throw error }
         // Simulate the single-transaction sweep + insert.
         // 1. Mark every active session as interrupted with endedAt computed
         //    from MAX(segments.endedAt) or fallback to startedAt.
@@ -52,6 +85,25 @@ actor MockTranscriptRepository: TranscriptRepository {
             id: UUID(),
             locale: locale,
             startedAt: now,
+            endedAt: nil,
+            title: nil,
+            status: .active,
+            lastDedupedSegmentSeq: 0,
+            pauseExpiresAt: nil,
+            pausedIndefinitely: false
+        )
+        sessions[fresh.id] = fresh
+        segments[fresh.id] = []
+        summaries[fresh.id] = []
+        return fresh
+    }
+
+    func openFreshSession(locale: Locale) async throws -> Session {
+        if let error = openFreshSessionError { throw error }
+        let fresh = Session(
+            id: UUID(),
+            locale: locale,
+            startedAt: Date(),
             endedAt: nil,
             title: nil,
             status: .active,
@@ -87,8 +139,9 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
 
     func mostRecentlyModifiedSession() async throws -> Session? {
+        if let error = mostRecentlyModifiedSessionError { throw error }
         // ORDER BY COALESCE(endedAt, startedAt) DESC.
-        sessions.values.sorted { lhs, rhs in
+        return sessions.values.sorted { lhs, rhs in
             let lk = lhs.endedAt ?? lhs.startedAt
             let rk = rhs.endedAt ?? rhs.startedAt
             return lk > rk

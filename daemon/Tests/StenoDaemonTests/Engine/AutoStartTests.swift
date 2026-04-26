@@ -346,4 +346,178 @@ struct AutoStartTests {
 
         await engine.stop()
     }
+
+    // MARK: - Pause-state fail-safe (privacy-critical, U10 contract)
+    //
+    // The plan's U10 fail-safe: any DB read error or unrecognized state on
+    // the pause columns → daemon stays paused, surfaces a non-transient
+    // `pause_state_unverifiable` health warning, requires explicit user
+    // resume. The exact `pause_state_unverifiable` token is load-bearing —
+    // U9's TUI surface and U10's health-warning machinery match on it.
+
+    @Test("Fail-safe: pause-state unverifiable (DB read error) → engine stays idle, sweeps orphans, emits pause_state_unverifiable")
+    func pauseStateUnverifiableKeepsEngineIdle() async throws {
+        let repo = MockTranscriptRepository()
+
+        // Seed an orphan to verify the sweep runs even on the fail-safe path.
+        let orphanId = UUID()
+        await repo.seed(Session(
+            id: orphanId,
+            locale: Locale(identifier: "en_US"),
+            startedAt: Date().addingTimeInterval(-3600),
+            endedAt: nil,
+            title: nil,
+            status: .active
+        ))
+        // Inject a DB read error on the pause-column lookup.
+        await repo.setMostRecentlyModifiedSessionError(
+            MockTranscriptRepository.InjectedError("simulated DB read failure")
+        )
+
+        let (engine, _, _, _, _, delegate) = await makeEngine(repository: repo)
+
+        let result = try await engine.recoverOrphansAndAutoStart(
+            locale: Locale(identifier: "en_US"),
+            systemAudio: false
+        )
+
+        // No fresh active session (privacy-critical).
+        #expect(result == nil)
+        let status = await engine.status
+        #expect(status == .idle)
+
+        // Orphan sweep ran despite the pause-column read failing.
+        let orphanAfter = try await repo.session(orphanId)
+        #expect(orphanAfter?.status == .interrupted)
+
+        // No fresh active session in the DB.
+        let all = try await repo.allSessions()
+        #expect(all.filter { $0.status == .active }.count == 0)
+
+        // The exact `pause_state_unverifiable` token is matched on by U9/U10
+        // — assert it appears verbatim in a non-transient error event.
+        let errors = await delegate.errors
+        #expect(errors.contains(where: { $0.0.contains("pause_state_unverifiable") && $0.1 == false }))
+    }
+
+    @Test("Fail-safe: pause-column read fails AFTER successful sweep → pause_state_unverifiable, engine .idle")
+    func pauseReadFailureAfterSuccessfulSweepStaysIdle() async throws {
+        let repo = MockTranscriptRepository()
+        // Sweep succeeds, but the pause-column read fails. This is the
+        // canonical fail-safe scenario: orphans got cleaned up cleanly,
+        // but we cannot verify the user's pause intent → stay paused
+        // (engine .idle), surface non-transient pause_state_unverifiable.
+        await repo.setMostRecentlyModifiedSessionError(
+            MockTranscriptRepository.InjectedError("pause read failed")
+        )
+
+        let orphanId = UUID()
+        await repo.seed(Session(
+            id: orphanId,
+            locale: Locale(identifier: "en_US"),
+            startedAt: Date().addingTimeInterval(-3600),
+            endedAt: nil,
+            title: nil,
+            status: .active
+        ))
+
+        let (engine, _, _, _, _, delegate) = await makeEngine(repository: repo)
+
+        let result = try await engine.recoverOrphansAndAutoStart(
+            locale: Locale(identifier: "en_US"),
+            systemAudio: false
+        )
+
+        #expect(result == nil)
+        let status = await engine.status
+        #expect(status == .idle)
+
+        // Sweep ran successfully — orphan is interrupted.
+        let orphanAfter = try await repo.session(orphanId)
+        #expect(orphanAfter?.status == .interrupted)
+
+        // No fresh active session opened.
+        let all = try await repo.allSessions()
+        #expect(all.filter { $0.status == .active }.count == 0)
+
+        // Non-transient pause_state_unverifiable event surfaced.
+        let errors = await delegate.errors
+        #expect(errors.contains(where: { $0.0.contains("pause_state_unverifiable") && $0.1 == false }))
+    }
+
+    @Test("Sweep failure on the main auto-start path → engine .error, no fresh session, non-transient event")
+    func sweepFailureOnAutoStartPathSetsErrorState() async throws {
+        let repo = MockTranscriptRepository()
+
+        // Permissions granted, pause-state read clean — but the orphan
+        // sweep itself throws. The engine must NOT crash, must NOT open
+        // a fresh active session, must surface the failure non-transiently,
+        // and must end in `.error`.
+        await repo.setSweepActiveOrphansError(
+            MockTranscriptRepository.InjectedError("sweep failed")
+        )
+
+        let (engine, _, _, _, _, delegate) = await makeEngine(repository: repo)
+
+        let result = try await engine.recoverOrphansAndAutoStart(
+            locale: Locale(identifier: "en_US"),
+            systemAudio: false
+        )
+
+        #expect(result == nil)
+        let status = await engine.status
+        #expect(status == .error)
+
+        // No active session was inserted (the sweep ran first, before
+        // any insert; the insert must not happen if the sweep fails).
+        let all = try await repo.allSessions()
+        #expect(all.filter { $0.status == .active }.count == 0)
+
+        let errors = await delegate.errors
+        #expect(errors.contains(where: { $0.1 == false }))
+    }
+
+    @Test("Permission denial path still sweeps orphans first")
+    func permissionDeniedSweepsOrphans() async throws {
+        let repo = MockTranscriptRepository()
+
+        // Seed an orphan so we can prove the sweep ran.
+        let orphanId = UUID()
+        await repo.seed(Session(
+            id: orphanId,
+            locale: Locale(identifier: "en_US"),
+            startedAt: Date().addingTimeInterval(-3600),
+            endedAt: nil,
+            title: nil,
+            status: .active
+        ))
+
+        let perms = await MainActor.run { MockPermissionService() }
+        await MainActor.run { perms.denyAll() }
+
+        let (engine, _, _, _, _, _) = await makeEngine(
+            repository: repo,
+            permissionService: perms
+        )
+
+        await #expect(throws: RecordingEngineError.self) {
+            _ = try await engine.recoverOrphansAndAutoStart(
+                locale: Locale(identifier: "en_US"),
+                systemAudio: false
+            )
+        }
+
+        // Orphan was swept BEFORE the permission check tripped — this is
+        // the issue-3 contract: orphan-sweep correctness (R9) does not
+        // depend on permissions.
+        let orphanAfter = try await repo.session(orphanId)
+        #expect(orphanAfter?.status == .interrupted)
+
+        // No fresh active session was opened (permissions denied).
+        let all = try await repo.allSessions()
+        #expect(all.filter { $0.status == .active }.count == 0)
+
+        let status = await engine.status
+        #expect(status == .error)
+    }
 }

@@ -98,6 +98,24 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func openFreshSession(locale: Locale) async throws -> Session {
+        let session = Session(
+            id: UUID(),
+            locale: locale,
+            startedAt: Date(),
+            endedAt: nil,
+            title: nil,
+            status: .active,
+            lastDedupedSegmentSeq: 0,
+            pauseExpiresAt: nil,
+            pausedIndefinitely: false
+        )
+        try await dbQueue.write { db in
+            try SessionRecord.from(session).insert(db)
+        }
+        return session
+    }
+
     /// Read the most-recently-modified session (by `endedAt` if present,
     /// else `startedAt`). Used by U4's pause-state-restore check on
     /// daemon-start: a paused session may have been the last write before

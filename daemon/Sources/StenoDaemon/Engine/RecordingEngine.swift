@@ -215,28 +215,44 @@ public actor RecordingEngine {
     /// (LaunchAgent relaunch, login, post-crash) to fulfil R1/R9: the
     /// daemon must not land in `idle` after first launch.
     ///
-    /// Privacy-critical: if the most-recently-modified session shows an
-    /// active pause (`paused_indefinitely=1` OR `pause_expires_at` in the
-    /// future), the daemon DOES still sweep orphans (those are stranded
-    /// rows from a prior crash, separate from pause state) but does NOT
-    /// open a fresh active session and does NOT bring up pipelines. The
-    /// engine remains in `.idle`. U10 will own the actual paused engine
-    /// state and the resume-from-restored-pause path; until U10 lands, a
-    /// pause restored across restart simply leaves the daemon idle until
-    /// the user explicitly resumes via the TUI.
+    /// Sequencing (load-bearing — see PR #33 review feedback):
+    ///   1. Orphan sweep (no permission gate, no pause gate) — R9 says
+    ///      stranded `active` rows from a prior crash MUST be closed on
+    ///      every daemon start, regardless of subsequent gating decisions.
+    ///   2. Pause-state restore check. The plan's U10 fail-safe
+    ///      (privacy-critical): any DB read error or unrecognized state on
+    ///      the pause columns → daemon stays in paused state, surfaces a
+    ///      non-transient `pause_state_unverifiable` health warning, and
+    ///      requires explicit user resume. The exact `pause_state_unverifiable`
+    ///      token is matched on later by U9's TUI surface and U10's
+    ///      health-warning machinery — do NOT change the wording.
+    ///   3. Permission check. If denied → engine `.error`, throw.
+    ///   4. Open a fresh active session and bring up pipelines.
     ///
-    /// On audio-source / recognizer failure mid-bringup: the orphan sweep
-    /// has already committed and remains so — that is the load-bearing
-    /// invariant of this method. Status transitions to `.error`; the
-    /// caller (RunCommand) does NOT crash the daemon.
+    /// Failure modes:
+    ///   - Sweep failure → engine `.error`, non-transient event, return nil
+    ///     (no crash; future U6/U9 retry can pick this up, or the user can
+    ///     resolve it manually via a future TUI command).
+    ///   - Pause-column read failure → engine `.idle`, sweep already
+    ///     committed, non-transient `pause_state_unverifiable` event,
+    ///     return nil. Daemon stays paused — privacy invariant.
+    ///   - Pause still active → engine `.idle`, non-transient event
+    ///     explaining the skip, return nil.
+    ///   - Permission denial → engine `.error`, throw `.permissionDenied`.
+    ///   - Bringup failure (mic/system audio) → engine `.error`, throw
+    ///     `.audioSourceFailed`. Sweep + fresh-session insert have
+    ///     already committed.
     ///
     /// - Parameters:
     ///   - locale: Locale for speech recognition (default: `.current`).
     ///   - device: Optional audio device identifier (default: nil = system default).
     ///   - systemAudio: Whether to also capture system audio (default: true,
     ///                  matching the always-on recording goal).
-    /// - Returns: The newly opened active session, or nil if the privacy
-    ///   check determined the daemon must remain paused.
+    /// - Returns: The newly opened active session, or nil if the daemon
+    ///   intentionally did not auto-start (pause restored, fail-safe
+    ///   tripped, or sweep failed). Throws only on permission / bringup
+    ///   failure where `.error` plus a thrown error is the right signal
+    ///   to the caller (RunCommand).
     @discardableResult
     public func recoverOrphansAndAutoStart(
         locale: Locale = .current,
@@ -247,21 +263,53 @@ public actor RecordingEngine {
             throw RecordingEngineError.alreadyRecording
         }
 
-        // Privacy-critical pause-state restore check (ties to U10).
-        // If the most-recently-modified session is still in a paused state,
-        // sweep orphans separately but do NOT open a fresh active session
-        // and do NOT bring up pipelines. The engine stays in `.idle`.
-        if let mostRecent = try? await repository.mostRecentlyModifiedSession() {
+        // Step 1: orphan sweep first (independent of pause-state and
+        // permissions). R9 — stranded `active` rows must be closed on
+        // every daemon start. Failure here surfaces non-transiently and
+        // ends the call without crashing or opening a fresh session.
+        do {
+            try await repository.sweepActiveOrphans()
+        } catch {
+            await setStatus(.error)
+            await emit(.error(
+                "Daemon-start: orphan sweep failed: \(error.localizedDescription)" +
+                " — engine remains in error state, no fresh session opened." +
+                " A future retry (U6/U9) or manual resolution will be needed.",
+                isTransient: false
+            ))
+            return nil
+        }
+
+        // Step 2: privacy-critical pause-state restore check (ties to U10).
+        // The U10 fail-safe is explicit: any DB read error or unrecognized
+        // state on the pause columns → daemon stays in paused state,
+        // surfaces a non-transient `pause_state_unverifiable` health
+        // warning, requires explicit user resume. This closes the
+        // privacy-violation path in plan-risk R-F where a corrupted /
+        // unmigrated row could otherwise default to "resume into recording."
+        let mostRecent: Session?
+        do {
+            mostRecent = try await repository.mostRecentlyModifiedSession()
+        } catch {
+            // Fail-safe: stay paused (engine `.idle`). The orphan sweep has
+            // already committed (step 1). Surface a non-transient warning
+            // whose message contains the exact `pause_state_unverifiable`
+            // token — U9's TUI surface and U10's health-warning machinery
+            // match on this token.
+            await emit(.error(
+                "pause_state_unverifiable: failed to read pause columns on daemon start" +
+                " (\(error.localizedDescription)). Daemon remains paused; explicit user" +
+                " resume required.",
+                isTransient: false
+            ))
+            return nil
+        }
+
+        if let mostRecent {
             let now = Date()
             let pauseStillActive = mostRecent.pausedIndefinitely
                 || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
             if pauseStillActive {
-                // Sweep orphans even though we're not auto-starting. Orphans
-                // are stranded `active` rows from a prior crash — they need
-                // to be closed regardless of the user's pause intent. Use
-                // the no-insert variant so we do NOT surprise-resume into
-                // a fresh recording session.
-                try? await repository.sweepActiveOrphans()
                 await emit(.error(
                     "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
                     ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
@@ -274,8 +322,9 @@ public actor RecordingEngine {
 
         await setStatus(.starting)
 
-        // Check permissions BEFORE the orphan sweep so a permission failure
-        // doesn't force us to swallow a successful sweep.
+        // Step 3: permission check. Failures here are user-resolvable
+        // (TCC dialog) — engine ends in `.error` with a non-transient
+        // event so the TUI can prompt the user.
         let permissions = await permissionService.checkPermissions()
         guard permissions.allGranted else {
             await setStatus(.error)
@@ -284,13 +333,13 @@ public actor RecordingEngine {
             throw RecordingEngineError.permissionDenied(message)
         }
 
-        // Atomic sweep + fresh-session insert.
+        // Step 4: open a fresh active session. Sweep already ran in step 1.
         let session: Session
         do {
-            session = try await repository.recoverOrphansAndOpenFresh(locale: locale)
+            session = try await repository.openFreshSession(locale: locale)
         } catch {
             await setStatus(.error)
-            await emit(.error("Failed to recover orphans and open session: \(error)", isTransient: false))
+            await emit(.error("Failed to open fresh session: \(error.localizedDescription)", isTransient: false))
             throw error
         }
 

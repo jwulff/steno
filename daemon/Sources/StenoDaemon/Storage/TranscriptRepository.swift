@@ -39,6 +39,18 @@ public protocol TranscriptRepository: Sendable {
     /// rule as `recoverOrphansAndOpenFresh`.
     func sweepActiveOrphans() async throws
 
+    /// Open a fresh `active` session in a single write, without sweeping
+    /// orphans first. Used by U4's daemon-start path AFTER a separate
+    /// `sweepActiveOrphans()` step has succeeded and any privacy/permission
+    /// gates have passed. Splitting this from `recoverOrphansAndOpenFresh`
+    /// lets the daemon-start path sequence orphan-sweep BEFORE the
+    /// permission check, so a permission failure does not prevent the
+    /// orphan sweep (R9).
+    ///
+    /// - Parameter locale: The locale for the new session.
+    /// - Returns: The newly opened active session.
+    func openFreshSession(locale: Locale) async throws -> Session
+
     /// Mark a session as completed.
     ///
     /// - Parameter sessionId: The ID of the session to end.
