@@ -112,6 +112,58 @@ public actor RecordingEngine {
             throw error
         }
 
+        let result = try await bringUpPipelines(
+            session: session,
+            locale: locale,
+            device: device,
+            systemAudio: systemAudio
+        )
+        // Persist last-known device + systemAudio so the next daemon-start
+        // auto-start can restore the user's selection. Failure to save is
+        // non-fatal — log via emit and continue.
+        await persistLastKnownAudioConfig(device: device, systemAudio: systemAudio)
+        return result
+    }
+
+    /// Best-effort settings persistence after a successful start. Failure
+    /// is non-fatal: we emit a transient error event and continue. The
+    /// recording session is unaffected — settings persistence is a
+    /// next-launch convenience, not a runtime requirement.
+    private func persistLastKnownAudioConfig(device: String?, systemAudio: Bool) async {
+        var settings = StenoSettings.load()
+        settings.lastDevice = device
+        settings.lastSystemAudioEnabled = systemAudio
+        do {
+            try settings.save()
+        } catch {
+            await emit(.error("Failed to save last-known audio config: \(error)", isTransient: true))
+        }
+    }
+
+    /// Bring up mic + (optional) system audio pipelines around an
+    /// already-acquired `Session`. Extracted from `start(...)` so the
+    /// auto-start path (`recoverOrphansAndAutoStart`) can reuse the
+    /// pipeline-bringup machinery with a session created by
+    /// `repository.recoverOrphansAndOpenFresh()` instead of
+    /// `repository.createSession()`.
+    ///
+    /// Caller invariants:
+    /// - Status has already been transitioned to `.starting`.
+    /// - Permissions have already been checked.
+    /// - The session row already exists in the repository.
+    ///
+    /// Postconditions on success: status is `.recording`, all engine
+    /// pipeline state is initialized.
+    /// Postconditions on failure: cleanup runs, status transitions to `.error`,
+    /// and an audio-source error is thrown. The session row in the DB is
+    /// NOT rolled back — the caller decides whether to leave it active or
+    /// close it.
+    private func bringUpPipelines(
+        session: Session,
+        locale: Locale,
+        device: String?,
+        systemAudio: Bool
+    ) async throws -> Session {
         currentSession = session
         currentDevice = device
         currentSequenceNumber = 0
@@ -144,6 +196,7 @@ public actor RecordingEngine {
         } catch {
             await cleanup()
             await setStatus(.error)
+            await emit(.error("Audio source failed: \(error.localizedDescription)", isTransient: false))
             throw RecordingEngineError.audioSourceFailed(error.localizedDescription)
         }
 
@@ -155,6 +208,149 @@ public actor RecordingEngine {
 
         await setStatus(.recording)
         return session
+    }
+
+    /// Sweep stranded `active` sessions to `interrupted`, then auto-start
+    /// recording into a fresh active session. Used on daemon start
+    /// (LaunchAgent relaunch, login, post-crash) to fulfil R1/R9: the
+    /// daemon must not land in `idle` after first launch.
+    ///
+    /// Sequencing (load-bearing — see PR #33 review feedback):
+    ///   1. Orphan sweep (no permission gate, no pause gate) — R9 says
+    ///      stranded `active` rows from a prior crash MUST be closed on
+    ///      every daemon start, regardless of subsequent gating decisions.
+    ///   2. Pause-state restore check. The plan's U10 fail-safe
+    ///      (privacy-critical): any DB read error or unrecognized state on
+    ///      the pause columns → daemon stays in paused state, surfaces a
+    ///      non-transient `pause_state_unverifiable` health warning, and
+    ///      requires explicit user resume. The exact `pause_state_unverifiable`
+    ///      token is matched on later by U9's TUI surface and U10's
+    ///      health-warning machinery — do NOT change the wording.
+    ///   3. Permission check. If denied → engine `.error`, throw.
+    ///   4. Open a fresh active session and bring up pipelines.
+    ///
+    /// Failure modes:
+    ///   - Sweep failure → engine `.error`, non-transient event, return nil
+    ///     (no crash; future U6/U9 retry can pick this up, or the user can
+    ///     resolve it manually via a future TUI command).
+    ///   - Pause-column read failure → engine `.idle`, sweep already
+    ///     committed, non-transient `pause_state_unverifiable` event,
+    ///     return nil. Daemon stays paused — privacy invariant.
+    ///   - Pause still active → engine `.idle`, non-transient event
+    ///     explaining the skip, return nil.
+    ///   - Permission denial → engine `.error`, throw `.permissionDenied`.
+    ///   - Bringup failure (mic/system audio) → engine `.error`, throw
+    ///     `.audioSourceFailed`. Sweep + fresh-session insert have
+    ///     already committed.
+    ///
+    /// - Parameters:
+    ///   - locale: Locale for speech recognition (default: `.current`).
+    ///   - device: Optional audio device identifier (default: nil = system default).
+    ///   - systemAudio: Whether to also capture system audio (default: true,
+    ///                  matching the always-on recording goal).
+    /// - Returns: The newly opened active session, or nil if the daemon
+    ///   intentionally did not auto-start (pause restored, fail-safe
+    ///   tripped, or sweep failed). Throws only on permission / bringup
+    ///   failure where `.error` plus a thrown error is the right signal
+    ///   to the caller (RunCommand).
+    @discardableResult
+    public func recoverOrphansAndAutoStart(
+        locale: Locale = .current,
+        device: String? = nil,
+        systemAudio: Bool = true
+    ) async throws -> Session? {
+        guard status == .idle || status == .error else {
+            throw RecordingEngineError.alreadyRecording
+        }
+
+        // Step 1: orphan sweep first (independent of pause-state and
+        // permissions). R9 — stranded `active` rows must be closed on
+        // every daemon start. Failure here surfaces non-transiently and
+        // ends the call without crashing or opening a fresh session.
+        do {
+            try await repository.sweepActiveOrphans()
+        } catch {
+            await setStatus(.error)
+            await emit(.error(
+                "Daemon-start: orphan sweep failed: \(error.localizedDescription)" +
+                " — engine remains in error state, no fresh session opened." +
+                " A future retry (U6/U9) or manual resolution will be needed.",
+                isTransient: false
+            ))
+            return nil
+        }
+
+        // Step 2: privacy-critical pause-state restore check (ties to U10).
+        // The U10 fail-safe is explicit: any DB read error or unrecognized
+        // state on the pause columns → daemon stays in paused state,
+        // surfaces a non-transient `pause_state_unverifiable` health
+        // warning, requires explicit user resume. This closes the
+        // privacy-violation path in plan-risk R-F where a corrupted /
+        // unmigrated row could otherwise default to "resume into recording."
+        let mostRecent: Session?
+        do {
+            mostRecent = try await repository.mostRecentlyModifiedSession()
+        } catch {
+            // Fail-safe: stay paused (engine `.idle`). The orphan sweep has
+            // already committed (step 1). Surface a non-transient warning
+            // whose message contains the exact `pause_state_unverifiable`
+            // token — U9's TUI surface and U10's health-warning machinery
+            // match on this token.
+            await emit(.error(
+                "pause_state_unverifiable: failed to read pause columns on daemon start" +
+                " (\(error.localizedDescription)). Daemon remains paused; explicit user" +
+                " resume required.",
+                isTransient: false
+            ))
+            return nil
+        }
+
+        if let mostRecent {
+            let now = Date()
+            let pauseStillActive = mostRecent.pausedIndefinitely
+                || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
+            if pauseStillActive {
+                await emit(.error(
+                    "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
+                    ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
+                    " — not auto-starting (U10 will restore paused engine state)",
+                    isTransient: false
+                ))
+                return nil
+            }
+        }
+
+        await setStatus(.starting)
+
+        // Step 3: permission check. Failures here are user-resolvable
+        // (TCC dialog) — engine ends in `.error` with a non-transient
+        // event so the TUI can prompt the user.
+        let permissions = await permissionService.checkPermissions()
+        guard permissions.allGranted else {
+            await setStatus(.error)
+            let message = permissions.errorMessage ?? "Permissions denied"
+            await emit(.error(message, isTransient: false))
+            throw RecordingEngineError.permissionDenied(message)
+        }
+
+        // Step 4: open a fresh active session. Sweep already ran in step 1.
+        let session: Session
+        do {
+            session = try await repository.openFreshSession(locale: locale)
+        } catch {
+            await setStatus(.error)
+            await emit(.error("Failed to open fresh session: \(error.localizedDescription)", isTransient: false))
+            throw error
+        }
+
+        let result = try await bringUpPipelines(
+            session: session,
+            locale: locale,
+            device: device,
+            systemAudio: systemAudio
+        )
+        await persistLastKnownAudioConfig(device: device, systemAudio: systemAudio)
+        return result
     }
 
     /// Stop recording and finalize the session.
