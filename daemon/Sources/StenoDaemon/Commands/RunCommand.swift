@@ -100,6 +100,28 @@ struct RunCommand: ParsableCommand {
                     log.error("Power observer registration failed: \(error)")
                 }
 
+                // U7: register AVAudioEngine config-change observer
+                // BEFORE auto-start. Same reasoning as U6: a
+                // notification arriving during the orphan sweep should
+                // serialize through the actor, not be dropped on the
+                // floor. The observer subscribes to
+                // `AVAudioEngine.configurationChangeNotification` on
+                // `NotificationCenter.default` and trampolines
+                // debounced events into `engine.audioConfigurationChanged(...)`.
+                let deviceObserver = AudioDeviceObserver(
+                    deviceUIDProvider: { defaultInputDeviceUID() },
+                    formatProvider: { nil }
+                )
+                do {
+                    try deviceObserver.start(target: engine)
+                    log.info("Audio device observer registered (AVAudioEngine config-change)")
+                } catch {
+                    // Non-fatal: the daemon can still record; we just
+                    // won't react to AirPods disconnect / USB unplug
+                    // until the next user-driven event.
+                    log.error("Audio device observer registration failed: \(error)")
+                }
+
                 // 5b. Auto-start recording. R1/R9: the daemon must never
                 // sit in `idle` after launch. Failure is logged but does
                 // NOT crash the daemon — the engine surfaces the error
@@ -141,6 +163,7 @@ struct RunCommand: ParsableCommand {
 
                 // 8. Graceful shutdown
                 powerObserver.stop()
+                deviceObserver.stop()
                 await engine.stop()
                 await server.stop()
                 pidFile.release()

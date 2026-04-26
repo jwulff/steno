@@ -137,6 +137,16 @@ public actor RecordingEngine {
     /// rollover even when the gap is short.
     private var lastDeviceUID: String?
 
+    // MARK: - U7 device-change observer state
+
+    /// Audio format captured at the last successful pipeline
+    /// bring-up. Used by `handleAudioDeviceChange(deviceUID:format:)`
+    /// to distinguish "device changed" (rollover candidate) from
+    /// "format changed within same device" (still triggers heal rule
+    /// because format affects the analyzer) from "neither changed"
+    /// (cheap restart, no heal-rule trigger).
+    private var lastMicFormat: AVAudioFormat?
+
     // MARK: - Init
 
     public init(
@@ -277,6 +287,10 @@ public actor RecordingEngine {
         do {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: device)
             micStopClosure = stopMic
+            // U7: remember the format so the device-change handler can
+            // distinguish "format changed within same device" from
+            // "neither changed."
+            lastMicFormat = format
 
             // Wrap buffer stream to compute mic levels as buffers pass through
             let micBuffers = tappedStream(buffers, isMic: true)
@@ -515,6 +529,7 @@ public actor RecordingEngine {
         pendingSysHealedGap = nil
         micRestartEntryTime = nil
         sysRestartEntryTime = nil
+        lastMicFormat = nil
 
         await setStatus(.idle)
         isStopping = false
@@ -772,6 +787,13 @@ public actor RecordingEngine {
         do {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: currentDevice)
             micStopClosure = stopMic
+            // U7: refresh cached mic format on successful rebuild so
+            // a subsequent device-change handler compares against the
+            // post-restart format, not the pre-restart format.
+            lastMicFormat = format
+            // Refresh the cached device UID — a config-change-driven
+            // restart may have landed on a new default-input device.
+            lastDeviceUID = deviceUIDProvider()
 
             let micBuffers = tappedStream(buffers, isMic: true)
             let recognizer = try await speechRecognizerFactory.makeRecognizer(
@@ -1182,6 +1204,166 @@ public actor RecordingEngine {
         }
     }
 
+    // MARK: - U7 Device-Change Handler
+
+    /// Called by `AudioDeviceObserver` after a 250ms-debounced burst
+    /// of `AVAudioEngine.configurationChangeNotification` events
+    /// settles. Compares the post-debounce device UID and format
+    /// against the cached values from the last successful pipeline
+    /// bring-up and routes through the appropriate path:
+    ///
+    /// - **Same UID + same format** → cheap restart only. The
+    ///   AVAudioEngine has internally torn down (per Apple's docs the
+    ///   engine has already stopped by the time we receive the
+    ///   notification), so we still rebuild via U5's
+    ///   `restartMicPipeline`, but we do NOT invoke the heal rule.
+    ///   The first segment after rebuild gets `heal_marker =
+    ///   "after_gap:Ns"` per U5's machinery — that's the existing
+    ///   transient-restart behavior, not a heal-rule outcome.
+    ///
+    /// - **Different UID OR different format** → restart + heal rule.
+    ///   The heal rule's "device change → rollover" branch kicks in
+    ///   on UID mismatch; on format-only mismatch with same UID, the
+    ///   gap will be < 30s so the rule's `reuseSession` branch fires
+    ///   and the next segment carries a heal marker. The restart
+    ///   itself routes through U5's machinery.
+    ///
+    /// **Concurrency:** This runs on the actor, serialized against
+    /// recognizer-error-driven restarts and sleep/wake handlers. A
+    /// device-change arriving while a restart is already in flight
+    /// is dropped (the in-flight restart will rebuild against the
+    /// post-change device anyway). A device-change arriving while
+    /// the engine is `.idle`, `.stopping`, or stopped is a no-op.
+    public func handleAudioDeviceChange(deviceUID: String?, format: AVAudioFormat?) async {
+        // No-op safety: device-change events arriving outside an
+        // active recording are uninteresting (no pipeline to
+        // rebuild). Same gating as recognizer-error.
+        if isStopping || status == .stopping || status == .idle {
+            return
+        }
+        // Drop duplicates while a mic restart is already running —
+        // the in-flight restart will rebuild against whatever the
+        // current default-input device is when it lands.
+        if micRestartTask != nil { return }
+        // No active session means there's no mic pipeline to rebuild.
+        guard currentSession != nil else { return }
+
+        // Decide the path. Per the plan's "Key Technical Decisions":
+        // > Compare device UID before/after to distinguish "device
+        // > changed" (full session-rollover candidate) from "format
+        // > changed within same device" (cheaper re-tap path; still
+        // > triggers heal rule because format affects the analyzer).
+        let cachedUID = lastDeviceUID
+        let cachedFormat = lastMicFormat
+
+        let sameUID = (deviceUID == cachedUID)
+        let sameFormat = formatsEqual(format, cachedFormat)
+        let needsHealRule = !sameUID || !sameFormat
+
+        // Stamp gap entry so the heal rule (if invoked below) sees a
+        // realistic time-since-engine-stopped. The AVAudioEngine has
+        // already stopped by the time the notification arrives, so we
+        // approximate "engine stopped" with "now."
+        let gapEntry = nowProvider()
+
+        // Build a reason string the TUI surfaces via the
+        // .recovering(reason:) event.
+        let reason: String
+        if !sameUID {
+            reason = "device-change:uid:\(deviceUID ?? "nil")"
+        } else if !sameFormat {
+            reason = "device-change:format"
+        } else {
+            reason = "device-change:retap"
+        }
+
+        // Always go through U5's mic-restart machinery. The restart
+        // path tears down the recognizer, runs the (zero-or-short)
+        // backoff, and rebuilds via the audio source factory — which
+        // owns the new MicrophoneAudioSource + fresh AVAudioEngine.
+        await scheduleMicRestart(reason: reason, errorCode: "device_change")
+
+        // Wait for the restart to land before evaluating the heal
+        // rule. The restart task we just scheduled will clear
+        // micRestartTask on success. We poll the actor's own state
+        // (cheap — same actor) up to a short ceiling; if the restart
+        // is still going past the ceiling, we punt and let the U5
+        // exhaustion path own the outcome.
+        let pollDeadline = Date().addingTimeInterval(5.0)
+        while micRestartTask != nil && Date() < pollDeadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        guard needsHealRule else {
+            // Cheap re-tap path — restart already ran via U5 (which
+            // staged its own `after_gap:Ns` heal marker). No heal-rule
+            // invocation, no session boundary change.
+            return
+        }
+
+        // Engine surrendered? Heal rule has nothing to act on.
+        if status == .error { return }
+
+        let gap = nowProvider().timeIntervalSince(gapEntry)
+        let outcome = HealRule.decide(
+            gap: gap,
+            deviceUID: deviceUID,
+            lastDeviceUID: cachedUID,
+            thresholdSeconds: healThresholdSeconds
+        )
+
+        switch outcome {
+        case .reuseSession(let healMarker):
+            // U5's restart machinery already staged a heal marker on
+            // the rebuilt mic pipeline. Replace it with the heal-rule's
+            // marker so the segment carries the rule's authoritative
+            // value (typically the same `after_gap:Ns` string, but the
+            // rule is the source of truth for the format).
+            pendingMicHealMarker = healMarker
+            pendingMicHealedGap = gap
+
+        case .rollover:
+            // UID changed → close current session as `interrupted`
+            // and open a fresh active session. Mirrors the wake
+            // rollover path: `sweepActiveOrphans()` marks any active
+            // session (the current one) as `interrupted`, then
+            // `openFreshSession` creates a new active row.
+            guard currentSession != nil else { return }
+            do {
+                try await repository.sweepActiveOrphans()
+                let fresh = try await repository.openFreshSession(locale: currentLocale)
+                currentSession = fresh
+                // Reset segment counter for the fresh session.
+                currentSequenceNumber = 0
+                segmentCount = 0
+                // Clear any pending mic heal-marker — the new session
+                // does not carry one (per HealRule contract).
+                pendingMicHealMarker = nil
+                pendingMicHealedGap = nil
+                // Surface the rollover to the TUI.
+                await emit(.healed(gapSeconds: gap))
+            } catch {
+                await emit(.error(
+                    "Device-change rollover failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+            }
+        }
+    }
+
+    /// Compare two `AVAudioFormat` values for the purposes of the
+    /// device-change handler. Two `nil` formats compare equal (both
+    /// "unknown"). Otherwise we compare sample rate, channel count,
+    /// and common format — these are the dimensions the analyzer
+    /// cares about for the pipeline rebuild decision.
+    private nonisolated func formatsEqual(_ a: AVAudioFormat?, _ b: AVAudioFormat?) -> Bool {
+        if a == nil && b == nil { return true }
+        guard let a, let b else { return false }
+        return a.sampleRate == b.sampleRate
+            && a.channelCount == b.channelCount
+            && a.commonFormat == b.commonFormat
+    }
+
     // MARK: - Cleanup
 
     private func cleanup() async {
@@ -1213,6 +1395,7 @@ public actor RecordingEngine {
         micRestartEntryTime = nil
         sysRestartEntryTime = nil
         gapStartedAt = nil
+        lastMicFormat = nil
     }
 }
 
@@ -1228,5 +1411,16 @@ extension RecordingEngine: PowerEventTarget {
 
     public nonisolated func systemDidWake() async {
         await handleSystemDidWake()
+    }
+}
+
+// MARK: - AudioDeviceEventTarget conformance (U7)
+
+/// `RecordingEngine` is the `AudioDeviceEventTarget` for
+/// `AudioDeviceObserver`. The protocol method is `async`, satisfied
+/// directly by the actor's isolated `handleAudioDeviceChange(...)`.
+extension RecordingEngine: AudioDeviceEventTarget {
+    public nonisolated func audioConfigurationChanged(deviceUID: String?, format: AVAudioFormat?) async {
+        await handleAudioDeviceChange(deviceUID: deviceUID, format: format)
     }
 }
