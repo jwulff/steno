@@ -245,6 +245,80 @@ struct DeviceChangeHandlerTests {
         await engine.stop()
     }
 
+    // MARK: - PR #35 issue 5: same UID + same format short-circuits heal-rule
+
+    /// Regression test for the `formatProvider: { nil }` wiring that
+    /// defeated U7's "same UID + same format" optimization. With the
+    /// fix, `RecordingEngine.currentMicFormat()` returns the format
+    /// captured at the last bring-up; a config-change observation
+    /// that reports the same UID and the same format should restart
+    /// the mic via U5's machinery (which stamps `after_gap:Ns`) but
+    /// MUST NOT roll the session over.
+    @Test("Same UID + same format reported by engine-backed provider → no rollover")
+    func sameUIDSameFormatViaEngineFormatProviderSkipsHealRule() async throws {
+        // Build the engine with the standard mock factories.
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // initial start
+        let postChangeHandle = MockSpeechRecognizerHandle()
+        postChangeHandle.resultsToYield = [
+            RecognizerResult(text: "post-change", isFinal: true, source: .microphone)
+        ]
+        rf.enqueueMicHandle(postChangeHandle)
+
+        let (engine, repo, audioFactory, _) = await makeEngine(
+            recognizerFactory: rf,
+            deviceUIDProvider: { "BuiltInMic" }
+        )
+
+        let originalSession = try await engine.start()
+
+        // The engine's currentMicFormat() reflects the audio source
+        // factory's reported format from start. Confirm that contract
+        // before driving the device-change.
+        let cachedFormat = await engine.currentMicFormat()
+        #expect(cachedFormat?.sampleRate == audioFactory.micFormat.sampleRate)
+        #expect(cachedFormat?.channelCount == audioFactory.micFormat.channelCount)
+
+        // Drive the change with the same UID and the same format that
+        // `currentMicFormat()` reports. This is the path the
+        // production observer's trailing-edge fire takes when nothing
+        // about the mic actually changed (a benign config-change
+        // notification, e.g. from a sample-rate-stable BT
+        // renegotiation).
+        await engine.handleAudioDeviceChange(
+            deviceUID: "BuiltInMic",
+            format: cachedFormat
+        )
+
+        // Wait for the rebuild to complete.
+        let rebuilt = await waitFor {
+            audioFactory.micCreateCount >= 2
+        }
+        #expect(rebuilt)
+
+        // U5's restart machinery still runs (the AVAudioEngine
+        // teardown documented by Apple is unconditional), so we
+        // expect a fresh mic source. But the heal rule MUST NOT have
+        // rolled the session — same UID + same format short-circuits.
+        let sessions = try await repo.allSessions()
+        #expect(sessions.count == 1)
+        #expect(sessions.first?.id == originalSession.id)
+
+        // The post-change segment carries a U5-stamped `after_gap:Ns`
+        // marker (the engine's restart machinery always stamps one
+        // for the first segment after a rebuild) — that's the
+        // documented behaviour for the cheap-restart path.
+        let landed = await waitFor {
+            let segs = (try? await repo.segments(for: originalSession.id)) ?? []
+            return !segs.isEmpty
+        }
+        #expect(landed)
+        let segments = try await repo.segments(for: originalSession.id)
+        #expect(segments.first?.healMarker?.starts(with: "after_gap:") == true)
+
+        await engine.stop()
+    }
+
     // MARK: - Concurrent device-changes drop while restart is in flight
 
     @Test("Concurrent device-change while restart is mid-flight is dropped")

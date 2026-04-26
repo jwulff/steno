@@ -5,11 +5,12 @@ import Foundation
 /// recovery) to throttle pipeline-restart attempts and surrender after a
 /// run of repeated same-error failures.
 ///
-/// Curve (per attempt N, capped at 30s):
-///   1 → 1s, 2 → 2s, 3 → 4s, 4 → 8s, 5+ → 30s.
+/// Curve (per attempt N):
+///   1 → 1s, 2 → 2s, 3 → 4s, 4 → 8s, 5 → 30s (cap).
 ///
 /// Surrender semantics:
-///   - 5 consecutive *same-error* attempts exhaust the policy.
+///   - Attempts 1–5 of the same error each return a `.delay(...)`.
+///     The 6th consecutive same-error attempt exhausts the policy.
 ///     `record(error:)` then returns `.exhausted`, and `isExhausted`
 ///     stays true until the policy is rebuilt.
 ///   - "Same error" is judged by an opaque error-code string (the caller
@@ -35,17 +36,19 @@ public struct BackoffPolicy: Sendable, Equatable {
     public enum RecordOutcome: Sendable, Equatable {
         /// Wait this duration before retrying.
         case delay(Duration)
-        /// Surrender — five same-error attempts have been exhausted.
+        /// Surrender — six same-error attempts have been exhausted
+        /// (the 6th call after five delays of 1s/2s/4s/8s/30s).
         case exhausted
     }
 
     // MARK: - Tunables
 
-    /// Backoff curve in seconds. Capped at 30s for attempts beyond the curve.
-    private static let curveSeconds: [Int] = [1, 2, 4, 8]
-    /// Cap for attempts past the end of `curveSeconds`.
-    private static let capSeconds: Int = 30
-    /// Number of consecutive same-error attempts before surrender.
+    /// Backoff curve in seconds. Five attempts get a delay (1, 2, 4, 8, 30);
+    /// the sixth same-error attempt surrenders.
+    private static let curveSeconds: [Int] = [1, 2, 4, 8, 30]
+    /// Number of consecutive same-error attempts that produce a delay
+    /// before surrender. The (surrenderThreshold + 1)-th call returns
+    /// `.exhausted`.
     public static let surrenderThreshold: Int = 5
     /// Wall-clock seconds of stable operation needed for reset.
     private static let resetStabilitySeconds: TimeInterval = 30
@@ -81,7 +84,8 @@ public struct BackoffPolicy: Sendable, Equatable {
     ///
     /// Behavior:
     ///   - If `errorCode == lastErrorCode`, the consecutive counter
-    ///     advances. Five same-error attempts → `.exhausted`.
+    ///     advances. Five same-error attempts each produce a delay
+    ///     (1s, 2s, 4s, 8s, 30s); the 6th surrenders.
     ///   - If `errorCode != lastErrorCode`, the consecutive counter
     ///     resets to 1 (the new error itself is attempt 1).
     ///   - When already exhausted, returns `.exhausted` without further
@@ -103,7 +107,7 @@ public struct BackoffPolicy: Sendable, Equatable {
             lastErrorCode = errorCode
         }
 
-        if attempts >= Self.surrenderThreshold {
+        if attempts > Self.surrenderThreshold {
             isExhausted = true
             return .exhausted
         }
@@ -158,7 +162,9 @@ public struct BackoffPolicy: Sendable, Equatable {
         if idx >= 0 && idx < curveSeconds.count {
             seconds = curveSeconds[idx]
         } else {
-            seconds = capSeconds
+            // Defensive — record(error:) gates this with the surrender
+            // threshold so this branch should never execute.
+            seconds = curveSeconds.last ?? 30
         }
         return .seconds(seconds)
     }

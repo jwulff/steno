@@ -141,7 +141,11 @@ public final class AudioDeviceObserver: @unchecked Sendable {
     private let notifier: any ConfigurationChangeSubscribing
     private let debounceWindow: TimeInterval
     private let deviceUIDProvider: @Sendable () -> String?
-    private let formatProvider: @Sendable () -> AVAudioFormat?
+    /// Resolves the engine's current mic format at the trailing edge
+    /// of the debounce window. Async so production can `await`
+    /// `RecordingEngine.currentMicFormat()` (the engine is an actor).
+    /// Tests pass a synchronous wrapper. See PR #35 review (issue 5).
+    private let formatProvider: @Sendable () async -> AVAudioFormat?
 
     /// Serial queue that owns the debounce timer state. All
     /// `pending`/`fireAt` mutations happen on this queue so the
@@ -157,9 +161,15 @@ public final class AudioDeviceObserver: @unchecked Sendable {
     /// AND on `stop()`. The trailing-edge dispatch checks against the
     /// snapshot it captured at scheduling time and bails if the
     /// generation has advanced (newer notification arrived) or if
-    /// observer has been stopped.
+    /// observer has been stopped. This counter alone is sufficient
+    /// for burst collapsing: every notification within the debounce
+    /// window dispatches its own trailing-edge check, but only the
+    /// most recent one's captured generation matches the live
+    /// counter, so the rest bail. (Earlier code carried a
+    /// `pendingScheduled` flag for this purpose; it was never
+    /// read or written and has been removed — see PR #35 review
+    /// (issue 7).)
     private var generation: UInt64 = 0
-    private var pendingScheduled: Bool = false
 
     /// - Parameters:
     ///   - notifier: The subscribing notifier. Production passes
@@ -182,7 +192,7 @@ public final class AudioDeviceObserver: @unchecked Sendable {
         notifier: any ConfigurationChangeSubscribing = NotificationCenterAudioConfig(),
         debounceWindow: TimeInterval = 0.25,
         deviceUIDProvider: @Sendable @escaping () -> String? = { defaultInputDeviceUID() },
-        formatProvider: @Sendable @escaping () -> AVAudioFormat? = { nil }
+        formatProvider: @Sendable @escaping () async -> AVAudioFormat? = { nil }
     ) {
         self.notifier = notifier
         self.debounceWindow = debounceWindow
@@ -271,11 +281,14 @@ public final class AudioDeviceObserver: @unchecked Sendable {
         // Resolve at the trailing edge — this is the load-bearing
         // detail. By the time we read it here, the BT renegotiation
         // burst has settled and the HAL reports the stable
-        // post-change device.
+        // post-change device. UID is sync (Core Audio HAL); format
+        // requires `await` because production threads it through
+        // `RecordingEngine.currentMicFormat()` on an actor.
         let deviceUID = deviceUIDProvider()
-        let format = formatProvider()
+        let provideFormat = formatProvider
 
         Task {
+            let format = await provideFormat()
             await target.audioConfigurationChanged(deviceUID: deviceUID, format: format)
         }
     }

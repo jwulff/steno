@@ -108,9 +108,15 @@ struct RunCommand: ParsableCommand {
                 // `AVAudioEngine.configurationChangeNotification` on
                 // `NotificationCenter.default` and trampolines
                 // debounced events into `engine.audioConfigurationChanged(...)`.
+                // formatProvider awaits the engine's cached mic format
+                // so U7's "same UID + same format" cheap-restart path
+                // can fire (the previous `{ nil }` placeholder always
+                // looked like a format change because lastMicFormat
+                // becomes non-nil after start). See PR #35 review
+                // (issue 5).
                 let deviceObserver = AudioDeviceObserver(
                     deviceUIDProvider: { defaultInputDeviceUID() },
-                    formatProvider: { nil }
+                    formatProvider: { [engine] in await engine.currentMicFormat() }
                 )
                 do {
                     try deviceObserver.start(target: engine)

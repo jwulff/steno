@@ -12,20 +12,23 @@ struct BackoffPolicyTests {
 
     // MARK: - Curve
 
-    @Test("Curve: 1s, 2s, 4s, 8s, then capped at 30s")
+    @Test("Curve: 1s, 2s, 4s, 8s, 30s then exhausted on attempt 6")
     func curveMatchesPlan() {
         var policy = BackoffPolicy()
 
-        let outcomes = (1...6).map { _ in policy.record(error: "E_SAME") }
+        let outcomes = (1...7).map { _ in policy.record(error: "E_SAME") }
 
         #expect(outcomes[0] == .delay(.seconds(1)))
         #expect(outcomes[1] == .delay(.seconds(2)))
         #expect(outcomes[2] == .delay(.seconds(4)))
         #expect(outcomes[3] == .delay(.seconds(8)))
-        // Attempt 5 surrenders before producing a delay — see surrender tests.
-        #expect(outcomes[4] == .exhausted)
-        // Already exhausted; further calls remain exhausted.
+        // Attempt 5 returns the 30s cap, matching the plan's
+        // "1s/2s/4s/8s capped at 30s" curve spec.
+        #expect(outcomes[4] == .delay(.seconds(30)))
+        // Attempt 6 surrenders.
         #expect(outcomes[5] == .exhausted)
+        // Already exhausted; further calls remain exhausted.
+        #expect(outcomes[6] == .exhausted)
     }
 
     @Test("Capped at 30s for sustained different-error streams")
@@ -43,8 +46,8 @@ struct BackoffPolicyTests {
 
     // MARK: - Surrender / same-error counting
 
-    @Test("Five same-error attempts surrender on attempt 5")
-    func surrenderOnFifthSameError() {
+    @Test("Six same-error attempts surrender on attempt 6")
+    func surrenderOnSixthSameError() {
         var policy = BackoffPolicy()
 
         let r1 = policy.record(error: "E_RECOG")
@@ -52,12 +55,14 @@ struct BackoffPolicyTests {
         let r3 = policy.record(error: "E_RECOG")
         let r4 = policy.record(error: "E_RECOG")
         let r5 = policy.record(error: "E_RECOG")
+        let r6 = policy.record(error: "E_RECOG")
 
         #expect(r1 == .delay(.seconds(1)))
         #expect(r2 == .delay(.seconds(2)))
         #expect(r3 == .delay(.seconds(4)))
         #expect(r4 == .delay(.seconds(8)))
-        #expect(r5 == .exhausted)
+        #expect(r5 == .delay(.seconds(30)))
+        #expect(r6 == .exhausted)
         #expect(policy.isExhausted)
     }
 
@@ -76,11 +81,12 @@ struct BackoffPolicyTests {
         #expect(policy.lastErrorCode == "E_B")
         #expect(!policy.isExhausted)
 
-        // Four more identical errors → surrender on the 5th attempt of E_B.
+        // Five more identical errors → surrender on the 6th attempt of E_B.
         _ = policy.record(error: "E_B") // 2
         _ = policy.record(error: "E_B") // 3
         _ = policy.record(error: "E_B") // 4
-        let surrender = policy.record(error: "E_B") // 5 → exhausted
+        _ = policy.record(error: "E_B") // 5
+        let surrender = policy.record(error: "E_B") // 6 → exhausted
         #expect(surrender == .exhausted)
         #expect(policy.isExhausted)
     }
@@ -88,7 +94,7 @@ struct BackoffPolicyTests {
     @Test("Exhausted policy stays exhausted on subsequent record calls")
     func exhaustedPolicyStaysExhausted() {
         var policy = BackoffPolicy()
-        for _ in 0..<5 { _ = policy.record(error: "E") }
+        for _ in 0..<6 { _ = policy.record(error: "E") }
         #expect(policy.isExhausted)
 
         // Even a different error code does not revive the policy.

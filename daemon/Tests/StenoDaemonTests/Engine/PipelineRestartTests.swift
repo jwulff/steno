@@ -268,11 +268,11 @@ struct PipelineRestartTests {
 
     // MARK: - Different error codes do not count as "same error"
 
-    @Test("Different error codes within 5 attempts do NOT trigger surrender")
+    @Test("Different error codes within 6 attempts do NOT trigger surrender")
     func differentErrorCodesAvoidSurrender() async throws {
         let rf = MockSpeechRecognizerFactory()
-        // 5 handles, each throwing a different error code, then success.
-        for code in 1...5 {
+        // 6 handles, each throwing a different error code, then success.
+        for code in 1...6 {
             let h = MockSpeechRecognizerHandle()
             h.errorToThrow = Self.makeNSError(domain: "RecogTest", code: code)
             rf.enqueueMicHandle(h)
@@ -301,24 +301,27 @@ struct PipelineRestartTests {
         // Curve should always look like the front of the curve since
         // each different error resets attempts to 1.
         let durations = sleep.requestedDurations
-        #expect(durations.count == 5)
+        #expect(durations.count == 6)
         #expect(durations.allSatisfy { $0 == .seconds(1) })
 
         await engine.stop()
     }
 
-    // MARK: - Surrender after 5 same-error attempts
+    // MARK: - Surrender after 6 same-error attempts
 
-    @Test("5 same-error recognizer throws → recoveryExhausted, status .error")
-    func fiveSameErrorAttemptsSurrender() async throws {
+    @Test("6 same-error recognizer throws → recoveryExhausted, status .error")
+    func sixSameErrorAttemptsSurrender() async throws {
         let rf = MockSpeechRecognizerFactory()
-        // 5 handles, all throwing the SAME NSError domain+code.
-        for _ in 0..<5 {
+        // 6 handles, all throwing the SAME NSError domain+code. The
+        // first 5 each consume a delay (1, 2, 4, 8, 30s — all
+        // short-circuited by the test sleep closure); the 6th call
+        // surrenders before its own rebuild attempt.
+        for _ in 0..<6 {
             let h = MockSpeechRecognizerHandle()
             h.errorToThrow = Self.makeNSError(domain: "RecogTest", code: 1)
             rf.enqueueMicHandle(h)
         }
-        // Provide a 6th handle just in case — it should never be consumed.
+        // Provide a 7th handle just in case — it should never be consumed.
         let unused = MockSpeechRecognizerHandle()
         rf.enqueueMicHandle(unused)
 
@@ -335,10 +338,10 @@ struct PipelineRestartTests {
         let status = await engine.status
         #expect(status == .error)
 
-        // No further recognizer creation past the 5th attempt — verify
+        // No further recognizer creation past the 6th attempt — verify
         // the unused handle was not consumed.
         let micCalls = rf.micMakeCount
-        #expect(micCalls == 5)
+        #expect(micCalls == 6)
 
         // No segments were finalized because the recognizer never
         // produced results.
@@ -482,6 +485,223 @@ struct PipelineRestartTests {
         let statuses = await delegate.statusChanges
         #expect(statuses.contains(.recovering))
         #expect(statuses.last == .recording)
+
+        await engine.stop()
+    }
+
+    // MARK: - PR #35 issues 3 & 4: rebuild-throw reschedules
+
+    /// Regression test for `restartMicPipeline` failing to retry when
+    /// the rebuild step itself throws. Before the fix, the catch block
+    /// would record the error in the policy and return; with no
+    /// recognizer task left to surface a follow-up failure, the mic
+    /// pipeline would stay stuck. The fix enqueues a fresh restart
+    /// task whenever the rebuild throws and the policy hasn't yet
+    /// surrendered.
+    @Test("Mic rebuild throws on attempts 1-2, succeeds on 3 — pipeline recovers")
+    func micRebuildThrowReschedulesUntilSuccess() async throws {
+        // Failure pattern keyed off the existing
+        // `MockAudioSourceFactory.micCreateCount` (mutated on the
+        // engine actor's serialized execution path). We override
+        // `micErrorQueue` with sentinel values: the start path
+        // (`micCreateCount == 1`) gets through, but rebuild attempts
+        // 1 and 2 (`micCreateCount == 2, 3`) throw via a small
+        // wrapper. The 3rd rebuild succeeds.
+        final class ThrowOnSecondAndThirdFactory: AudioSourceFactory, @unchecked Sendable {
+            let inner = MockAudioSourceFactory()
+            // We store the call count using NSNumber-ish atomic-ish
+            // semantics through a single-threaded property. Actor
+            // isolation on the engine guarantees serial calls into
+            // `makeMicrophoneSource`, so a plain `Int` here is fine.
+            var calls: Int = 0
+            var creates: Int { calls }
+
+            func makeMicrophoneSource(device: String?) async throws
+                -> (buffers: AsyncStream<AVAudioPCMBuffer>,
+                    format: AVAudioFormat,
+                    stop: @Sendable () async -> Void)
+            {
+                calls += 1
+                let n = calls
+                if n == 2 || n == 3 {
+                    throw MockAudioSourceFactory.InjectedError("rebuild-\(n - 1)")
+                }
+                return try await inner.makeMicrophoneSource(device: device)
+            }
+            func makeSystemAudioSource() -> AudioSource { inner.makeSystemAudioSource() }
+        }
+
+        let rf = MockSpeechRecognizerFactory()
+        // Initial handle throws immediately on iteration so the
+        // restart loop kicks in shortly after `start()` returns.
+        let initialHandle = MockSpeechRecognizerHandle()
+        initialHandle.errorToThrow = Self.makeNSError(domain: "RecogTest", code: 7)
+        rf.enqueueMicHandle(initialHandle)
+        let healthyHandle = MockSpeechRecognizerHandle()
+        healthyHandle.resultsToYield = [
+            RecognizerResult(text: "post-rebuild", isFinal: true, source: .microphone)
+        ]
+        rf.enqueueMicHandle(healthyHandle)
+
+        let af = ThrowOnSecondAndThirdFactory()
+        let repo = MockTranscriptRepository()
+        let perms = await MainActor.run { MockPermissionService() }
+        let summarizer = MockSummarizationService()
+        let delegate = MockRecordingEngineDelegate()
+        let coordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: summarizer,
+            triggerCount: 100,
+            timeThreshold: 3600
+        )
+        let recorder = SleepRecorder()
+        let engine = RecordingEngine(
+            repository: repo,
+            permissionService: perms,
+            summaryCoordinator: coordinator,
+            audioSourceFactory: af,
+            speechRecognizerFactory: rf,
+            delegate: delegate,
+            backoffSleep: Self.makeSleep(recorder)
+        )
+
+        _ = try await engine.start()
+
+        // The pipeline must walk the curve: fail rebuild #1, fail
+        // rebuild #2, succeed on rebuild #3. Wait until the audio
+        // factory has been called for all three rebuild attempts so
+        // the restart loop has had a chance to fully run.
+        let attemptedAll = await waitFor(timeout: .seconds(3)) { af.creates >= 4 }
+        #expect(attemptedAll, "creates=\(af.creates)")
+
+        // After the rebuilds, the engine status settles to .recording.
+        let recovered = await waitFor(timeout: .seconds(3)) {
+            await engine.status == .recording
+        }
+        #expect(recovered)
+
+        // No surrender event — the policy stayed under threshold.
+        let surrender = await delegate.recoveryExhaustedReasons
+        #expect(surrender.isEmpty)
+
+        // 4 mic creates: 1 start + 3 rebuild attempts (2 throws + 1
+        // success).
+        #expect(af.creates == 4)
+
+        // The sleep recorder shows at least 3 delays (one per restart
+        // attempt): the initial-recognizer-failure attempt + the two
+        // rebuild-failure reschedules.
+        #expect(recorder.requestedDurations.count >= 3)
+
+        await engine.stop()
+    }
+
+    @Test("System rebuild throws on attempts 1-2, succeeds on 3 — pipeline recovers")
+    func sysRebuildThrowReschedulesUntilSuccess() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle())     // mic stays healthy
+        // System recognizer: a healthy initial handle (will be torn
+        // down by the first failure), then queued failures + one
+        // success at the recognizer level. The system audio source's
+        // own start path is the analogue of mic source factory throws.
+        let initialSysHandle = MockSpeechRecognizerHandle()
+        rf.enqueueSysHandle(initialSysHandle)
+        // Two queued sys handles both throw at the recognizer
+        // factory level — these stand in for "the rebuild's
+        // makeRecognizer threw immediately."
+        let sysFail1 = MockSpeechRecognizerHandle()
+        sysFail1.errorToThrow = Self.makeNSError(domain: "SysRebuild", code: 11)
+        rf.enqueueSysHandle(sysFail1)
+        let sysFail2 = MockSpeechRecognizerHandle()
+        sysFail2.errorToThrow = Self.makeNSError(domain: "SysRebuild", code: 11)
+        rf.enqueueSysHandle(sysFail2)
+        let sysOk = MockSpeechRecognizerHandle()
+        sysOk.resultsToYield = [
+            RecognizerResult(text: "sys ok", isFinal: true, source: .systemAudio)
+        ]
+        rf.enqueueSysHandle(sysOk)
+
+        let (engine, _, _, _, delegate, _) =
+            await makeEngine(recognizerFactory: rf)
+
+        _ = try await engine.start(systemAudio: true)
+
+        // Trigger a system recognizer error on the initial handle.
+        initialSysHandle.finishWithError(Self.makeNSError(domain: "SysInitial", code: 9))
+
+        // The handler should retry through the rebuild failures and
+        // ultimately recover.
+        let recovered = await waitFor(timeout: .seconds(3)) {
+            await engine.status == .recording
+        }
+        #expect(recovered)
+
+        // No surrender event.
+        let surrender = await delegate.recoveryExhaustedReasons
+        #expect(surrender.isEmpty)
+
+        await engine.stop()
+    }
+
+    // MARK: - PR #35 issue 2: backoff resets when restarting from .error
+
+    /// Regression test for the "exhausted backoff persists across
+    /// restart from .error" bug. After a surrender, the engine ends
+    /// up in `.error` with `micBackoff.isExhausted == true`. Without
+    /// the fix, calling `start(...)` again succeeds (it allows
+    /// transitions out of `.error`) but the policy still reports
+    /// exhausted, so the next transient failure short-circuits to
+    /// `recoveryExhausted` immediately instead of running the curve.
+    @Test("Backoff resets when start() transitions out of .error after a surrender")
+    func backoffResetsOnRestartFromError() async throws {
+        // Six handles, all throwing the same NSError → forces surrender.
+        let rfFail = MockSpeechRecognizerFactory()
+        for _ in 0..<6 {
+            let h = MockSpeechRecognizerHandle()
+            h.errorToThrow = Self.makeNSError(domain: "RecogTest", code: 99)
+            rfFail.enqueueMicHandle(h)
+        }
+
+        let (engine, _, _, _, delegate, _) =
+            await makeEngine(recognizerFactory: rfFail)
+
+        _ = try await engine.start()
+
+        // Surrender fires, status transitions to `.error`.
+        let exhausted = await waitFor(timeout: .seconds(3)) {
+            !(await delegate.recoveryExhaustedReasons.isEmpty)
+        }
+        #expect(exhausted)
+        let errorStatus = await engine.status
+        #expect(errorStatus == .error)
+        let surrenderCount = await delegate.recoveryExhaustedReasons.count
+        #expect(surrenderCount == 1)
+
+        // Now enqueue a follow-up scenario: one failing handle, then a
+        // successful one. If the policy were still exhausted, the very
+        // first failure after the new `start()` would emit a SECOND
+        // recoveryExhausted event. Instead we expect a single 1s delay
+        // from the curve and a healthy rebuild.
+        let firstFollowup = MockSpeechRecognizerHandle()
+        firstFollowup.errorToThrow = Self.makeNSError(domain: "RecogTest", code: 99)
+        rfFail.enqueueMicHandle(firstFollowup)
+        let okHandle = MockSpeechRecognizerHandle()
+        okHandle.resultsToYield = [
+            RecognizerResult(text: "post-restart", isFinal: true, source: .microphone)
+        ]
+        rfFail.enqueueMicHandle(okHandle)
+
+        // start() must accept a transition from .error.
+        _ = try await engine.start()
+
+        let recovered = await waitFor(timeout: .seconds(3)) {
+            await engine.status == .recording
+        }
+        #expect(recovered)
+
+        // No SECOND surrender — only the original one.
+        let surrenderAfter = await delegate.recoveryExhaustedReasons.count
+        #expect(surrenderAfter == 1)
 
         await engine.stop()
     }

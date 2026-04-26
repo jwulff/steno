@@ -453,4 +453,85 @@ struct SleepWakeHandlerTests {
         let status = await engine.status
         #expect(status == .idle)
     }
+
+    // MARK: - PR #35 issue 1: sequence-number rehydration on wake-reuse
+
+    /// Regression test for the wake-reuse sequence-number collision.
+    /// Before the fix, `bringUpPipelines` unconditionally reset
+    /// `currentSequenceNumber` to 0 on every entry — including the
+    /// wake-reuse path, where the resumed session already has segments
+    /// at sequence numbers 0..N persisted. The next post-wake segment
+    /// would land at sequenceNumber=1 and collide with the schema's
+    /// `UNIQUE(sessionId, sequenceNumber)` constraint, silently
+    /// dropping the segment until the counter naturally exceeded the
+    /// pre-sleep max.
+    ///
+    /// The fix rehydrates `currentSequenceNumber` from
+    /// `repository.maxSegmentSequence(for:)` at every bring-up, so the
+    /// post-wake counter resumes where the pre-sleep counter left off.
+    @Test("Wake-reuse: post-wake segments resume from max(sequenceNumber), no UNIQUE collision")
+    func wakeReuseResumesSequenceFromRepository() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        rf.enqueueMicHandle(MockSpeechRecognizerHandle()) // initial start
+        let postWakeHandle = MockSpeechRecognizerHandle()
+        postWakeHandle.resultsToYield = [
+            RecognizerResult(text: "post-wake", isFinal: true, source: .microphone)
+        ]
+        rf.enqueueMicHandle(postWakeHandle)               // post-wake rebuild
+
+        let (engine, repo, _, _, _, _) = await makeEngine(
+            recognizerFactory: rf
+        )
+
+        let session = try await engine.start()
+
+        // Seed five "pre-sleep" segments at sequenceNumbers 1...5 so the
+        // wake-reuse path has a non-trivial max to rehydrate from. Real
+        // production segments would arrive via the recognizer; the seed
+        // here is a faithful proxy because `bringUpPipelines` rehydrates
+        // from the repo via `maxSegmentSequence(for:)` regardless of
+        // how the segments got there.
+        for seq in 1...5 {
+            let segment = StoredSegment(
+                sessionId: session.id,
+                text: "pre-sleep \(seq)",
+                startedAt: Date(),
+                endedAt: Date(),
+                confidence: 0.9,
+                sequenceNumber: seq,
+                source: .microphone,
+                healMarker: nil
+            )
+            try await repo.saveSegment(segment)
+        }
+
+        await engine.handleSystemWillSleep()
+        try await Task.sleep(for: .milliseconds(20))
+        await engine.handleSystemDidWake()
+
+        // Wait for the post-wake recognizer's segment to land.
+        let landed = await waitFor {
+            let segs = (try? await repo.segments(for: session.id)) ?? []
+            // 5 seeded + 1 post-wake = 6 segments.
+            return segs.count >= 6
+        }
+        #expect(landed)
+
+        let segments = try await repo.segments(for: session.id)
+        #expect(segments.count == 6)
+
+        // The post-wake segment must NOT collide with seq 1..5. The
+        // engine's monotonic counter rehydrates from the repo, so the
+        // first post-wake segment lands at seq 6.
+        let postWakeSegments = segments.filter { $0.text == "post-wake" }
+        #expect(postWakeSegments.count == 1)
+        #expect(postWakeSegments.first?.sequenceNumber == 6)
+
+        // No duplicate sequenceNumbers — the schema's UNIQUE
+        // (sessionId, sequenceNumber) invariant holds in the mock.
+        let allSeqs = segments.map(\.sequenceNumber).sorted()
+        #expect(Set(allSeqs).count == allSeqs.count)
+
+        await engine.stop()
+    }
 }

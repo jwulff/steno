@@ -167,33 +167,34 @@ struct SystemAudioRecoveryTests {
         #expect(revoked == 0)
     }
 
-    // MARK: - Sys surrender after 5 same-error attempts
+    // MARK: - Sys surrender after 6 same-error attempts (PR #35 issue 6)
 
-    @Test("5 consecutive systemStoppedStream errors → recoveryExhausted, mic continues")
-    func fiveSameErrorsSurrender() async throws {
+    @Test("6 consecutive systemStoppedStream errors → recoveryExhausted, mic continues")
+    func sixSameErrorsSurrender() async throws {
         let rf = MockSpeechRecognizerFactory()
         // Mic: persistent passing handle so mic stays up across the
         // sys storm.
         let micH = MockSpeechRecognizerHandle()
         rf.enqueueMicHandle(micH)
-        // Sys: initial handle from engine.start, then 5 fresh handles
+        // Sys: initial handle from engine.start, then 6 fresh handles
         // for the rebuild path. Each rebuild succeeds (handle does not
         // throw), then the next external SCStream error retriggers a
-        // restart with the SAME backoff key. After 5 same-error calls
-        // the policy surrenders and emits recoveryExhausted.
+        // restart with the SAME backoff key. The plan's curve gives
+        // each of the first 5 same-error calls a delay
+        // (1s/2s/4s/8s/30s) and surrenders on the 6th.
         let initialSys = MockSpeechRecognizerHandle()
         rf.enqueueSysHandle(initialSys)
         let sysErrorCode = "com.apple.ScreenCaptureKit.SCStreamErrorDomain#-3821"
-        for _ in 0..<5 {
+        for _ in 0..<6 {
             rf.enqueueSysHandle(MockSpeechRecognizerHandle())
         }
 
         let (engine, _, _, delegate, _) = await makeEngine(recognizerFactory: rf)
         _ = try await engine.start(systemAudio: true)
 
-        // Drive 5 SCStream error events with the same backoff key.
+        // Drive 6 SCStream error events with the same backoff key.
         // Each call schedules a sys restart; the policy advances on
-        // each `record(error:)` and surrenders on the 5th call.
+        // each `record(error:)` and surrenders on the 6th call.
         //
         // Test pacing: each call schedules a Task<Void, Never>. To
         // ensure the next call doesn't get dropped by the
@@ -201,7 +202,7 @@ struct SystemAudioRecoveryTests {
         // the recovering-event count to reach `i + 1` (proves the
         // restart task entered) AND for the status to leave
         // `.recovering` (proves the restart task has finished).
-        for i in 0..<5 {
+        for i in 0..<6 {
             await engine.systemAudioRequestsRetry(
                 errorCode: sysErrorCode,
                 reason: "scstream:\(sysErrorCode):systemStoppedStream attempt \(i)"

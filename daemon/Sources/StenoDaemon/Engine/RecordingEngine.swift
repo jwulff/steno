@@ -201,6 +201,16 @@ public actor RecordingEngine {
             throw RecordingEngineError.alreadyRecording
         }
 
+        // Reset backoff state on every entry into `.starting`. This is
+        // a no-op when we came from `.idle` (a fresh `BackoffPolicy` is
+        // already there), but it is load-bearing when we came from
+        // `.error`: a prior surrender leaves `isExhausted == true`, and
+        // the next transient failure would otherwise short-circuit
+        // straight back to `recoveryExhausted` without retrying. See
+        // PR #35 review (issue 2).
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+
         await setStatus(.starting)
 
         // Check permissions
@@ -277,8 +287,18 @@ public actor RecordingEngine {
         currentSession = session
         currentDevice = device
         currentLocale = locale
-        currentSequenceNumber = 0
-        segmentCount = 0
+        // Rehydrate the segment counter from the repository every time
+        // we bring up pipelines. For a brand-new session the MAX query
+        // returns 0 (so the first segment lands at sequenceNumber=1, as
+        // before). For a *resumed* session — wake/reuse, device-change
+        // reuse — we pick up where the pre-sleep segments left off,
+        // avoiding collisions under the `UNIQUE(sessionId,
+        // sequenceNumber)` schema constraint that previously caused
+        // post-wake segment writes to fail silently until the counter
+        // naturally passed the old max. See PR #35 review (issue 1).
+        let resumeFrom = (try? await repository.maxSegmentSequence(for: session.id)) ?? 0
+        currentSequenceNumber = resumeFrom
+        segmentCount = resumeFrom
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
         lastDeviceUID = deviceUIDProvider()
@@ -380,6 +400,15 @@ public actor RecordingEngine {
         guard status == .idle || status == .error else {
             throw RecordingEngineError.alreadyRecording
         }
+
+        // Reset backoff state when coming out of `.error`. A prior
+        // surrender leaves `isExhausted == true`; without this reset,
+        // the next transient failure after the auto-start completes
+        // would short-circuit back to `recoveryExhausted` instead of
+        // honouring the curve. From `.idle` this is a no-op. See
+        // PR #35 review (issue 2).
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
 
         // Step 1: orphan sweep first (independent of pause-state and
         // permissions). R9 — stranded `active` rows must be closed on
@@ -539,6 +568,18 @@ public actor RecordingEngine {
     public func availableDevices() async -> [AudioDevice] {
         // Placeholder — real implementation queries Core Audio
         []
+    }
+
+    /// Current cached mic format from the last successful pipeline
+    /// bring-up. Used by `AudioDeviceObserver`'s `formatProvider`
+    /// closure so the trailing-edge fire compares against the engine's
+    /// real current format instead of always-nil — without this, U7's
+    /// "same UID + same format" cheap-restart optimization never fires
+    /// (lastMicFormat is non-nil after start, the provider always
+    /// returns nil → comparison always reports a format mismatch).
+    /// See PR #35 review (issue 5).
+    public func currentMicFormat() -> AVAudioFormat? {
+        lastMicFormat
     }
 
     // MARK: - Private
@@ -862,25 +903,45 @@ public actor RecordingEngine {
             pendingMicHealedGap = gap
             micBackoff.recordRestart()
         } catch {
-            // Rebuild itself failed — record under a fresh error code
-            // and re-enter the restart loop. We'll be re-driven by
-            // `handleRecognizerError` when the next consumer task fails,
-            // OR — for an immediate factory throw — surface the error
-            // as an exhaustion path: bump the policy with the current
-            // error and check.
+            // Rebuild itself failed (e.g. `makeMicrophoneSource` or
+            // `makeRecognizer` threw immediately). Without explicit
+            // re-scheduling here, `handleRecognizerError` never fires
+            // again — there is no recognizer consumer task left to
+            // surface a failure — so the mic pipeline would stay stuck
+            // until the next external stimulus (device-change,
+            // sleep/wake). The original `record(error:)` call near the
+            // top of this function already bumped the policy for this
+            // attempt; the rebuild failure is the realization of that
+            // same attempt. We re-enter the restart loop by enqueuing
+            // a fresh task, which calls `record(error:)` again at its
+            // top — counting as the next attempt. See PR #35 review
+            // (issues 3 & 4).
             await emit(.error(
                 "Mic pipeline rebuild failed: \(error.localizedDescription)",
                 isTransient: true
             ))
-            // Bump the policy on the rebuild failure; if it pushes us
-            // past the surrender threshold, exhaustion fires now.
-            let nested = micBackoff.record(error: self.errorCode(for: error))
-            if case .exhausted = nested {
-                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
-                await setStatus(.error)
-            }
+            let nestedCode = self.errorCode(for: error)
+            // Honour cancellation arriving during the rebuild — don't
+            // schedule another attempt if the engine is being torn down.
             micRestartTask = nil
             micRestartEntryTime = nil
+            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+                return
+            }
+            // If the policy is already exhausted, surrender now. We
+            // peek at the policy without bumping it again — the next
+            // `restartMicPipeline` invocation would call `record` for
+            // us, and we don't want to double-count this rebuild
+            // failure.
+            if micBackoff.isExhausted {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+                return
+            }
+            await scheduleMicRestart(
+                reason: "rebuild:\(error.localizedDescription)",
+                errorCode: nestedCode
+            )
             return
         }
 
@@ -963,17 +1024,30 @@ public actor RecordingEngine {
             pendingSysHealedGap = gap
             sysBackoff.recordRestart()
         } catch {
+            // Mirror of mic-side handling — see `restartMicPipeline`'s
+            // catch block. Without an explicit reschedule, the system
+            // pipeline stays stuck after a rebuild throw because there
+            // is no recognizer consumer task left to re-trigger
+            // `handleRecognizerError`. PR #35 review (issue 4).
             await emit(.error(
                 "System pipeline rebuild failed: \(error.localizedDescription)",
                 isTransient: true
             ))
-            let nested = sysBackoff.record(error: self.errorCode(for: error))
-            if case .exhausted = nested {
-                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
-                await setStatus(.error)
-            }
+            let nestedCode = self.errorCode(for: error)
             sysRestartTask = nil
             sysRestartEntryTime = nil
+            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+                return
+            }
+            if sysBackoff.isExhausted {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+                return
+            }
+            await scheduleSysRestart(
+                reason: "rebuild:\(error.localizedDescription)",
+                errorCode: nestedCode
+            )
             return
         }
 

@@ -3,6 +3,12 @@ import AVFoundation
 
 /// Mock factory that returns configurable audio sources.
 final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
+    /// Test-only error type used by the throw-injection helpers below.
+    struct InjectedError: Error, Equatable {
+        let message: String
+        init(_ message: String = "injected") { self.message = message }
+    }
+
     /// Continuation for the most recently produced mic stream. Earlier
     /// streams are still alive in their own continuations on the engine
     /// side, but `finishMicStream` / `emitMicBuffer` always operate on
@@ -18,6 +24,13 @@ final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
     /// Error to throw from makeMicrophoneSource on the next call.
     /// Cleared after one shot so a follow-up restart can succeed.
     var micError: Error?
+
+    /// Sequence of errors to throw from successive `makeMicrophoneSource`
+    /// calls. Each call dequeues the next entry; when empty, the call
+    /// returns a real stream. Used by U5 tests that exercise the
+    /// "rebuild throws → reschedule" path on multiple consecutive
+    /// rebuild attempts before success.
+    var micErrorQueue: [Error] = []
 
     /// Total mic source creations (rebuild count).
     private(set) var micCreateCount: Int = 0
@@ -43,6 +56,13 @@ final class MockAudioSourceFactory: AudioSourceFactory, @unchecked Sendable {
         micSourceCreated = true
         lastDevice = device
         micCreateCount += 1
+
+        // The queue takes precedence over the single-shot `micError`
+        // so a sequence of rebuild failures can be staged.
+        if !micErrorQueue.isEmpty {
+            let next = micErrorQueue.removeFirst()
+            throw next
+        }
 
         if let error = micError {
             // One-shot: clear so that the next call (e.g. a U5 restart)
