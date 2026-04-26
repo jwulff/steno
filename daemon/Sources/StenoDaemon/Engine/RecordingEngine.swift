@@ -673,6 +673,19 @@ public actor RecordingEngine {
         // restart — the user-initiated teardown owns the state machine.
         if isStopping || status == .stopping || status == .idle { return }
 
+        // U8: mic-side TCC revocation surface. AVAudioEngine permission
+        // errors (typically `kAudioServicesNoSuchHardware`-class or
+        // AVAudioSession permission-denied errors) are NON-RETRYABLE —
+        // cycling through U5's backoff loop on TCC revocation produces
+        // ambiguous orange-indicator flicker while silently failing.
+        // The exact `MIC_OR_SCREEN_PERMISSION_REVOKED` token is
+        // load-bearing: U9's TUI surface matches on it.
+        if source == .microphone,
+           MicrophonePermissionErrorDetector.isPermissionRevocation(error) {
+            await handleMicrophonePermissionRevoked(message: message)
+            return
+        }
+
         switch source {
         case .microphone:
             // Drop duplicate failures while a restart is already running.
@@ -682,6 +695,33 @@ public actor RecordingEngine {
             if sysRestartTask != nil { return }
             await scheduleSysRestart(reason: "recognizer:\(message)", errorCode: errorCode(for: error))
         }
+    }
+
+    /// Handle a microphone TCC-revocation surface. Tear down the mic
+    /// pipeline (no rebuild), emit the load-bearing
+    /// `MIC_OR_SCREEN_PERMISSION_REVOKED` `recoveryExhausted` event,
+    /// transition to `.error`. Mirrors the SCStream `userDeclined`
+    /// path (see `systemAudioPermissionRevoked()` below) so the TUI
+    /// surfaces a single non-transient failure regardless of which
+    /// pipeline tripped the revocation.
+    private func handleMicrophonePermissionRevoked(message: String) async {
+        // Cancel any in-flight mic restart loop — it would only
+        // re-enter this path on the next attempt anyway.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+
+        // Tear down the mic pipeline so the engine is in a clean
+        // state when the user re-grants permission and a future
+        // command (or U6/U9 retry path) re-attempts bringup.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
+        await setStatus(.error)
     }
 
     /// Compute a stable error code for backoff "same-error" tracking.
@@ -891,6 +931,10 @@ public actor RecordingEngine {
 
         let source = audioSourceFactory.makeSystemAudioSource()
         systemAudioSource = source
+        // U8: re-wire the SCStream recovery delegate on the rebuilt source.
+        if let recoverable = source as? SystemAudioSource {
+            recoverable.recoveryDelegate = self
+        }
 
         do {
             let (buffers, format) = try await source.start()
@@ -961,6 +1005,15 @@ public actor RecordingEngine {
     private func startSystemAudio(locale: Locale) async {
         let source = audioSourceFactory.makeSystemAudioSource()
         systemAudioSource = source
+        // U8: wire the SCStream recovery delegate so error-code-aware
+        // recovery flows back through the engine. Production source is
+        // `SystemAudioSource`; mocks (e.g. `MockAudioSource`) are not
+        // required to support recovery delegation — the SCStream
+        // delegate path is exercised directly in
+        // `SystemAudioSourceTests` against synthetic NSErrors.
+        if let recoverable = source as? SystemAudioSource {
+            recoverable.recoveryDelegate = self
+        }
 
         do {
             let (buffers, format) = try await source.start()
@@ -1422,5 +1475,69 @@ extension RecordingEngine: PowerEventTarget {
 extension RecordingEngine: AudioDeviceEventTarget {
     public nonisolated func audioConfigurationChanged(deviceUID: String?, format: AVAudioFormat?) async {
         await handleAudioDeviceChange(deviceUID: deviceUID, format: format)
+    }
+}
+
+// MARK: - SystemAudioRecoveryDelegate conformance (U8)
+
+/// `RecordingEngine` is the `SystemAudioRecoveryDelegate` for
+/// `SystemAudioSource`. The SCStream's delegate callback runs on its
+/// own internal queue; both methods are `async` and trampoline back
+/// onto the actor's isolation domain via the actor-isolated
+/// `handleSystemAudio*` implementations.
+extension RecordingEngine: SystemAudioRecoveryDelegate {
+
+    /// Called by `SystemAudioSource.stream(_:didStopWithError:)` after
+    /// classifying a transient SCStream error. Routes through U5's
+    /// `restartSystemPipeline(reason:errorCode:)` so the bounded
+    /// backoff handles wait + rebuild + surrender semantics. The
+    /// `errorCode` is the `domain#code` backoff key that
+    /// `BackoffPolicy` uses for "same-error" tracking.
+    public nonisolated func systemAudioRequestsRetry(errorCode: String, reason: String) async {
+        await handleSystemAudioRetry(errorCode: errorCode, reason: reason)
+    }
+
+    /// Called by `SystemAudioSource.stream(_:didStopWithError:)` after
+    /// classifying `userDeclined` (Screen Recording TCC revocation).
+    /// Emits a non-transient `recoveryExhausted` event with the
+    /// load-bearing `MIC_OR_SCREEN_PERMISSION_REVOKED` token,
+    /// transitions to `.error`, does NOT retry.
+    public nonisolated func systemAudioPermissionRevoked() async {
+        await handleSystemAudioPermissionRevoked()
+    }
+}
+
+extension RecordingEngine {
+
+    /// Actor-isolated handler for SCStream-driven retry requests. Drops
+    /// the request if a sys restart is already in flight (the in-flight
+    /// restart will rebuild against the freshly-classified failure
+    /// state) or if the engine is mid-teardown.
+    func handleSystemAudioRetry(errorCode: String, reason: String) async {
+        if isStopping || status == .stopping || status == .idle { return }
+        if sysRestartTask != nil { return }
+        await scheduleSysRestart(reason: reason, errorCode: errorCode)
+    }
+
+    /// Actor-isolated handler for SCStream `userDeclined` (TCC
+    /// revocation). Mirrors `handleMicrophonePermissionRevoked` in
+    /// shape: tear down the sys pipeline, emit the load-bearing
+    /// recoveryExhausted event, transition to `.error`. Mic
+    /// pipeline is unaffected — engine isolation between mic and sys
+    /// is preserved.
+    func handleSystemAudioPermissionRevoked() async {
+        // Cancel any in-flight sys restart.
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
+        await setStatus(.error)
     }
 }
