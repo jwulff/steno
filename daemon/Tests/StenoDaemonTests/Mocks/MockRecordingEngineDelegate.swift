@@ -69,6 +69,30 @@ actor MockRecordingEngineDelegate: RecordingEngineDelegate {
         }
     }
 
+    /// All `recovering` reasons (U5).
+    var recoveringReasons: [String] {
+        events.compactMap {
+            if case .recovering(let reason) = $0 { return reason }
+            return nil
+        }
+    }
+
+    /// All `healed` events with their measured gap-seconds (U5).
+    var healedGaps: [Double] {
+        events.compactMap {
+            if case .healed(let gap) = $0 { return gap }
+            return nil
+        }
+    }
+
+    /// All `recoveryExhausted` reasons (U5).
+    var recoveryExhaustedReasons: [String] {
+        events.compactMap {
+            if case .recoveryExhausted(let reason) = $0 { return reason }
+            return nil
+        }
+    }
+
     func reset() {
         events.removeAll()
     }

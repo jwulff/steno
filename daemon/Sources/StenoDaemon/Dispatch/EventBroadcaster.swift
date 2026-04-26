@@ -114,6 +114,33 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 message: message,
                 transient: isTransient
             ))
+
+        // U5: the new restart/heal events are routed onto the existing
+        // `.error` wire channel with the `transient` flag distinguishing
+        // surrender (non-transient) from in-progress recovery (transient).
+        // U9 will introduce dedicated wire-protocol fields and TUI
+        // surfaces for these — the placeholder mapping here keeps the
+        // event payload visible without expanding the protocol mid-cluster.
+        case .recovering(let reason):
+            return (.error, DaemonEvent(
+                event: "error",
+                message: "recovering: \(reason)",
+                transient: true
+            ))
+
+        case .healed(let gapSeconds):
+            return (.error, DaemonEvent(
+                event: "error",
+                message: "healed: gap=\(gapSeconds)s",
+                transient: true
+            ))
+
+        case .recoveryExhausted(let reason):
+            return (.error, DaemonEvent(
+                event: "error",
+                message: "recovery_exhausted: \(reason)",
+                transient: false
+            ))
         }
     }
 }

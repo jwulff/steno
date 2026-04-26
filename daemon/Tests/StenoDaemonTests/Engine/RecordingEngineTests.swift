@@ -234,7 +234,11 @@ struct RecordingEngineTests {
         await engine.stop()
     }
 
-    @Test func errorFromRecognizerEmitsErrorEvent() async throws {
+    @Test func errorFromRecognizerEntersRecoveringState() async throws {
+        // U5: recognizer errors no longer surface directly as `.error`
+        // events; they enter the restart-with-bounded-backoff path,
+        // emitting `.recovering(reason:)` and transitioning the engine
+        // to `.recovering` while the (mocked) backoff sleeps.
         let rf = MockSpeechRecognizerFactory()
         rf.handle.errorToThrow = SpeechRecognitionError.recognitionFailed("test failure")
 
@@ -243,9 +247,13 @@ struct RecordingEngineTests {
         _ = try await engine.start()
         try await Task.sleep(for: .milliseconds(50))
 
-        let errors = await delegate.errors
-        #expect(!errors.isEmpty)
-        #expect(errors[0].1 == true) // isTransient = true
+        let recoveringReasons = await delegate.recoveringReasons
+        #expect(!recoveringReasons.isEmpty)
+        #expect(recoveringReasons[0].contains("recognizer:"))
+
+        // Status should be `.recovering` while the backoff loop is mid-sleep.
+        let status = await engine.status
+        #expect(status == .recovering)
 
         await engine.stop()
     }

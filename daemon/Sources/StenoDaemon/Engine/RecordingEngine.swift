@@ -32,6 +32,13 @@ public actor RecordingEngine {
     private let speechRecognizerFactory: SpeechRecognizerFactory
     private var delegate: (any RecordingEngineDelegate)?
 
+    /// Sleep used by the U5 restart-with-backoff loop. Production passes
+    /// `Task.sleep(for:)`; tests inject a faster (or zero-duration)
+    /// closure so the curve is observable without paying real wall-clock.
+    /// The closure must throw `CancellationError` when its task is
+    /// cancelled — otherwise `stop()` cannot abort an in-flight backoff.
+    private let backoffSleep: @Sendable (Duration) async throws -> Void
+
     // MARK: - Internal state
 
     private var micRecognizerHandle: (any SpeechRecognizerHandle)?
@@ -49,6 +56,48 @@ public actor RecordingEngine {
     /// Minimum interval between audio level events (10Hz = 100ms).
     private let levelInterval: TimeInterval = 0.1
 
+    // MARK: - U5 restart-with-backoff state
+
+    /// Locale captured at start time so the restart path can rebuild
+    /// recognizers without re-threading locale through every call.
+    private var currentLocale: Locale = .current
+
+    /// Independent backoff policies per source. The mic and system audio
+    /// pipelines fail (and recover) independently per the plan: a
+    /// recognizer error on the system audio pipeline must not throttle
+    /// mic-pipeline rebuilds.
+    private var micBackoff = BackoffPolicy()
+    private var sysBackoff = BackoffPolicy()
+
+    /// In-flight restart tasks. While non-nil for a source, that source
+    /// is mid-restart — additional errors arriving via the (already
+    /// cancelled) recognizer stream are ignored. `stop()` cancels both
+    /// to terminate the cancellable backoff sleep cleanly.
+    private var micRestartTask: Task<Void, Never>?
+    private var sysRestartTask: Task<Void, Never>?
+
+    /// Heal markers staged for the *first* segment finalized after a
+    /// successful restart on each source. Cleared by the segment-save
+    /// path on consumption.
+    private var pendingMicHealMarker: String?
+    private var pendingSysHealMarker: String?
+
+    /// Wall-clock timestamps of restart entry per source. Used to
+    /// compute the `healed(gapSeconds:)` value once the rebuild
+    /// completes and the next segment lands.
+    private var micRestartEntryTime: Date?
+    private var sysRestartEntryTime: Date?
+
+    /// Pre-computed gap-seconds awaiting consumption by the next
+    /// finalized segment of the rebuilt pipeline. Set after a successful
+    /// rebuild, cleared on consumption.
+    private var pendingMicHealedGap: Double?
+    private var pendingSysHealedGap: Double?
+
+    /// Whether `stop()` has been entered. Restart loops check this to
+    /// abort cleanly mid-backoff.
+    private var isStopping: Bool = false
+
     // MARK: - Init
 
     public init(
@@ -57,7 +106,10 @@ public actor RecordingEngine {
         summaryCoordinator: RollingSummaryCoordinator,
         audioSourceFactory: AudioSourceFactory,
         speechRecognizerFactory: SpeechRecognizerFactory,
-        delegate: (any RecordingEngineDelegate)? = nil
+        delegate: (any RecordingEngineDelegate)? = nil,
+        backoffSleep: @Sendable @escaping (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        }
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -65,6 +117,7 @@ public actor RecordingEngine {
         self.audioSourceFactory = audioSourceFactory
         self.speechRecognizerFactory = speechRecognizerFactory
         self.delegate = delegate
+        self.backoffSleep = backoffSleep
     }
 
     // MARK: - Public Commands
@@ -166,6 +219,7 @@ public actor RecordingEngine {
     ) async throws -> Session {
         currentSession = session
         currentDevice = device
+        currentLocale = locale
         currentSequenceNumber = 0
         segmentCount = 0
 
@@ -190,7 +244,7 @@ public actor RecordingEngine {
                         await self?.handleRecognizerResult(result)
                     }
                 } catch {
-                    await self?.handleRecognizerError(error)
+                    await self?.handleRecognizerError(error, source: .microphone)
                 }
             }
         } catch {
@@ -355,9 +409,23 @@ public actor RecordingEngine {
 
     /// Stop recording and finalize the session.
     public func stop() async {
-        guard status == .recording || status == .starting else { return }
+        // Allow stopping from `.recovering` too (U5): an in-flight
+        // restart must be cancellable mid-backoff so user-initiated
+        // teardown is not blocked by the wait.
+        guard status == .recording
+            || status == .starting
+            || status == .recovering else { return }
 
+        isStopping = true
         await setStatus(.stopping)
+
+        // Cancel any in-flight restart tasks. Their `Task.sleep(for:)`
+        // raises CancellationError and the loop returns early without
+        // re-arming a rebuild attempt.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
 
         // Stop recognizers
         recognizerTask?.cancel()
@@ -388,7 +456,18 @@ public actor RecordingEngine {
         currentSession = nil
         isSystemAudioEnabled = false
 
+        // Clear U5 restart bookkeeping for the next start.
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+        pendingMicHealMarker = nil
+        pendingSysHealMarker = nil
+        pendingMicHealedGap = nil
+        pendingSysHealedGap = nil
+        micRestartEntryTime = nil
+        sysRestartEntryTime = nil
+
         await setStatus(.idle)
+        isStopping = false
     }
 
     /// List available audio devices.
@@ -417,6 +496,20 @@ public actor RecordingEngine {
             currentSequenceNumber += 1
             segmentCount = currentSequenceNumber
 
+            // U5: stamp the heal marker on the *first* segment after a
+            // successful pipeline restart on the matching source. The
+            // marker is consumed (cleared) here so subsequent normal
+            // segments have heal_marker = NULL.
+            let healMarker: String?
+            switch result.source {
+            case .microphone:
+                healMarker = pendingMicHealMarker
+                pendingMicHealMarker = nil
+            case .systemAudio:
+                healMarker = pendingSysHealMarker
+                pendingSysHealMarker = nil
+            }
+
             let segment = StoredSegment(
                 sessionId: session.id,
                 text: result.text,
@@ -424,7 +517,8 @@ public actor RecordingEngine {
                 endedAt: Date(),
                 confidence: result.confidence,
                 sequenceNumber: currentSequenceNumber,
-                source: result.source
+                source: result.source,
+                healMarker: healMarker
             )
 
             // Persist
@@ -436,6 +530,34 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
+
+            // U5: a finalized segment counts toward the per-source
+            // backoff reset (segment-finalized gate). The wall-clock
+            // gate is enforced separately in `tryReset(now:)` below.
+            switch result.source {
+            case .microphone:
+                micBackoff.recordSegmentFinalized()
+                micBackoff.tryReset()
+            case .systemAudio:
+                sysBackoff.recordSegmentFinalized()
+                sysBackoff.tryReset()
+            }
+
+            // U5: emit `healed(gapSeconds:)` once on the first segment
+            // after a successful restart. The gap was pre-computed at
+            // rebuild-success time, so this lands deterministically.
+            switch result.source {
+            case .microphone:
+                if let gap = pendingMicHealedGap {
+                    await emit(.healed(gapSeconds: gap))
+                    pendingMicHealedGap = nil
+                }
+            case .systemAudio:
+                if let gap = pendingSysHealedGap {
+                    await emit(.healed(gapSeconds: gap))
+                    pendingSysHealedGap = nil
+                }
+            }
 
             // Trigger summary
             await emit(.modelProcessing(true))
@@ -450,12 +572,301 @@ public actor RecordingEngine {
         }
     }
 
-    private func handleRecognizerError(_ error: Error) async {
+    /// Recognizer-error entry point. Dispatches to the per-source
+    /// `restart…Pipeline(reason:)` so U5's bounded-backoff machinery can
+    /// rebuild without surfacing the failure to the user as long as the
+    /// policy stays under the surrender threshold.
+    ///
+    /// Cancellation errors arriving from a teardown (e.g. an in-flight
+    /// `restartMicPipeline` finishing the previous handle's stream) are
+    /// silently ignored — only genuine recognizer failures should
+    /// trigger a fresh restart attempt.
+    private func handleRecognizerError(_ error: Error, source: AudioSourceType) async {
         let message = error.localizedDescription
-        let isCancellation = message.lowercased().contains("cancel")
-        if !isCancellation {
-            await emit(.error(message, isTransient: true))
+        let isCancellation = (error is CancellationError)
+            || message.lowercased().contains("cancel")
+        if isCancellation { return }
+
+        // If we're already in the middle of stopping, don't spawn a
+        // restart — the user-initiated teardown owns the state machine.
+        if isStopping || status == .stopping || status == .idle { return }
+
+        switch source {
+        case .microphone:
+            // Drop duplicate failures while a restart is already running.
+            if micRestartTask != nil { return }
+            await scheduleMicRestart(reason: "recognizer:\(message)", errorCode: errorCode(for: error))
+        case .systemAudio:
+            if sysRestartTask != nil { return }
+            await scheduleSysRestart(reason: "recognizer:\(message)", errorCode: errorCode(for: error))
         }
+    }
+
+    /// Compute a stable error code for backoff "same-error" tracking.
+    /// Strategy: if the error is an `NSError`, use `domain#code`; otherwise,
+    /// use the type name. This gives U5's `BackoffPolicy` a deterministic
+    /// key string without coupling to any specific error enum.
+    private nonisolated func errorCode(for error: Error) -> String {
+        let ns = error as NSError
+        return "\(ns.domain)#\(ns.code)"
+    }
+
+    // MARK: - U5 Restart machinery
+
+    /// Schedule a mic-pipeline restart and remember the in-flight task
+    /// so concurrent error reports / `stop()` can join or cancel it.
+    private func scheduleMicRestart(reason: String, errorCode: String) async {
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.restartMicPipeline(reason: reason, errorCode: errorCode)
+        }
+        micRestartTask = task
+    }
+
+    private func scheduleSysRestart(reason: String, errorCode: String) async {
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.restartSystemPipeline(reason: reason, errorCode: errorCode)
+        }
+        sysRestartTask = task
+    }
+
+    /// Restart the microphone pipeline with bounded exponential backoff (U5).
+    ///
+    /// Sequence:
+    ///   1. Set status to `.recovering`, broadcast `.recovering(reason:)`.
+    ///   2. Tear down the current mic pipeline (recognizer task, recognizer
+    ///      handle, audio source).
+    ///   3. Record the error in `micBackoff`. If the policy surrenders,
+    ///      broadcast `.recoveryExhausted(reason:)`, set status to
+    ///      `.error`, exit. The engine will only recover via external
+    ///      stimulus (resume, device-change — see plan's "Engine-state
+    ///      recovery from `error`" section).
+    ///   4. Sleep for the backoff delay. The sleep is cancellable —
+    ///      `stop()` cancels the restart task and the wait aborts cleanly.
+    ///   5. Rebuild the mic pipeline (audio source + recognizer +
+    ///      consumer task). The recognizer is created via the same
+    ///      `speechRecognizerFactory` used at start time; the
+    ///      SpeechAnalyzer factory implementation owns the `@MainActor`
+    ///      hop internally per project convention.
+    ///   6. On success: stage `pendingMicHealMarker` for the first
+    ///      finalized segment, pre-compute `pendingMicHealedGap`, restore
+    ///      status to `.recording` (unless sys is also recovering).
+    ///
+    /// **Heal-rule scope (U5):** always reuses the current session and
+    /// stamps `heal_marker = "after_gap:<N>s"` on the next segment.
+    /// Session rollover for long gaps is U6's heal-rule decision, not U5's.
+    func restartMicPipeline(reason: String, errorCode: String) async {
+        await beginRecovering(reason: reason)
+        let entryTime = Date()
+        micRestartEntryTime = entryTime
+
+        // Tear down the current mic pipeline. Cancellation of the
+        // existing recognizerTask is the load-bearing step — it stops
+        // the consumer that would otherwise re-emit the same error and
+        // re-enter this method.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        // Record the error and decide whether to wait or surrender.
+        let outcome = micBackoff.record(error: errorCode)
+        switch outcome {
+        case .exhausted:
+            await emit(.recoveryExhausted(reason: reason))
+            await setStatus(.error)
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            return
+        case .delay(let duration):
+            // Cancellable sleep — `stop()` triggers Task cancellation
+            // which makes this throw and return cleanly.
+            do {
+                try await backoffSleep(duration)
+            } catch {
+                // Either cancelled by `stop()` or by another teardown.
+                micRestartTask = nil
+                micRestartEntryTime = nil
+                return
+            }
+        }
+
+        // If `stop()` arrived during the wait, do NOT rebuild.
+        if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            return
+        }
+
+        // Rebuild.
+        do {
+            let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: currentDevice)
+            micStopClosure = stopMic
+
+            let micBuffers = tappedStream(buffers, isMic: true)
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(
+                locale: currentLocale,
+                format: format,
+                source: .microphone
+            )
+            micRecognizerHandle = recognizer
+
+            let results = recognizer.transcribe(buffers: micBuffers)
+            recognizerTask = Task { [weak self] in
+                do {
+                    for try await result in results {
+                        await self?.handleRecognizerResult(result)
+                    }
+                } catch {
+                    await self?.handleRecognizerError(error, source: .microphone)
+                }
+            }
+
+            // Successful rebuild. Compute gap, stage heal marker, mark
+            // restart-time for backoff reset.
+            let gap = Date().timeIntervalSince(entryTime)
+            let gapSeconds = max(0, Int(gap.rounded()))
+            pendingMicHealMarker = "after_gap:\(gapSeconds)s"
+            pendingMicHealedGap = gap
+            micBackoff.recordRestart()
+        } catch {
+            // Rebuild itself failed — record under a fresh error code
+            // and re-enter the restart loop. We'll be re-driven by
+            // `handleRecognizerError` when the next consumer task fails,
+            // OR — for an immediate factory throw — surface the error
+            // as an exhaustion path: bump the policy with the current
+            // error and check.
+            await emit(.error(
+                "Mic pipeline rebuild failed: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            // Bump the policy on the rebuild failure; if it pushes us
+            // past the surrender threshold, exhaustion fires now.
+            let nested = micBackoff.record(error: self.errorCode(for: error))
+            if case .exhausted = nested {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+            }
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            return
+        }
+
+        // Restore status. If sys is still recovering, leave status at
+        // `.recovering` until both pipelines are healthy.
+        micRestartTask = nil
+        micRestartEntryTime = nil
+        await maybeRestoreRecordingStatus()
+    }
+
+    /// Restart the system-audio pipeline with bounded exponential backoff (U5).
+    /// Mirror of `restartMicPipeline` operating on the sys-audio state.
+    func restartSystemPipeline(reason: String, errorCode: String) async {
+        await beginRecovering(reason: reason)
+        let entryTime = Date()
+        sysRestartEntryTime = entryTime
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        let outcome = sysBackoff.record(error: errorCode)
+        switch outcome {
+        case .exhausted:
+            await emit(.recoveryExhausted(reason: reason))
+            await setStatus(.error)
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            return
+        case .delay(let duration):
+            do {
+                try await backoffSleep(duration)
+            } catch {
+                sysRestartTask = nil
+                sysRestartEntryTime = nil
+                return
+            }
+        }
+
+        if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            return
+        }
+
+        let source = audioSourceFactory.makeSystemAudioSource()
+        systemAudioSource = source
+
+        do {
+            let (buffers, format) = try await source.start()
+            let sysBuffers = tappedStream(buffers, isMic: false)
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(
+                locale: currentLocale,
+                format: format,
+                source: .systemAudio
+            )
+            sysRecognizerHandle = recognizer
+
+            let results = recognizer.transcribe(buffers: sysBuffers)
+            systemRecognizerTask = Task { [weak self] in
+                do {
+                    for try await result in results {
+                        await self?.handleRecognizerResult(result)
+                    }
+                } catch {
+                    await self?.handleRecognizerError(error, source: .systemAudio)
+                }
+            }
+
+            let gap = Date().timeIntervalSince(entryTime)
+            let gapSeconds = max(0, Int(gap.rounded()))
+            pendingSysHealMarker = "after_gap:\(gapSeconds)s"
+            pendingSysHealedGap = gap
+            sysBackoff.recordRestart()
+        } catch {
+            await emit(.error(
+                "System pipeline rebuild failed: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            let nested = sysBackoff.record(error: self.errorCode(for: error))
+            if case .exhausted = nested {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+            }
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            return
+        }
+
+        sysRestartTask = nil
+        sysRestartEntryTime = nil
+        await maybeRestoreRecordingStatus()
+    }
+
+    /// Transition into the `.recovering` status (idempotent — multiple
+    /// concurrent restarts only emit one transition because the second
+    /// call sees status already at `.recovering`).
+    private func beginRecovering(reason: String) async {
+        await emit(.recovering(reason: reason))
+        if status != .recovering && status != .error {
+            await setStatus(.recovering)
+        }
+    }
+
+    /// After a successful restart, restore status to `.recording`
+    /// unless another pipeline is still mid-restart or the engine has
+    /// surrendered to `.error`.
+    private func maybeRestoreRecordingStatus() async {
+        if status == .error { return }
+        if micRestartTask != nil || sysRestartTask != nil { return }
+        if isStopping || status == .stopping || status == .idle { return }
+        await setStatus(.recording)
     }
 
     private func startSystemAudio(locale: Locale) async {
@@ -477,7 +888,7 @@ public actor RecordingEngine {
                         await self?.handleRecognizerResult(result)
                     }
                 } catch {
-                    await self?.handleRecognizerError(error)
+                    await self?.handleRecognizerError(error, source: .systemAudio)
                 }
             }
         } catch {
@@ -555,6 +966,10 @@ public actor RecordingEngine {
     // MARK: - Cleanup
 
     private func cleanup() async {
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
         recognizerTask?.cancel()
         recognizerTask = nil
         await micRecognizerHandle?.stop()
@@ -570,5 +985,13 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
         currentSession = nil
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+        pendingMicHealMarker = nil
+        pendingSysHealMarker = nil
+        pendingMicHealedGap = nil
+        pendingSysHealedGap = nil
+        micRestartEntryTime = nil
+        sysRestartEntryTime = nil
     }
 }
