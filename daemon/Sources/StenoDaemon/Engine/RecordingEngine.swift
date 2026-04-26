@@ -39,6 +39,31 @@ public actor RecordingEngine {
     /// cancelled — otherwise `stop()` cannot abort an in-flight backoff.
     private let backoffSleep: @Sendable (Duration) async throws -> Void
 
+    // MARK: - U6 dependencies (sleep/wake supervisor)
+
+    /// IOKit-backed power assertion held while the engine is in the
+    /// `.recording` status. Acquired on first transition into
+    /// `.recording`, released on every transition OUT of `.recording`,
+    /// re-acquired on transitions back into `.recording`. Surfaces in
+    /// `pmset -g assertions` as `"Steno: capturing audio"`.
+    private let powerAssertion: any PowerAssertionManaging
+
+    /// Resolves the current default-input device UID for the heal rule.
+    /// Production injects a Core Audio HAL lookup
+    /// (`kAudioHardwarePropertyDefaultInputDevice` → device UID); tests
+    /// inject a closure that returns synthetic UIDs to exercise the
+    /// "device changed across sleep" rollover branch.
+    private let deviceUIDProvider: @Sendable () -> String?
+
+    /// Heal-rule reuse threshold in seconds. Resolved from
+    /// `StenoSettings.healGapSeconds` at construction time.
+    private let healThresholdSeconds: Int
+
+    /// Wall-clock provider. Tests inject a deterministic clock so the
+    /// rollover-vs-reuse path can be exercised without a real 30-second
+    /// sleep.
+    private let nowProvider: @Sendable () -> Date
+
     // MARK: - Internal state
 
     private var micRecognizerHandle: (any SpeechRecognizerHandle)?
@@ -98,6 +123,20 @@ public actor RecordingEngine {
     /// abort cleanly mid-backoff.
     private var isStopping: Bool = false
 
+    // MARK: - U6 sleep/wake state
+
+    /// Wall-clock moment the most recent `handleSystemWillSleep()` (or
+    /// equivalent teardown) recorded the gap entry. The wake handler
+    /// computes `gap = nowProvider() - gapStartedAt` to drive the heal
+    /// rule. Cleared when the wake handler returns (success or rollover).
+    private var gapStartedAt: Date?
+
+    /// Device UID captured at the last successful pipeline bring-up
+    /// (start, restart, or wake-reuse). Used by the heal rule on the
+    /// next wake to detect "device changed across sleep" and force a
+    /// rollover even when the gap is short.
+    private var lastDeviceUID: String?
+
     // MARK: - Init
 
     public init(
@@ -109,7 +148,11 @@ public actor RecordingEngine {
         delegate: (any RecordingEngineDelegate)? = nil,
         backoffSleep: @Sendable @escaping (Duration) async throws -> Void = { duration in
             try await Task.sleep(for: duration)
-        }
+        },
+        powerAssertion: (any PowerAssertionManaging)? = nil,
+        deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
+        healThresholdSeconds: Int = 30,
+        now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -118,6 +161,10 @@ public actor RecordingEngine {
         self.speechRecognizerFactory = speechRecognizerFactory
         self.delegate = delegate
         self.backoffSleep = backoffSleep
+        self.powerAssertion = powerAssertion ?? PowerAssertion()
+        self.deviceUIDProvider = deviceUIDProvider
+        self.healThresholdSeconds = healThresholdSeconds
+        self.nowProvider = now
     }
 
     // MARK: - Public Commands
@@ -222,6 +269,9 @@ public actor RecordingEngine {
         currentLocale = locale
         currentSequenceNumber = 0
         segmentCount = 0
+        // U6: capture the device UID at this bring-up so the next wake
+        // / config-change can compare against it for the heal rule.
+        lastDeviceUID = deviceUIDProvider()
 
         // Start microphone
         do {
@@ -479,7 +529,24 @@ public actor RecordingEngine {
     // MARK: - Private
 
     private func setStatus(_ newStatus: EngineStatus) async {
+        let previous = status
         status = newStatus
+        // U6: power assertion lifecycle. Take on entry into `.recording`,
+        // release on every transition OUT of `.recording`. Idempotent in
+        // both directions so concurrent rebuild paths can call freely
+        // without leaking duplicate assertions.
+        if previous != .recording && newStatus == .recording {
+            do {
+                try powerAssertion.acquire()
+            } catch {
+                await emit(.error(
+                    "Failed to acquire power assertion: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        } else if previous == .recording && newStatus != .recording {
+            powerAssertion.release()
+        }
         await emit(.statusChanged(newStatus))
     }
 
@@ -963,6 +1030,158 @@ public actor RecordingEngine {
         return peak
     }
 
+    // MARK: - U6 Sleep/Wake Handlers
+
+    /// Called on `kIOMessageSystemWillSleep` (wired via
+    /// `PowerManagementObserver`). Drains pipelines, persists in-flight
+    /// segments, releases the power assertion, and stamps
+    /// `gapStartedAt`. The heal rule decision is deferred to wake.
+    ///
+    /// **Ordering invariant (load-bearing — see plan's "Power-assertion
+    /// ordering (U6 test)" section):** the call sequence inside this
+    /// method MUST be (1) stop pipelines and confirm stopped, (2) release
+    /// the power assertion, (3) return to caller (which then invokes
+    /// `IOAllowPowerChange`). This closes the race where a still-active
+    /// mic pipeline could capture audio after the power assertion is
+    /// released but before the system actually sleeps.
+    ///
+    /// Cleanup is unconditional — runs even from `.error` state.
+    public func handleSystemWillSleep() async {
+        // Stamp the gap moment before tearing anything down so the wake
+        // handler can compute the elapsed time accurately.
+        gapStartedAt = nowProvider()
+
+        // Cancel any in-flight restart tasks. Their `Task.sleep(for:)`
+        // raises CancellationError and the loop returns early without
+        // re-arming a rebuild attempt during sleep.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+
+        // (1) Stop pipelines and confirm stopped. Each `await` returns
+        // only after the underlying handle / closure has finished its
+        // teardown.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        levelThrottleTask?.cancel()
+        levelThrottleTask = nil
+
+        // (2) Release the power assertion AFTER pipelines confirm
+        // stopped. Releasing is idempotent — the .recording -> .recovering
+        // transition below would also release it if we hadn't already.
+        powerAssertion.release()
+
+        // Transition to `.recovering` to reflect the sleep gap. We don't
+        // close the session here — the heal rule decides on wake whether
+        // to reuse or roll over.
+        if status != .error && status != .idle && status != .stopping {
+            await setStatus(.recovering)
+        }
+
+        // (3) Caller (PowerManagementObserver) calls IOAllowPowerChange
+        // next.
+    }
+
+    /// Called on `kIOMessageSystemHasPoweredOn` (wired via
+    /// `PowerManagementObserver`). Computes the gap, applies the heal
+    /// rule, and brings up pipelines around either the surviving session
+    /// (reuse) or a fresh one (rollover). Re-acquires the power
+    /// assertion via the `.recording` status transition.
+    public func handleSystemDidWake() async {
+        // No-op safety: if we never entered `.recording` (e.g., engine
+        // was idle before sleep, paused, or error-with-no-session), we
+        // have nothing to bring back up. This guards the test scenario
+        // where `handleSystemDidWake` is invoked on an idle engine.
+        guard let gapStarted = gapStartedAt else {
+            // Wake without a prior willSleep — nothing to do.
+            return
+        }
+        gapStartedAt = nil
+
+        guard let session = currentSession else {
+            // Status was non-.recording at sleep-time (e.g. error). Stay
+            // wherever we are; the engine-recovery path (plan "Engine-state
+            // recovery from `error`") drives a re-attempt elsewhere.
+            return
+        }
+
+        let gap = nowProvider().timeIntervalSince(gapStarted)
+        let currentDeviceUID = deviceUIDProvider()
+        let outcome = HealRule.decide(
+            gap: gap,
+            deviceUID: currentDeviceUID,
+            lastDeviceUID: lastDeviceUID,
+            thresholdSeconds: healThresholdSeconds
+        )
+
+        await emit(.recovering(reason: "wake:gap=\(Int(gap.rounded()))s"))
+
+        switch outcome {
+        case .reuseSession(let healMarker):
+            // Stage the heal marker for the first segment of each
+            // rebuilt pipeline so the post-wake transcription carries
+            // the U2-schema `heal_marker` annotation.
+            pendingMicHealMarker = healMarker
+            pendingSysHealMarker = healMarker
+            pendingMicHealedGap = gap
+            pendingSysHealedGap = gap
+
+            do {
+                _ = try await bringUpPipelines(
+                    session: session,
+                    locale: currentLocale,
+                    device: currentDevice,
+                    systemAudio: isSystemAudioEnabled
+                )
+            } catch {
+                // bringUpPipelines transitions to .error on failure and
+                // emits a non-transient error event.
+                await emit(.error(
+                    "Wake (reuse) bring-up failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+            }
+
+        case .rollover:
+            // Close current session as `interrupted`. Use the same
+            // path orphan-sweep uses (sweepActiveOrphans then
+            // openFreshSession) since the active session is effectively
+            // an "orphan" of the pre-sleep capture.
+            do {
+                try await repository.sweepActiveOrphans()
+                let fresh = try await repository.openFreshSession(locale: currentLocale)
+                _ = try await bringUpPipelines(
+                    session: fresh,
+                    locale: currentLocale,
+                    device: currentDevice,
+                    systemAudio: isSystemAudioEnabled
+                )
+                // Emit a healed event reflecting the gap that triggered
+                // the rollover so the TUI surfaces a visible recovery.
+                await emit(.healed(gapSeconds: gap))
+            } catch {
+                await emit(.error(
+                    "Wake (rollover) failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+                await setStatus(.error)
+            }
+        }
+    }
+
     // MARK: - Cleanup
 
     private func cleanup() async {
@@ -993,5 +1212,21 @@ public actor RecordingEngine {
         pendingSysHealedGap = nil
         micRestartEntryTime = nil
         sysRestartEntryTime = nil
+        gapStartedAt = nil
+    }
+}
+
+// MARK: - PowerEventTarget conformance (U6)
+
+/// `RecordingEngine` is the `PowerEventTarget` for
+/// `PowerManagementObserver`. Both methods are `async`, satisfied
+/// directly by the actor's isolated implementations.
+extension RecordingEngine: PowerEventTarget {
+    public nonisolated func systemWillSleep() async {
+        await handleSystemWillSleep()
+    }
+
+    public nonisolated func systemDidWake() async {
+        await handleSystemDidWake()
     }
 }
