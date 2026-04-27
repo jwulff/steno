@@ -229,6 +229,25 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func nonDuplicateSegmentCount(for sessionId: UUID) async throws -> Int {
+        try await dbQueue.read { db in
+            // Direct SQL keeps the predicate in line with U11's
+            // `duplicate_of IS NULL` convention used elsewhere in this
+            // file (overlappingSegments, applyRetentionPolicy, etc.).
+            let value = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(*)
+                    FROM segments
+                    WHERE sessionId = ?
+                      AND duplicate_of IS NULL
+                """,
+                arguments: [sessionId.uuidString]
+            )
+            return value ?? 0
+        }
+    }
+
     public func maxSegmentSequence(for sessionId: UUID) async throws -> Int {
         try await dbQueue.read { db in
             // SELECT MAX(sequenceNumber) returns NULL for an empty

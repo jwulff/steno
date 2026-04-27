@@ -94,23 +94,43 @@ public actor RollingSummaryCoordinator {
         }
 
         do {
-            let count = try await repository.segmentCount(for: sessionId)
-            let lastSummary = try await repository.latestSummary(for: sessionId)
-            let lastSummarizedSequence = lastSummary?.segmentRangeEnd ?? 0
+            // PR #36 review (Copilot): every "is there enough content to
+            // run the LLM?" gate must count canonical (non-duplicate)
+            // segments only. After U11's cross-source dedup runs, a
+            // Zoom-style session can hold 10 rows of which only 5 are
+            // canonical — the prior `segmentCount(for:)` overcounted and
+            // fired the LLM on duplicates that the summarizer pipeline
+            // would filter downstream anyway.
+            let count = try await repository.nonDuplicateSegmentCount(for: sessionId)
 
-            let newSegmentCount = count - lastSummarizedSequence
-
-            // U12: Gate by minimum segment count BEFORE the LLM is invoked.
-            // Sessions with too few segments are almost certain to be
-            // pruned at close (R11 empty-session policy); spending a 45s
-            // LLM timeout on them is wasted work. The gate uses the total
-            // session segment count rather than the new-segment delta so
-            // a long-running session with a recent summary still re-fires
-            // promptly when the next batch lands.
+            // U12: Gate by minimum non-duplicate segment count BEFORE the
+            // LLM is invoked. Sessions with too few canonical segments
+            // are almost certain to be pruned at close (R11 empty-session
+            // policy); spending a 45s LLM timeout on them is wasted work.
+            // The gate uses the total session non-dup count rather than
+            // a new-segment delta so a long-running session with a recent
+            // summary still re-fires promptly when the next batch lands.
             if count < minSegmentsForExtraction {
-                logSummary("Segments: \(count) — below extraction gate (\(minSegmentsForExtraction)), skipping LLM")
+                logSummary("Non-dup segments: \(count) — below extraction gate (\(minSegmentsForExtraction)), skipping LLM")
                 return nil
             }
+
+            // Past the gate: load segments once and derive the new-segment
+            // delta from sequence numbers on the canonical subset. The
+            // prior `count - lastSummarizedSequence` math compared a
+            // total-row count against a sequence number — meaningless
+            // once `count` excludes duplicates (sequence numbers are not
+            // compacted by U11; duplicates retain their original seq).
+            // We now compare like-with-like: count of canonical rows
+            // whose `sequenceNumber` is past the last-summarized cursor.
+            let allSegments = try await repository.segments(for: sessionId)
+            let nonDupSegments = allSegments.filter { $0.duplicateOf == nil }
+
+            let lastSummary = try await repository.latestSummary(for: sessionId)
+            let lastSummarizedSequence = lastSummary?.segmentRangeEnd ?? 0
+            let newSegmentCount = nonDupSegments
+                .filter { $0.sequenceNumber > lastSummarizedSequence }
+                .count
 
             // Check time since last summary
             let now = Date()
@@ -122,7 +142,7 @@ public actor RollingSummaryCoordinator {
             let minSegmentsForTimeTrigger = 3
             let shouldTriggerByTime = newSegmentCount >= minSegmentsForTimeTrigger && (lastTime == nil || timeSinceLastSummary! >= timeThreshold)
 
-            logSummary("Segments: \(count), new: \(newSegmentCount), time since last: \(timeSinceLastSummary.map { String(format: "%.0fs", $0) } ?? "never")")
+            logSummary("Non-dup segments: \(count), new: \(newSegmentCount), time since last: \(timeSinceLastSummary.map { String(format: "%.0fs", $0) } ?? "never")")
 
             if shouldTriggerByCount || shouldTriggerByTime {
                 let reason = shouldTriggerByCount ? "count threshold" : "time threshold"
@@ -131,7 +151,8 @@ public actor RollingSummaryCoordinator {
                 defer { isGenerating = false }
                 let result = try await generateRollingSummary(
                     sessionId: sessionId,
-                    fromSequence: lastSummarizedSequence + 1
+                    fromSequence: lastSummarizedSequence + 1,
+                    canonicalSegments: nonDupSegments
                 )
                 lastSummaryTime[sessionId] = Date()
                 return result
@@ -145,8 +166,17 @@ public actor RollingSummaryCoordinator {
         }
     }
 
-    private func generateRollingSummary(sessionId: UUID, fromSequence: Int) async throws -> SummaryResult? {
-        let allSegments = try await repository.segments(for: sessionId)
+    private func generateRollingSummary(
+        sessionId: UUID,
+        fromSequence: Int,
+        canonicalSegments: [StoredSegment]
+    ) async throws -> SummaryResult? {
+        // PR #36 review (Copilot): the segment list passed downstream to
+        // `summarize`, `generateMeetingNotes`, and `extractTopics` MUST
+        // be the canonical (non-duplicate) subset. Caller has already
+        // filtered via `allSegments.filter { $0.duplicateOf == nil }` —
+        // we reuse that result here rather than reload-and-refilter.
+        let allSegments = canonicalSegments
         let segments = allSegments.filter { $0.sequenceNumber >= fromSequence }
 
         guard !segments.isEmpty else {

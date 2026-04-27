@@ -89,12 +89,10 @@ struct EmptySessionPruneIntegrationTests {
         try await repo.saveSegment(segment)
 
         // Override the session's startedAt so duration > 3s. The mock
-        // repo uses the seeded startedAt; we re-seed via the test helper.
-        var augmented = session
-        augmented.endedAt = nil  // still active until stop()
-        // The mock uses Date() at endSession time, so duration will be
-        // very small. We can simulate a long session by directly
-        // backdating the startedAt via the seed helper:
+        // uses Date() at endSession time, so duration would otherwise be
+        // very small. Backdate the startedAt directly via the seed helper.
+        // (PR #36 review: prior draft kept an `augmented = session` copy
+        // here that was never read — removed.)
         let backdatedSession = Session(
             id: session.id,
             locale: session.locale,

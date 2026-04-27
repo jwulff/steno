@@ -114,6 +114,20 @@ public protocol TranscriptRepository: Sendable {
     /// - Returns: Number of segments.
     func segmentCount(for sessionId: UUID) async throws -> Int
 
+    /// Count only canonical (non-duplicate) segments in a session.
+    /// Used by `RollingSummaryCoordinator` (PR #36 review): the LLM
+    /// extraction gate is defined in terms of *meaningful* content, not
+    /// total rows. After U11's cross-source dedup runs, a Zoom-style
+    /// session may carry mic+sys rows for the same speech and only the
+    /// sys rows are canonical — counting both inflates the gate.
+    ///
+    /// Implemented as `SELECT COUNT(*) FROM segments WHERE sessionId = ?
+    /// AND duplicate_of IS NULL`.
+    ///
+    /// - Parameter sessionId: The session ID.
+    /// - Returns: Number of segments where `duplicateOf IS NULL`.
+    func nonDuplicateSegmentCount(for sessionId: UUID) async throws -> Int
+
     /// Largest `sequenceNumber` already persisted for `sessionId`. Returns
     /// 0 when the session has no segments yet (so callers can use
     /// `currentSequenceNumber = max + 1` on the next save without a

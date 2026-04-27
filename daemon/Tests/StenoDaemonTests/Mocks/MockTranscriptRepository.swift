@@ -184,6 +184,10 @@ actor MockTranscriptRepository: TranscriptRepository {
         segments[sessionId]?.count ?? 0
     }
 
+    func nonDuplicateSegmentCount(for sessionId: UUID) async throws -> Int {
+        (segments[sessionId] ?? []).filter { $0.duplicateOf == nil }.count
+    }
+
     func maxSegmentSequence(for sessionId: UUID) async throws -> Int {
         // Mirror the SQLite contract: 0 when the session has no
         // segments, otherwise the max `sequenceNumber` value.
