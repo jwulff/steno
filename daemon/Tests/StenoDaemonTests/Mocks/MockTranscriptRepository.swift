@@ -129,7 +129,10 @@ actor MockTranscriptRepository: TranscriptRepository {
             startedAt: session.startedAt,
             endedAt: Date(),
             title: session.title,
-            status: .completed
+            status: .completed,
+            lastDedupedSegmentSeq: session.lastDedupedSegmentSeq,
+            pauseExpiresAt: session.pauseExpiresAt,
+            pausedIndefinitely: session.pausedIndefinitely
         )
         sessions[sessionId] = session
     }
@@ -328,6 +331,40 @@ actor MockTranscriptRepository: TranscriptRepository {
         summaries.removeValue(forKey: sessionId)
         topics.removeValue(forKey: sessionId)
         return true
+    }
+
+    // MARK: - Pause state (U10)
+
+    /// Optional throw-injection: when set, `setPauseState` raises and the
+    /// engine path treats it as a non-fatal warning per U10 contract.
+    private var setPauseStateError: Error?
+    private var clearPauseStateError: Error?
+
+    func setSetPauseStateError(_ error: Error?) {
+        setPauseStateError = error
+    }
+    func setClearPauseStateError(_ error: Error?) {
+        clearPauseStateError = error
+    }
+
+    func setPauseState(
+        sessionId: UUID,
+        expiresAt: Date?,
+        indefinite: Bool
+    ) async throws {
+        if let err = setPauseStateError { throw err }
+        guard var session = sessions[sessionId] else { return }
+        session.pauseExpiresAt = expiresAt
+        session.pausedIndefinitely = indefinite
+        sessions[sessionId] = session
+    }
+
+    func clearPauseState(sessionId: UUID) async throws {
+        if let err = clearPauseStateError { throw err }
+        guard var session = sessions[sessionId] else { return }
+        session.pauseExpiresAt = nil
+        session.pausedIndefinitely = false
+        sessions[sessionId] = session
     }
 
     @discardableResult

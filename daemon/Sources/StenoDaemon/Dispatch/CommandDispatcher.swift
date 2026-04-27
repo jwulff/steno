@@ -5,6 +5,12 @@ public actor CommandDispatcher {
     private let engine: RecordingEngine
     private let broadcaster: EventBroadcaster
 
+    /// Default auto-resume window for `pause` commands that omit both
+    /// `autoResumeSeconds` and `indefinite`. 30 minutes matches the
+    /// plan's UX choice and is intentionally explicit (not a magic
+    /// number sprinkled in the engine).
+    public static let defaultPauseAutoResumeSeconds: Double = 1800
+
     public init(engine: RecordingEngine, broadcaster: EventBroadcaster) {
         self.engine = engine
         self.broadcaster = broadcaster
@@ -32,6 +38,15 @@ public actor CommandDispatcher {
 
         case "subscribe":
             response = await handleSubscribe(command, from: client)
+
+        case "pause":
+            response = await handlePause(command)
+
+        case "resume":
+            response = await handleResume()
+
+        case "demarcate":
+            response = await handleDemarcate()
 
         default:
             response = DaemonResponse.failure("Unknown command: \(command.cmd)")
@@ -80,6 +95,7 @@ public actor CommandDispatcher {
         let segments = await engine.segmentCount
         let device = await engine.currentDevice
         let systemAudio = await engine.isSystemAudioEnabled
+        let pause = await engine.pauseStateSnapshot()
 
         return DaemonResponse(
             ok: true,
@@ -88,8 +104,73 @@ public actor CommandDispatcher {
             segments: segments,
             status: status.rawValue,
             device: device,
-            systemAudio: systemAudio
+            systemAudio: systemAudio,
+            paused: pause.paused,
+            pausedIndefinitely: pause.indefinite,
+            pauseExpiresAt: pause.expiresAt?.timeIntervalSince1970
         )
+    }
+
+    // MARK: - U10 pause / resume / demarcate
+
+    private func handlePause(_ command: DaemonCommand) async -> DaemonResponse {
+        // Resolve auto-resume window. Explicit `indefinite=true` wins over
+        // `autoResumeSeconds`. If neither is supplied, default to the
+        // server-side timeout (30 min).
+        let autoResumeSeconds: TimeInterval?
+        if command.indefinite == true {
+            autoResumeSeconds = nil
+        } else if let secs = command.autoResumeSeconds {
+            autoResumeSeconds = secs
+        } else {
+            autoResumeSeconds = Self.defaultPauseAutoResumeSeconds
+        }
+
+        do {
+            try await engine.pause(autoResumeSeconds: autoResumeSeconds)
+            let snapshot = await engine.pauseStateSnapshot()
+            return DaemonResponse(
+                ok: true,
+                recording: false,
+                status: EngineStatus.paused.rawValue,
+                paused: snapshot.paused,
+                pausedIndefinitely: snapshot.indefinite,
+                pauseExpiresAt: snapshot.expiresAt?.timeIntervalSince1970
+            )
+        } catch {
+            return DaemonResponse.failure(error.localizedDescription)
+        }
+    }
+
+    private func handleResume() async -> DaemonResponse {
+        do {
+            try await engine.resume()
+            let session = await engine.currentSession
+            return DaemonResponse(
+                ok: true,
+                sessionId: session?.id.uuidString,
+                recording: true,
+                paused: false,
+                pausedIndefinitely: false,
+                pauseExpiresAt: nil
+            )
+        } catch {
+            return DaemonResponse.failure(error.localizedDescription)
+        }
+    }
+
+    private func handleDemarcate() async -> DaemonResponse {
+        do {
+            let fresh = try await engine.demarcate()
+            return DaemonResponse(
+                ok: true,
+                sessionId: fresh.id.uuidString,
+                recording: true,
+                status: EngineStatus.recording.rawValue
+            )
+        } catch {
+            return DaemonResponse.failure(error.localizedDescription)
+        }
     }
 
     private func handleDevices() async -> DaemonResponse {

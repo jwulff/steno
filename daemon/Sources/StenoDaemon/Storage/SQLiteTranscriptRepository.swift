@@ -522,6 +522,44 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    // MARK: - Pause state (U10)
+
+    public func setPauseState(
+        sessionId: UUID,
+        expiresAt: Date?,
+        indefinite: Bool
+    ) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE sessions
+                    SET pause_expires_at = ?,
+                        paused_indefinitely = ?
+                    WHERE id = ?
+                """,
+                arguments: [
+                    expiresAt?.timeIntervalSince1970,
+                    indefinite ? 1 : 0,
+                    sessionId.uuidString
+                ]
+            )
+        }
+    }
+
+    public func clearPauseState(sessionId: UUID) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE sessions
+                    SET pause_expires_at = NULL,
+                        paused_indefinitely = 0
+                    WHERE id = ?
+                """,
+                arguments: [sessionId.uuidString]
+            )
+        }
+    }
+
     @discardableResult
     public func applyRetentionPolicy(retentionDays: Int) async throws -> Int {
         guard retentionDays > 0 else { return 0 }

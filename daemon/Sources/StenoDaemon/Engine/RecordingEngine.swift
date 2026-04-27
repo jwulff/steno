@@ -180,6 +180,60 @@ public actor RecordingEngine {
     /// (cheap restart, no heal-rule trigger).
     private var lastMicFormat: AVAudioFormat?
 
+    // MARK: - U10 pause / demarcate state
+
+    /// Wall-clock auto-resume timer. Armed during `pause(autoResumeSeconds:)`
+    /// when a non-nil interval was supplied. Fires `resume()` at the
+    /// absolute deadline; survives system sleep via `DispatchWallTime`.
+    private let pauseTimer: PauseTimer
+
+    /// The session row used as the pause anchor. `pause` writes
+    /// `pause_expires_at` and `paused_indefinitely` onto this row before
+    /// closing it; `resume` (manual or timer-fired) clears them on the
+    /// same row. `nil` outside the paused state.
+    private var pausedSessionId: UUID?
+
+    /// Cached pause-state copy on the engine — readable by the dispatcher
+    /// without round-tripping the DB. Mirrors what was last persisted via
+    /// `setPauseState`. Cleared on resume.
+    private var pauseExpiresAt: Date?
+    private var isPauseIndefinite: Bool = false
+
+    /// True while `pause()` / `resume()` is mid-flight, OR the engine has
+    /// settled into `.paused`. The pause-resume gate uses this to reject
+    /// concurrent pause-while-pausing and resume-while-resuming attempts;
+    /// `status == .paused` is the canonical "currently paused" check.
+    private var pauseInProgress: Bool = false
+
+    /// Last device captured at the last successful pipeline bring-up,
+    /// reused by `resume()` if the engine bring-up does not pass an
+    /// explicit device.
+    /// (Preserved when entering `.paused`; `cleanup()` does NOT clear this.)
+    private var lastUsedDevice: String?
+
+    /// Last system-audio flag captured at the last successful pipeline
+    /// bring-up. Reused by `resume()` so the post-pause configuration
+    /// matches the pre-pause configuration.
+    private var lastUsedSystemAudio: Bool = false
+
+    /// Demarcate timestamp routing. Set to the wall-clock instant of a
+    /// `demarcate()` call; while non-nil, finalized segments whose
+    /// `startedAt < demarcationTimestamp` are routed to the previous
+    /// session id, segments at or after T are routed to the current
+    /// session. Cleared after the first finalized segment with
+    /// `startedAt >= T` lands on the new session, OR after a 10s
+    /// grace window (`demarcationGraceSeconds`).
+    private var demarcationTimestamp: Date?
+    private var previousSessionId: UUID?
+    private var demarcationClearTask: Task<Void, Never>?
+
+    /// Queue a demarcate request that arrived during `.recovering`. The
+    /// pending boundary is applied on the next return-to-`.recording`
+    /// transition. The plan calls this out as the "queue" choice over
+    /// "reject" because the user expectation is that a spacebar tap
+    /// during a transient blip should still split the session.
+    private var pendingDemarcate: Bool = false
+
     // MARK: - Init
 
     public init(
@@ -200,7 +254,8 @@ public actor RecordingEngine {
         dedupTriggerDebounce: Duration = .seconds(5),
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
-        retentionDays: Int = 90
+        retentionDays: Int = 90,
+        pauseTimer: PauseTimer? = nil
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -218,6 +273,7 @@ public actor RecordingEngine {
         self.emptySessionMinChars = emptySessionMinChars
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.retentionDays = retentionDays
+        self.pauseTimer = pauseTimer ?? PauseTimer()
     }
 
     // MARK: - Public Commands
@@ -387,6 +443,13 @@ public actor RecordingEngine {
         }
         isSystemAudioEnabled = systemAudio
 
+        // U10: remember the device + system-audio configuration so a
+        // post-pause `resume()` re-builds against the same selection.
+        // Placed AFTER the setStatus to keep the U10 state writes off
+        // any error paths.
+        lastUsedDevice = device
+        lastUsedSystemAudio = systemAudio
+
         await setStatus(.recording)
         return session
     }
@@ -535,12 +598,26 @@ public actor RecordingEngine {
             let pauseStillActive = mostRecent.pausedIndefinitely
                 || (mostRecent.pauseExpiresAt.map { $0 > now } ?? false)
             if pauseStillActive {
+                // U10: restore the paused engine state from the persisted
+                // DB row. Re-arms the wall-clock timer for the remaining
+                // window (timed pauses) or stays paused indefinitely. The
+                // privacy invariant: we do NOT bring up pipelines.
                 await emit(.error(
                     "Daemon-start: pause is still active (paused_indefinitely=\(mostRecent.pausedIndefinitely)" +
                     ", pause_expires_at=\(mostRecent.pauseExpiresAt.map { String($0.timeIntervalSince1970) } ?? "nil"))" +
-                    " — not auto-starting (U10 will restore paused engine state)",
+                    " — restoring paused engine state",
                     isTransient: false
                 ))
+                // Pre-populate locale + last-known device so a future
+                // resume bringup uses the same configuration.
+                currentLocale = mostRecent.locale
+                lastUsedDevice = device
+                lastUsedSystemAudio = systemAudio
+                await restorePausedState(
+                    sessionId: mostRecent.id,
+                    expiresAt: mostRecent.pauseExpiresAt,
+                    indefinite: mostRecent.pausedIndefinitely
+                )
                 return nil
             }
         }
@@ -585,18 +662,39 @@ public actor RecordingEngine {
         // teardown is not blocked by the wait.
         guard status == .recording
             || status == .starting
-            || status == .recovering else { return }
+            || status == .recovering
+            || status == .paused else { return }
+
+        // U10: if we were paused, cancel the auto-resume timer and clear
+        // pause-state markers. The DB anchor is left as-is (the user can
+        // restart manually and the next daemon-start sees the row state).
+        if status == .paused {
+            pauseTimer.cancel()
+            pausedSessionId = nil
+            pauseExpiresAt = nil
+            isPauseIndefinite = false
+            await setStatus(.idle)
+            return
+        }
 
         isStopping = true
         await setStatus(.stopping)
 
         // Cancel any in-flight restart tasks. Their `Task.sleep(for:)`
         // raises CancellationError and the loop returns early without
-        // re-arming a rebuild attempt.
-        micRestartTask?.cancel()
+        // re-arming a rebuild attempt. Capture, cancel, then await to
+        // guarantee the tasks have fully unwound before `stop()` returns —
+        // otherwise their tail cleanup (which touches actor state) can
+        // race against the test fixture's release of the engine, surfacing
+        // as `freed pointer was not the last allocation` at process exit.
+        let priorMicRestart = micRestartTask
+        let priorSysRestart = sysRestartTask
         micRestartTask = nil
-        sysRestartTask?.cancel()
         sysRestartTask = nil
+        priorMicRestart?.cancel()
+        priorSysRestart?.cancel()
+        await priorMicRestart?.value
+        await priorSysRestart?.value
 
         // Stop recognizers
         recognizerTask?.cancel()
@@ -648,6 +746,12 @@ public actor RecordingEngine {
         for (_, task) in pendingDedupTriggers { task.cancel() }
         pendingDedupTriggers.removeAll()
         currentMicSegmentPeak = 0
+
+        // U10: clear demarcate routing on full stop. The pause timer
+        // does not need explicit cancellation here — if a pause was
+        // active we'd have hit the `.paused` early return above.
+        pendingDemarcate = false
+        clearDemarcationRouting()
 
         // U12: dedup + empty-session prune for the just-closed session.
         // Done AFTER the cancel-all above so the synchronous pass we run
@@ -716,6 +820,34 @@ public actor RecordingEngine {
             currentSequenceNumber += 1
             segmentCount = currentSequenceNumber
 
+            // U10 demarcate timestamp routing: a finalized segment whose
+            // audio-frame `startedAt` precedes the demarcate moment T is
+            // attributed to the previously-closed session; segments at
+            // or after T land on the new (current) session.
+            //
+            // **Assumption (load-bearing, U1 was skipped):** `result.timestamp`
+            // is the audio-frame start instant. If real-world testing of
+            // SpeechAnalyzer shows otherwise, the plan's fallback is to
+            // plumb wall-clock timestamps through the audio path
+            // independent of the recognizer.
+            //
+            // The first finalized segment with `startedAt >= T` clears the
+            // demarcate state — segments arriving after that always land on
+            // the current session. A 10s grace task also clears it if no
+            // such segment ever arrives.
+            let routingSessionId: UUID
+            if let demarcateAt = demarcationTimestamp,
+               let prevId = previousSessionId,
+               result.timestamp < demarcateAt {
+                routingSessionId = prevId
+            } else {
+                routingSessionId = session.id
+                // First post-T segment clears the routing state.
+                if demarcationTimestamp != nil {
+                    clearDemarcationRouting()
+                }
+            }
+
             // U5: stamp the heal marker on the *first* segment after a
             // successful pipeline restart on the matching source. The
             // marker is consumed (cleared) here so subsequent normal
@@ -742,13 +874,31 @@ public actor RecordingEngine {
                 micPeakDb = nil
             }
 
+            // U10 demarcate routing: if attributing to the previous session,
+            // we need a sequence number greater than that session's MAX (so
+            // we don't violate UNIQUE(sessionId, sequenceNumber)). Cheap
+            // single-indexed lookup; we only do it when actively routing.
+            // Otherwise the bumped `currentSequenceNumber` is the right key.
+            let segmentSequence: Int
+            if routingSessionId != session.id {
+                // Don't waste a slot on the current session for a routed
+                // segment — back the counter off by 1 and use the previous
+                // session's own next-slot.
+                currentSequenceNumber -= 1
+                segmentCount = currentSequenceNumber
+                let prevMax = (try? await repository.maxSegmentSequence(for: routingSessionId)) ?? 0
+                segmentSequence = prevMax + 1
+            } else {
+                segmentSequence = currentSequenceNumber
+            }
+
             let segment = StoredSegment(
-                sessionId: session.id,
+                sessionId: routingSessionId,
                 text: result.text,
                 startedAt: result.timestamp,
                 endedAt: Date(),
                 confidence: result.confidence,
-                sequenceNumber: currentSequenceNumber,
+                sequenceNumber: segmentSequence,
                 source: result.source,
                 healMarker: healMarker,
                 micPeakDb: micPeakDb
@@ -764,11 +914,14 @@ public actor RecordingEngine {
 
             await emit(.segmentFinalized(segment))
 
-            // U11: schedule a debounced dedup pass for this session. The
-            // pass runs in a detached task so the segment-save hot path
-            // is not blocked. Multiple triggers within the debounce
-            // window collapse to a single pass per session.
-            scheduleDedupTrigger(sessionId: session.id)
+            // U11: schedule a debounced dedup pass for the session this
+            // segment landed on (routing-aware — a demarcate-routed
+            // segment queues dedup against its previous-session anchor,
+            // not the current session). The pass runs in a detached task
+            // so the segment-save hot path is not blocked. Multiple
+            // triggers within the debounce window collapse to a single
+            // pass per session.
+            scheduleDedupTrigger(sessionId: routingSessionId)
 
             // U5: a finalized segment counts toward the per-source
             // backoff reset (segment-finalized gate). The wall-clock
@@ -798,9 +951,9 @@ public actor RecordingEngine {
                 }
             }
 
-            // Trigger summary
+            // Trigger summary against the session the segment landed on.
             await emit(.modelProcessing(true))
-            let summaryResult = await summaryCoordinator.onSegmentSaved(sessionId: session.id)
+            let summaryResult = await summaryCoordinator.onSegmentSaved(sessionId: routingSessionId)
             await emit(.modelProcessing(false))
 
             if let summaryResult {
@@ -1190,6 +1343,22 @@ public actor RecordingEngine {
         if micRestartTask != nil || sysRestartTask != nil { return }
         if isStopping || status == .stopping || status == .idle { return }
         await setStatus(.recording)
+
+        // U10: if a `demarcate()` arrived while we were `.recovering`,
+        // apply the boundary now that recovery completed. Failures here
+        // are best-effort logged — the demarcate UX expects a successful
+        // boundary, but a DB failure shouldn't take down the engine.
+        if pendingDemarcate {
+            pendingDemarcate = false
+            do {
+                _ = try await performDemarcate()
+            } catch {
+                await emit(.error(
+                    "Queued demarcate failed: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
     }
 
     private func startSystemAudio(locale: Locale) async {
@@ -1422,6 +1591,13 @@ public actor RecordingEngine {
     ///
     /// Cleanup is unconditional — runs even from `.error` state.
     public func handleSystemWillSleep() async {
+        // U10: while paused, no audio is being captured and no power
+        // assertion is held. Nothing to drain. The pause timer keeps
+        // running through sleep (DispatchWallTime-based).
+        if status == .paused {
+            return
+        }
+
         // Stamp the gap moment before tearing anything down so the wake
         // handler can compute the elapsed time accurately.
         gapStartedAt = nowProvider()
@@ -1485,6 +1661,14 @@ public actor RecordingEngine {
             return
         }
         gapStartedAt = nil
+
+        // U10: while paused, wake is a no-op. The pause timer is wall-
+        // clock based (DispatchWallTime) and continues to advance during
+        // sleep, so it fires on its own when the deadline lands. We do
+        // NOT bring up pipelines while paused — the privacy invariant.
+        if status == .paused {
+            return
+        }
 
         guard let session = currentSession else {
             // Status was non-.recording at sleep-time (e.g. error). Stay
@@ -1731,6 +1915,388 @@ public actor RecordingEngine {
             && a.commonFormat == b.commonFormat
     }
 
+    // MARK: - U10 Pause / Resume / Demarcate
+
+    /// Hard pause. Closes the current session cleanly, tears down both
+    /// pipelines, releases the power assertion, and persists pause state
+    /// on the most-recent session row so daemon restart re-enters the
+    /// paused state (R-F privacy invariant).
+    ///
+    /// While paused: NO audio capture, NO recognizer, NO power assertion.
+    ///
+    /// - Parameter autoResumeSeconds: If non-nil, arm a wall-clock timer
+    ///   to fire `resume()` after this many seconds. The timer survives
+    ///   sleep (`DispatchWallTime`). `nil` → indefinite pause, no timer.
+    public func pause(autoResumeSeconds: TimeInterval?) async throws {
+        // Allowed-from gate. From `.recording`, `.recovering`, or `.error`:
+        // valid pause entry (R3 — pause is always available, even from a
+        // surrendered engine). From `.paused`/`.starting`/`.stopping`/
+        // `.idle`: reject — there's nothing to pause cleanly.
+        guard status == .recording || status == .recovering || status == .error else {
+            throw RecordingEngineError.notRecording
+        }
+        if pauseInProgress { throw RecordingEngineError.notRecording }
+        pauseInProgress = true
+        defer { pauseInProgress = false }
+
+        // Cancel any in-flight backoff/restart tasks. Their cancellable
+        // sleeps abort with CancellationError and the tasks return early.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+
+        // Tear down pipelines. Stop the recognizer consumer FIRST so the
+        // recognizer-error path doesn't trigger another restart while we
+        // are mid-pause.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        levelThrottleTask?.cancel()
+        levelThrottleTask = nil
+
+        // Release the power assertion now that no capture is in flight.
+        // The `.recording → .paused` transition in `setStatus` would
+        // also release it, but releasing here is idempotent and makes
+        // the ordering explicit.
+        powerAssertion.release()
+
+        // Close the current session (if any) and run dedup + prune
+        // exactly like the `stop()` close-path. The closing session
+        // becomes our pause anchor.
+        let closingSessionId = currentSession?.id
+        if let id = closingSessionId {
+            try? await repository.endSession(id)
+        }
+        currentSession = nil
+        // Cancel any pending demarcate/dedup-trigger machinery — we are
+        // ending this session cleanly.
+        clearDemarcationRouting()
+        for (_, task) in pendingDedupTriggers { task.cancel() }
+        pendingDedupTriggers.removeAll()
+
+        // Compute pause state from caller arguments.
+        let now = nowProvider()
+        let expiresAt: Date?
+        let indefinite: Bool
+        if let secs = autoResumeSeconds {
+            expiresAt = now.addingTimeInterval(secs)
+            indefinite = false
+        } else {
+            expiresAt = nil
+            indefinite = true
+        }
+
+        // Persist pause state on the just-closed session (the canonical
+        // anchor — `mostRecentlyModifiedSession()` will return this row
+        // on daemon-start).
+        if let id = closingSessionId {
+            do {
+                try await repository.setPauseState(
+                    sessionId: id,
+                    expiresAt: expiresAt,
+                    indefinite: indefinite
+                )
+            } catch {
+                // Persistence failed. Surface non-transient — the user's
+                // pause intent could not be persisted, so a daemon restart
+                // would silently resume into recording. Rather than
+                // silently degrade, we still enter `.paused` in-memory but
+                // emit a non-transient warning matching U4's
+                // `pause_state_unverifiable` token so the TUI surfaces it.
+                await emit(.error(
+                    "pause_state_unverifiable: failed to persist pause state on session \(id) (\(error.localizedDescription))",
+                    isTransient: false
+                ))
+            }
+        }
+
+        // Now run dedup + prune for the just-closed session (synchronous).
+        if let id = closingSessionId {
+            await dedupAndMaybePrune(sessionId: id)
+        }
+
+        // In-memory pause state.
+        pausedSessionId = closingSessionId
+        pauseExpiresAt = expiresAt
+        isPauseIndefinite = indefinite
+
+        // Arm the auto-resume timer if applicable. The closure trampolines
+        // back onto the actor via `Task` and calls `resume()` — failures
+        // there surface their own events.
+        if let deadline = expiresAt {
+            pauseTimer.arm(at: deadline) { [weak self] in
+                Task { [weak self] in
+                    try? await self?.resume()
+                }
+            }
+        }
+
+        await setStatus(.paused)
+        await emit(.pauseStateChanged(
+            paused: true,
+            indefinite: indefinite,
+            expiresAt: expiresAt
+        ))
+    }
+
+    /// Resume from a paused state. Cancels the auto-resume timer (if any),
+    /// clears persisted pause state on the anchor session row, opens a
+    /// fresh active session, and brings up pipelines around it.
+    public func resume() async throws {
+        guard status == .paused else {
+            throw RecordingEngineError.notRecording
+        }
+        if pauseInProgress { throw RecordingEngineError.notRecording }
+        pauseInProgress = true
+        defer { pauseInProgress = false }
+
+        // Cancel the auto-resume timer in case `resume()` was called
+        // manually before the timer fired.
+        pauseTimer.cancel()
+
+        // Clear pause state on the anchor session row.
+        if let anchorId = pausedSessionId {
+            do {
+                try await repository.clearPauseState(sessionId: anchorId)
+            } catch {
+                // Best-effort — log transient. A failure here doesn't
+                // prevent the resume; the columns may simply re-trigger
+                // the pause-state-restore guard on the next daemon start
+                // (depending on the row's actual state).
+                await emit(.error(
+                    "Failed to clear pause state on session \(anchorId): \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
+
+        // Reset U5 backoff state — we're entering a fresh recording session.
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+
+        await setStatus(.starting)
+
+        // Open a fresh active session. Permissions are NOT re-checked on
+        // resume — the user's prior consent is still in force; if a TCC
+        // revocation lands, U8's revocation-detector surfaces it on the
+        // first failed bring-up.
+        let session: Session
+        do {
+            session = try await repository.openFreshSession(locale: currentLocale)
+        } catch {
+            await setStatus(.error)
+            await emit(.error(
+                "Resume: failed to open fresh session: \(error.localizedDescription)",
+                isTransient: false
+            ))
+            // Clear pause state in-memory so subsequent commands don't
+            // think we're still paused.
+            pausedSessionId = nil
+            pauseExpiresAt = nil
+            isPauseIndefinite = false
+            await emit(.pauseStateChanged(paused: false, indefinite: false, expiresAt: nil))
+            throw error
+        }
+
+        // Bring up pipelines around the fresh session, restoring the
+        // pre-pause device + system-audio configuration.
+        do {
+            _ = try await bringUpPipelines(
+                session: session,
+                locale: currentLocale,
+                device: lastUsedDevice,
+                systemAudio: lastUsedSystemAudio
+            )
+        } catch {
+            // bringUpPipelines already transitioned to `.error` and
+            // emitted a non-transient event. Clear pause-state markers.
+            pausedSessionId = nil
+            pauseExpiresAt = nil
+            isPauseIndefinite = false
+            await emit(.pauseStateChanged(paused: false, indefinite: false, expiresAt: nil))
+            throw error
+        }
+
+        // Pause-state cleanup.
+        pausedSessionId = nil
+        pauseExpiresAt = nil
+        isPauseIndefinite = false
+
+        await emit(.pauseStateChanged(paused: false, indefinite: false, expiresAt: nil))
+    }
+
+    /// Atomic session boundary at T = `nowProvider()`. Closes the current
+    /// session at T (sets `endedAt`), opens a fresh active session at T,
+    /// and seeds timestamp-based segment routing so in-flight partial
+    /// transcriptions land on the correct side of the boundary.
+    ///
+    /// Pipelines continue uninterrupted — no audio teardown, no recognizer
+    /// reset.
+    ///
+    /// - Returns: the newly opened active session.
+    @discardableResult
+    public func demarcate() async throws -> Session {
+        switch status {
+        case .recording:
+            return try await performDemarcate()
+        case .recovering:
+            // Queue: the next return-to-`.recording` transition applies
+            // the boundary. Better UX than reject — a spacebar tap during
+            // a transient blip splits the session as the user expects.
+            pendingDemarcate = true
+            // Caller still wants a Session value back; the contract here
+            // is "the boundary will fire when recovery completes." We
+            // return the current session (effectively the closing one)
+            // so the caller has a non-nil result; tests that need precise
+            // semantics drive through `performDemarcate` directly.
+            if let current = currentSession { return current }
+            throw RecordingEngineError.notRecording
+        case .paused:
+            // Reject — paused has no current session to demarcate. The
+            // user must explicitly resume first ("press p to resume").
+            throw RecordingEngineError.notRecording
+        case .idle, .starting, .stopping, .error:
+            throw RecordingEngineError.notRecording
+        }
+    }
+
+    /// The actual demarcate implementation, factored so the queued path
+    /// (`pendingDemarcate` -> heal completion) can call it on the same
+    /// terms.
+    private func performDemarcate() async throws -> Session {
+        guard let closing = currentSession else {
+            throw RecordingEngineError.notRecording
+        }
+
+        let demarcateAt = nowProvider()
+
+        // Close the current session at T. We set endedAt via the standard
+        // `endSession` path (which uses `Date()` for endedAt) — the wall-
+        // clock skew between T and the DB write is the natural latency of
+        // the storage operation and well under our segment-routing
+        // tolerance.
+        try? await repository.endSession(closing.id)
+
+        // Open a fresh active session at T.
+        let fresh = try await repository.openFreshSession(locale: currentLocale)
+
+        // Seed timestamp-based routing. In-flight finalized segments
+        // arriving with `result.timestamp < demarcateAt` will be
+        // attributed to `closing`; segments at/after T land on `fresh`.
+        previousSessionId = closing.id
+        demarcationTimestamp = demarcateAt
+
+        // Reset segment counter for the fresh session — segments routed
+        // to the previous session use a per-target MAX lookup so they
+        // don't collide.
+        currentSequenceNumber = 0
+        segmentCount = 0
+
+        // Cancel any pending heal-marker — a demarcate is a clean session
+        // boundary, NOT a heal-in-place. The first segment of the new
+        // session does NOT carry a heal marker.
+        pendingMicHealMarker = nil
+        pendingSysHealMarker = nil
+        pendingMicHealedGap = nil
+        pendingSysHealedGap = nil
+
+        // Replace currentSession AFTER seeding routing so a concurrent
+        // segment-finalize sees consistent state.
+        currentSession = fresh
+
+        // Schedule a 10s grace task to clear demarcation routing if no
+        // post-T segment ever arrives (e.g., silence). Without this, a
+        // long-running pre-T finalize could route to the previous
+        // session forever.
+        demarcationClearTask?.cancel()
+        let grace: Double = 10.0
+        demarcationClearTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(grace))
+            } catch {
+                return
+            }
+            await self?.clearDemarcationRouting()
+        }
+
+        // Run dedup + prune on the just-closed session — same close-path
+        // sequencing as `stop()`, `pause()`, sleep-rollover (U6), and
+        // device-change-rollover (U7).
+        await dedupAndMaybePrune(sessionId: closing.id)
+
+        return fresh
+    }
+
+    /// Clear the demarcate routing state. Called on (a) the first finalized
+    /// segment with `startedAt >= demarcationTimestamp`, (b) the 10s grace
+    /// task firing, and (c) any session-close path so the next session
+    /// starts with a clean slate.
+    private func clearDemarcationRouting() {
+        previousSessionId = nil
+        demarcationTimestamp = nil
+        demarcationClearTask?.cancel()
+        demarcationClearTask = nil
+    }
+
+    /// Restore the engine into `.paused` from a persisted DB row. Used by
+    /// the daemon-start path (U4 → `recoverOrphansAndAutoStart`) when the
+    /// most-recent session row indicates a still-active pause that must
+    /// outlive the daemon restart (R-F privacy invariant).
+    ///
+    /// Differs from `pause()` in that it doesn't close a session (the
+    /// pause anchor is already closed), doesn't release a power assertion
+    /// (none was held), and doesn't run dedup/prune (already done at the
+    /// original pause time). It DOES re-arm the wall-clock timer for the
+    /// remaining wall-clock interval.
+    public func restorePausedState(
+        sessionId: UUID,
+        expiresAt: Date?,
+        indefinite: Bool
+    ) async {
+        // Cache the pause anchor so a manual resume can clear the row.
+        pausedSessionId = sessionId
+        pauseExpiresAt = expiresAt
+        isPauseIndefinite = indefinite
+
+        // Re-arm timer if the pause is timed and not yet expired.
+        if !indefinite, let deadline = expiresAt {
+            // If the deadline is already in the past, fire immediately —
+            // DispatchWallTime semantics handle this for us, but a sub-
+            // second drift between the daemon-start check and the timer
+            // arming is OK.
+            pauseTimer.arm(at: deadline) { [weak self] in
+                Task { [weak self] in
+                    try? await self?.resume()
+                }
+            }
+        }
+
+        await setStatus(.paused)
+        await emit(.pauseStateChanged(
+            paused: true,
+            indefinite: indefinite,
+            expiresAt: expiresAt
+        ))
+    }
+
+    /// Read-only snapshot of pause state for the dispatcher's `status`
+    /// response. Returns `(paused, indefinite, expiresAt)`.
+    public func pauseStateSnapshot() -> (paused: Bool, indefinite: Bool, expiresAt: Date?) {
+        return (status == .paused, isPauseIndefinite, pauseExpiresAt)
+    }
+
     // MARK: - Cleanup
 
     private func cleanup() async {
@@ -1766,6 +2332,14 @@ public actor RecordingEngine {
         for (_, task) in pendingDedupTriggers { task.cancel() }
         pendingDedupTriggers.removeAll()
         currentMicSegmentPeak = 0
+        // U10: cancel pause timer + clear demarcate routing on full cleanup.
+        // Use `peek` to avoid lazily instantiating the timer here.
+        pauseTimer.cancel()
+        pausedSessionId = nil
+        pauseExpiresAt = nil
+        isPauseIndefinite = false
+        pendingDemarcate = false
+        clearDemarcationRouting()
     }
 }
 

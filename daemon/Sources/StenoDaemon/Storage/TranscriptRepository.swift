@@ -255,4 +255,27 @@ public protocol TranscriptRepository: Sendable {
     /// fresh session opens. Disk-growth hedge per U12.
     @discardableResult
     func applyRetentionPolicy(retentionDays: Int) async throws -> Int
+
+    // MARK: - Pause state (U10)
+
+    /// Persist pause state on a session row. Anchors the pause to the
+    /// most-recent session (typically the just-closed session at the
+    /// moment of `pause`); the daemon-start path reads this row to
+    /// decide whether to re-enter the paused state across daemon
+    /// restart (R-F privacy invariant).
+    ///
+    /// - Parameters:
+    ///   - sessionId: The session whose pause columns are being written.
+    ///   - expiresAt: Wall-clock instant the auto-resume timer fires.
+    ///     `nil` for indefinite pauses.
+    ///   - indefinite: `true` when pause has no auto-resume. Mutually
+    ///     exclusive with a non-nil `expiresAt` in normal use; persisting
+    ///     both would be a caller bug. Implementations write whatever the
+    ///     caller provides.
+    func setPauseState(sessionId: UUID, expiresAt: Date?, indefinite: Bool) async throws
+
+    /// Clear pause state on a session row (set both columns to their
+    /// "not paused" sentinel: `pause_expires_at = NULL`,
+    /// `paused_indefinitely = 0`). Called on `resume`.
+    func clearPauseState(sessionId: UUID) async throws
 }
