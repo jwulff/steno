@@ -115,6 +115,98 @@ func TestActiveSessionNone(t *testing.T) {
 	}
 }
 
+// TestSegmentsForSessionExcludesDuplicates verifies the U9 default-filter:
+// 5 mic segments marked as duplicates of 5 sys segments → default query
+// returns 5 rows (the canonical sys segments), not 10.
+func TestSegmentsForSessionExcludesDuplicates(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	now := float64(time.Now().Unix())
+
+	rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-1', 'en_US', ?, 'active', ?)`, now, now)
+
+	// 5 sys segments at seq 1..5
+	for i := 1; i <= 5; i++ {
+		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-1', ?, ?, ?, ?, ?, 'systemAudio')`,
+			fmt.Sprintf("sys-%d", i),
+			fmt.Sprintf("sys text %d", i),
+			now+float64(i), now+float64(i)+1, i, now)
+	}
+	// 5 mic segments at seq 6..10, each duplicate_of the matching sys segment
+	for i := 1; i <= 5; i++ {
+		seq := i + 5
+		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source, duplicate_of, dedup_method)
+			VALUES (?, 'sess-1', ?, ?, ?, ?, ?, 'microphone', ?, 'exact')`,
+			fmt.Sprintf("mic-%d", i),
+			fmt.Sprintf("sys text %d", i),
+			now+float64(i), now+float64(i)+1, seq, now,
+			fmt.Sprintf("sys-%d", i))
+	}
+
+	store := &Store{db: rawDB}
+
+	segments, err := store.SegmentsForSession("sess-1", 100, 0)
+	if err != nil {
+		t.Fatalf("SegmentsForSession: %v", err)
+	}
+	if len(segments) != 5 {
+		t.Fatalf("default-filter: got %d segments, want 5", len(segments))
+	}
+	for _, seg := range segments {
+		if seg.Source != "systemAudio" {
+			t.Errorf("expected only systemAudio canonical rows, got source=%q id=%q",
+				seg.Source, seg.ID)
+		}
+	}
+
+	// SessionCounts also respects the filter
+	counts, err := store.SessionCounts("sess-1")
+	if err != nil {
+		t.Fatalf("SessionCounts: %v", err)
+	}
+	if counts.Segments != 5 {
+		t.Errorf("counts.Segments = %d, want 5 (default-filter)", counts.Segments)
+	}
+}
+
+// TestSegmentsForRangeExcludesDuplicates verifies the default-filter on
+// the range query that the TUI uses for topic-segment expansion.
+func TestSegmentsForRangeExcludesDuplicates(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	now := float64(time.Now().Unix())
+
+	rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-1', 'en_US', ?, 'active', ?)`, now, now)
+
+	// seq 1: sys (canonical)
+	rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+		VALUES ('sys-1', 'sess-1', 'canonical', ?, ?, 1, ?, 'systemAudio')`, now, now+1, now)
+	// seq 2: mic, duplicate of sys-1
+	rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source, duplicate_of)
+		VALUES ('mic-1', 'sess-1', 'canonical', ?, ?, 2, ?, 'microphone', 'sys-1')`, now, now+1, now)
+	// seq 3: mic (canonical, no duplicate_of)
+	rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+		VALUES ('mic-2', 'sess-1', 'unique', ?, ?, 3, ?, 'microphone')`, now+1, now+2, now+1)
+
+	store := &Store{db: rawDB}
+
+	segs, err := store.SegmentsForRange("sess-1", 1, 3)
+	if err != nil {
+		t.Fatalf("SegmentsForRange: %v", err)
+	}
+	if len(segs) != 2 {
+		t.Fatalf("got %d, want 2 (mic-1 should be filtered)", len(segs))
+	}
+	if segs[0].ID != "sys-1" || segs[1].ID != "mic-2" {
+		t.Errorf("segs = [%q, %q], want [sys-1, mic-2]", segs[0].ID, segs[1].ID)
+	}
+}
+
 func TestLatestSession(t *testing.T) {
 	rawDB := createTestDB(t)
 	defer rawDB.Close()

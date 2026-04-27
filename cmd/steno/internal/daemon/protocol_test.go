@@ -250,3 +250,124 @@ func TestBoolPtr(t *testing.T) {
 		t.Error("BoolPtr(false) should return pointer to false")
 	}
 }
+
+func TestPauseCmd(t *testing.T) {
+	cmd := PauseCmd(1800)
+	if cmd.Cmd != "pause" {
+		t.Errorf("cmd = %q, want pause", cmd.Cmd)
+	}
+	if cmd.AutoResumeSeconds == nil || *cmd.AutoResumeSeconds != 1800 {
+		t.Errorf("AutoResumeSeconds = %v, want 1800", cmd.AutoResumeSeconds)
+	}
+	if cmd.Indefinite != nil {
+		t.Errorf("Indefinite should be nil for finite pause")
+	}
+
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if raw["autoResumeSeconds"] != 1800.0 {
+		t.Errorf("autoResumeSeconds wire = %v, want 1800", raw["autoResumeSeconds"])
+	}
+	if _, ok := raw["indefinite"]; ok {
+		t.Errorf("indefinite should be omitted for finite pause")
+	}
+}
+
+func TestPauseIndefiniteCmd(t *testing.T) {
+	cmd := PauseIndefiniteCmd()
+	if cmd.Cmd != "pause" {
+		t.Errorf("cmd = %q, want pause", cmd.Cmd)
+	}
+	if cmd.Indefinite == nil || !*cmd.Indefinite {
+		t.Errorf("Indefinite = %v, want true", cmd.Indefinite)
+	}
+	if cmd.AutoResumeSeconds != nil {
+		t.Errorf("AutoResumeSeconds should be nil for indefinite")
+	}
+
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	if raw["indefinite"] != true {
+		t.Errorf("indefinite wire = %v, want true", raw["indefinite"])
+	}
+}
+
+func TestResumeCmd(t *testing.T) {
+	cmd := ResumeCmd()
+	if cmd.Cmd != "resume" {
+		t.Errorf("cmd = %q, want resume", cmd.Cmd)
+	}
+}
+
+func TestDemarcateCmd(t *testing.T) {
+	cmd := DemarcateCmd()
+	if cmd.Cmd != "demarcate" {
+		t.Errorf("cmd = %q, want demarcate", cmd.Cmd)
+	}
+}
+
+func TestResponsePauseFields(t *testing.T) {
+	j := `{"ok":true,"paused":true,"pausedIndefinitely":false,"pauseExpiresAt":1700000000.5}`
+
+	var resp Response
+	if err := json.Unmarshal([]byte(j), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Paused == nil || !*resp.Paused {
+		t.Errorf("Paused = %v, want true", resp.Paused)
+	}
+	if resp.PausedIndefinitely == nil || *resp.PausedIndefinitely {
+		t.Errorf("PausedIndefinitely = %v, want false", resp.PausedIndefinitely)
+	}
+	if resp.PauseExpiresAt == nil || *resp.PauseExpiresAt != 1700000000.5 {
+		t.Errorf("PauseExpiresAt = %v, want 1700000000.5", resp.PauseExpiresAt)
+	}
+}
+
+func TestEventPauseState(t *testing.T) {
+	j := `{"event":"pause_state","paused":true,"pausedIndefinitely":false,"pauseExpiresAt":1700000000}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if ev.Event != "pause_state" {
+		t.Errorf("event = %q, want pause_state", ev.Event)
+	}
+	if ev.Paused == nil || !*ev.Paused {
+		t.Errorf("Paused = %v, want true", ev.Paused)
+	}
+	if ev.PausedIndefinitely == nil || *ev.PausedIndefinitely {
+		t.Errorf("PausedIndefinitely = %v, want false", ev.PausedIndefinitely)
+	}
+	if ev.PauseExpiresAt == nil || *ev.PauseExpiresAt != 1700000000 {
+		t.Errorf("PauseExpiresAt = %v, want 1700000000", ev.PauseExpiresAt)
+	}
+}
+
+func TestEventPauseStateIndefinite(t *testing.T) {
+	j := `{"event":"pause_state","paused":true,"pausedIndefinitely":true}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if ev.PausedIndefinitely == nil || !*ev.PausedIndefinitely {
+		t.Errorf("PausedIndefinitely = %v, want true", ev.PausedIndefinitely)
+	}
+	if ev.PauseExpiresAt != nil {
+		t.Errorf("PauseExpiresAt should be nil for indefinite pause")
+	}
+}
