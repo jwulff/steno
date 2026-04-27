@@ -37,13 +37,20 @@ struct RecordingEngineTests {
             timeThreshold: 3600
         )
 
+        // U12 thresholds disabled — these baseline engine tests pre-date
+        // U12 and assert post-stop session presence (e.g. status ==
+        // .completed). The U12 prune-on-close behavior is covered by
+        // `EmptySessionPruneIntegrationTests`.
         let engine = RecordingEngine(
             repository: repo,
             permissionService: perms,
             summaryCoordinator: coordinator,
             audioSourceFactory: af,
             speechRecognizerFactory: rf,
-            delegate: del
+            delegate: del,
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
         )
 
         return (engine, repo, perms, summ, af, rf, del)
@@ -169,7 +176,10 @@ struct RecordingEngineTests {
             repository: repo,
             summarizer: summarizer,
             triggerCount: 1,  // Trigger on every segment
-            timeThreshold: 0
+            timeThreshold: 0,
+            // U12 gates topic extraction by min segment count; this test
+            // only saves a single segment so we must lower the gate.
+            minSegmentsForExtraction: 1
         )
 
         let engine = RecordingEngine(

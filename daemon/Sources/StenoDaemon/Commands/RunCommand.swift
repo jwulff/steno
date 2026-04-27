@@ -57,9 +57,17 @@ struct RunCommand: ParsableCommand {
                 let permissionService = SystemPermissionService()
                 let summarizer: SummarizationService = FoundationModelSummarizationService()
 
+                // Load settings once and reuse for every wiring step. A
+                // prior version read the file twice (once for the summary
+                // coordinator, once for the engine), opening a small window
+                // where a settings-file write between reads would leave the
+                // two consumers disagreeing. See PR #36 review (Copilot).
+                let settings = StenoSettings.load()
+
                 let summaryCoordinator = RollingSummaryCoordinator(
                     repository: repository,
-                    summarizer: summarizer
+                    summarizer: summarizer,
+                    minSegmentsForExtraction: settings.topicExtractionMinSegments
                 )
 
                 let audioSourceFactory = DefaultAudioSourceFactory()
@@ -68,7 +76,14 @@ struct RunCommand: ParsableCommand {
                 // 5. Create engine, broadcaster, dispatcher
                 let broadcaster = EventBroadcaster()
 
-                let settings = StenoSettings.load()
+                // U11: cross-source dedup coordinator runs as a background
+                // pass after each segment write, debounced per-session.
+                let dedupCoordinator = DedupCoordinator(
+                    repository: repository,
+                    overlapSeconds: settings.dedupOverlapSeconds,
+                    scoreThreshold: settings.dedupScoreThreshold,
+                    micPeakThresholdDb: settings.dedupMicPeakThresholdDb
+                )
 
                 let engine = RecordingEngine(
                     repository: repository,
@@ -78,7 +93,12 @@ struct RunCommand: ParsableCommand {
                     speechRecognizerFactory: speechRecognizerFactory,
                     delegate: broadcaster,
                     deviceUIDProvider: { defaultInputDeviceUID() },
-                    healThresholdSeconds: settings.healGapSeconds
+                    healThresholdSeconds: settings.healGapSeconds,
+                    dedupCoordinator: dedupCoordinator,
+                    dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
+                    emptySessionMinChars: settings.emptySessionMinChars,
+                    emptySessionMinDurationSeconds: settings.emptySessionMinDurationSeconds,
+                    retentionDays: settings.retentionDays
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)

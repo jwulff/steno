@@ -28,9 +28,26 @@ public actor RecordingEngine {
     private let repository: TranscriptRepository
     private let permissionService: PermissionService
     private let summaryCoordinator: RollingSummaryCoordinator
+    private let dedupCoordinator: DedupCoordinator?
+    private let dedupTriggerDebounce: Duration
     private let audioSourceFactory: AudioSourceFactory
     private let speechRecognizerFactory: SpeechRecognizerFactory
     private var delegate: (any RecordingEngineDelegate)?
+
+    // MARK: - U12 prune + retention thresholds
+
+    /// Min non-duplicate text length below which a just-closed session is
+    /// pruned. Resolved from `StenoSettings.emptySessionMinChars`.
+    private let emptySessionMinChars: Int
+
+    /// Min wall-clock duration below which a just-closed session is pruned.
+    /// Resolved from `StenoSettings.emptySessionMinDurationSeconds`.
+    private let emptySessionMinDurationSeconds: Double
+
+    /// Retention cap (days). Sessions older than this are cascade-deleted
+    /// at daemon-start (top of `recoverOrphansAndAutoStart`). 0 disables.
+    /// Resolved from `StenoSettings.retentionDays`.
+    private let retentionDays: Int
 
     /// Sleep used by the U5 restart-with-backoff loop. Production passes
     /// `Task.sleep(for:)`; tests inject a faster (or zero-duration)
@@ -77,6 +94,22 @@ public actor RecordingEngine {
     private var lastLevelEmitTime: Date = .distantPast
     private var pendingMicLevel: Float = 0
     private var pendingSystemLevel: Float = 0
+
+    /// Peak linear-PCM amplitude observed on the mic across the *current
+    /// in-flight segment*. Updated on every buffer (max), snapshotted +
+    /// converted to dBFS at segment-finalize time, then reset on the next
+    /// partial-text emission for that source. `0` represents silence /
+    /// no-buffers-seen-yet — the converter floors the dBFS at -90 to
+    /// avoid `log10(0) = -inf`.
+    private var currentMicSegmentPeak: Float = 0
+
+    // MARK: - U11 dedup-trigger debounce state
+
+    /// Per-session trailing-edge debounce tasks. A fresh `saveSegment`
+    /// trigger replaces the prior task with a new one that sleeps for the
+    /// configured debounce window and then runs `dedupCoordinator.runPass`.
+    /// Multiple segment writes within the window collapse to a single pass.
+    private var pendingDedupTriggers: [UUID: Task<Void, Never>] = [:]
 
     /// Minimum interval between audio level events (10Hz = 100ms).
     private let levelInterval: TimeInterval = 0.1
@@ -162,7 +195,12 @@ public actor RecordingEngine {
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
         healThresholdSeconds: Int = 30,
-        now: @Sendable @escaping () -> Date = { Date() }
+        now: @Sendable @escaping () -> Date = { Date() },
+        dedupCoordinator: DedupCoordinator? = nil,
+        dedupTriggerDebounce: Duration = .seconds(5),
+        emptySessionMinChars: Int = 20,
+        emptySessionMinDurationSeconds: Double = 3.0,
+        retentionDays: Int = 90
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -175,6 +213,11 @@ public actor RecordingEngine {
         self.deviceUIDProvider = deviceUIDProvider
         self.healThresholdSeconds = healThresholdSeconds
         self.nowProvider = now
+        self.dedupCoordinator = dedupCoordinator
+        self.dedupTriggerDebounce = dedupTriggerDebounce
+        self.emptySessionMinChars = emptySessionMinChars
+        self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
+        self.retentionDays = retentionDays
     }
 
     // MARK: - Public Commands
@@ -410,12 +453,38 @@ public actor RecordingEngine {
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
 
+        // Step 0: U12 retention guard. Cascade-delete sessions whose
+        // `endedAt` is older than the retention cap. Runs BEFORE the
+        // orphan sweep so old data is cleaned up first, leaving the
+        // sweep + prune to act only on recent rows. Best-effort: a
+        // failure here is logged transiently and we proceed — the
+        // sweep is more important to the daemon's health than the
+        // retention policy.
+        if retentionDays > 0 {
+            do {
+                let deleted = try await repository.applyRetentionPolicy(
+                    retentionDays: retentionDays
+                )
+                if deleted > 0 {
+                    await emit(.recovering(
+                        reason: "retention:purged=\(deleted) sessions older than \(retentionDays)d"
+                    ))
+                }
+            } catch {
+                await emit(.error(
+                    "Daemon-start: retention sweep failed: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
+
         // Step 1: orphan sweep first (independent of pause-state and
         // permissions). R9 — stranded `active` rows must be closed on
         // every daemon start. Failure here surfaces non-transiently and
         // ends the call without crashing or opening a fresh session.
+        let sweptOrphanIds: [UUID]
         do {
-            try await repository.sweepActiveOrphans()
+            sweptOrphanIds = try await repository.sweepActiveOrphans()
         } catch {
             await setStatus(.error)
             await emit(.error(
@@ -425,6 +494,15 @@ public actor RecordingEngine {
                 isTransient: false
             ))
             return nil
+        }
+
+        // U12: prune swept orphans that meet any empty-criterion. The
+        // repository check is conservative — orphans with real (post-dedup)
+        // text or duration are KEPT (R9 says crashed sessions are valuable
+        // even when interrupted). The pruner's behavior is identical to
+        // the close-path call: dedup pass first, then maybeDeleteIfEmpty.
+        for orphanId in sweptOrphanIds {
+            await dedupAndMaybePrune(sessionId: orphanId)
         }
 
         // Step 2: privacy-critical pause-state restore check (ties to U10).
@@ -542,9 +620,13 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
 
-        // End session
-        if let session = currentSession {
-            try? await repository.endSession(session.id)
+        // End session, then run dedup + empty-session prune (U12). The
+        // prune runs unconditionally on close; sessions that don't meet
+        // any empty-criterion remain. Future U10 pause/demarcate close
+        // paths use the same `dedupAndMaybePrune(sessionId:)` helper.
+        let closingSessionId = currentSession?.id
+        if let id = closingSessionId {
+            try? await repository.endSession(id)
         }
         currentSession = nil
         isSystemAudioEnabled = false
@@ -559,6 +641,21 @@ public actor RecordingEngine {
         micRestartEntryTime = nil
         sysRestartEntryTime = nil
         lastMicFormat = nil
+
+        // U11: cancel any in-flight dedup-trigger debounce tasks. Their
+        // sleeps will throw and the tasks return without invoking the
+        // coordinator — a clean teardown.
+        for (_, task) in pendingDedupTriggers { task.cancel() }
+        pendingDedupTriggers.removeAll()
+        currentMicSegmentPeak = 0
+
+        // U12: dedup + empty-session prune for the just-closed session.
+        // Done AFTER the cancel-all above so the synchronous pass we run
+        // here is the only one in-flight. The pruner is no-op on
+        // sessions that meet none of the empty criteria.
+        if let id = closingSessionId {
+            await dedupAndMaybePrune(sessionId: id)
+        }
 
         await setStatus(.idle)
         isStopping = false
@@ -633,6 +730,18 @@ public actor RecordingEngine {
                 pendingSysHealMarker = nil
             }
 
+            // U11: snapshot the per-segment mic peak (linear PCM) and
+            // convert to dBFS for the dedup audio-level guard. Reset to
+            // 0 so the next mic segment's metering starts fresh. Sys-side
+            // segments don't carry this — `mic_peak_db` is mic-only.
+            let micPeakDb: Double?
+            if result.source == .microphone {
+                micPeakDb = Self.linearPeakToDbFS(currentMicSegmentPeak)
+                currentMicSegmentPeak = 0
+            } else {
+                micPeakDb = nil
+            }
+
             let segment = StoredSegment(
                 sessionId: session.id,
                 text: result.text,
@@ -641,7 +750,8 @@ public actor RecordingEngine {
                 confidence: result.confidence,
                 sequenceNumber: currentSequenceNumber,
                 source: result.source,
-                healMarker: healMarker
+                healMarker: healMarker,
+                micPeakDb: micPeakDb
             )
 
             // Persist
@@ -653,6 +763,12 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
+
+            // U11: schedule a debounced dedup pass for this session. The
+            // pass runs in a detached task so the segment-save hot path
+            // is not blocked. Multiple triggers within the debounce
+            // window collapse to a single pass per session.
+            scheduleDedupTrigger(sessionId: session.id)
 
             // U5: a finalized segment counts toward the per-source
             // backoff reset (segment-finalized gate). The wall-clock
@@ -1144,6 +1260,10 @@ public actor RecordingEngine {
 
     private func updateMicLevel(_ peak: Float) {
         pendingMicLevel = max(pendingMicLevel, peak)
+        // U11: track the peak across the *current in-flight mic segment*
+        // for the dedup audio-level guard. Snapshotted + reset on segment
+        // finalize.
+        currentMicSegmentPeak = max(currentMicSegmentPeak, peak)
     }
 
     private func updateSystemLevel(_ peak: Float) {
@@ -1177,6 +1297,112 @@ public actor RecordingEngine {
             if sample > peak { peak = sample }
         }
         return peak
+    }
+
+    /// Convert a linear-PCM peak (0.0–1.0) to dBFS for the U11 dedup
+    /// audio-level guard. Floors at -90 dBFS for silence to avoid
+    /// `log10(0) = -inf`. Anything at or above 1.0 (clipping) reports as
+    /// 0 dBFS.
+    static func linearPeakToDbFS(_ peak: Float) -> Double {
+        let p = Double(peak)
+        guard p > 0 else { return -90.0 }
+        let db = 20.0 * log10(min(p, 1.0))
+        return max(-90.0, db)
+    }
+
+    // MARK: - U11 Dedup-Trigger Debounce
+
+    /// Schedule (or reset) the trailing-edge debounce timer for a session's
+    /// dedup pass. A new trigger replaces any prior pending task — the new
+    /// one sleeps for `dedupTriggerDebounce`, then runs the pass. If the
+    /// engine has no `dedupCoordinator` (test default), this is a no-op.
+    private func scheduleDedupTrigger(sessionId: UUID) {
+        guard let coordinator = dedupCoordinator else { return }
+        // Cancel the prior pending task — its sleep will throw and the
+        // task returns without invoking the coordinator.
+        pendingDedupTriggers[sessionId]?.cancel()
+        let debounce = dedupTriggerDebounce
+        let task: Task<Void, Never> = Task { [weak self] in
+            do {
+                try await Task.sleep(for: debounce)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await self.clearPendingDedupTrigger(sessionId: sessionId)
+            // The coordinator owns its own reentrance — multiple cross-session
+            // passes can run in parallel; same-session collapse is the
+            // coordinator's responsibility.
+            await coordinator.runPass(sessionId: sessionId)
+        }
+        pendingDedupTriggers[sessionId] = task
+    }
+
+    /// Clear the entry for a session's pending trigger. Called by the
+    /// debounce task itself after it fires (so a fresh trigger arriving
+    /// AFTER the pass starts schedules a new task rather than racing).
+    private func clearPendingDedupTrigger(sessionId: UUID) {
+        pendingDedupTriggers[sessionId] = nil
+    }
+
+    // MARK: - U12 Empty-Session Prune
+
+    /// Run a synchronous dedup pass for the just-closed session, then ask
+    /// the repository to prune it if it meets any empty-session criterion.
+    /// Sequencing matters: dedup-then-prune ensures the pruner's
+    /// "non-duplicate text length" check sees the post-dedup truth (mic
+    /// segments newly marked as duplicates of sys segments don't count
+    /// toward the threshold). Failures in either step are logged via the
+    /// `.error` event channel as transient — pruning is best-effort.
+    ///
+    /// Cancels any pending debounced dedup trigger for this session: that
+    /// debounced pass would otherwise run AFTER the synchronous pass +
+    /// prune, possibly against a deleted session. Cancelling here is the
+    /// cleanest way to avoid that wasted pass and the matching FK-check
+    /// inside the dedup repo calls.
+    ///
+    /// Called by every session-close path: `stop()`, sleep-rollover (U6),
+    /// device-change-rollover (U7), the daemon-start orphan sweep
+    /// (U4 → `recoverOrphansAndAutoStart`), and the future U10 pause /
+    /// resume / demarcate paths (those callers wire it themselves).
+    private func dedupAndMaybePrune(sessionId: UUID) async {
+        // 1. Cancel any in-flight debounced trigger for this session.
+        pendingDedupTriggers[sessionId]?.cancel()
+        pendingDedupTriggers[sessionId] = nil
+
+        // 2. Synchronous dedup pass first (so the pruner's non-dup-text
+        //    check is meaningful). The coordinator owns its own
+        //    reentrance — if a pass is already running it returns
+        //    `.empty` and we move on. Borderline by design: a concurrent
+        //    pass might still be writing duplicates as we read counts;
+        //    the pruner's threshold is conservative enough that this
+        //    doesn't change outcomes in practice.
+        if let coordinator = dedupCoordinator {
+            _ = await coordinator.runPass(sessionId: sessionId)
+        }
+
+        // Pruner is "disabled" sentinel: both thresholds at 0 means tests
+        // (or a config that wants the pruner off) skip the delete entirely.
+        // The "non_dup_count == 0" criterion would otherwise still trigger
+        // even with `minChars: 0` because zero-segment sessions are always
+        // empty by count.
+        guard emptySessionMinChars > 0 || emptySessionMinDurationSeconds > 0 else {
+            return
+        }
+
+        // 3. Pruner. Tolerates already-deleted sessions (returns false).
+        do {
+            _ = try await repository.maybeDeleteIfEmpty(
+                sessionId: sessionId,
+                minChars: emptySessionMinChars,
+                minDurationSeconds: emptySessionMinDurationSeconds
+            )
+        } catch {
+            await emit(.error(
+                "Empty-session pruner failed for session \(sessionId): \(error.localizedDescription)",
+                isTransient: true
+            ))
+        }
     }
 
     // MARK: - U6 Sleep/Wake Handlers
@@ -1310,8 +1536,16 @@ public actor RecordingEngine {
             // openFreshSession) since the active session is effectively
             // an "orphan" of the pre-sleep capture.
             do {
-                try await repository.sweepActiveOrphans()
+                let sweptIds = try await repository.sweepActiveOrphans()
                 let fresh = try await repository.openFreshSession(locale: currentLocale)
+                // U12: prune the just-closed session(s) if empty. Done
+                // AFTER opening the fresh session so the new session is
+                // already in place when the prune commits. The new
+                // session is `active` and therefore not eligible for the
+                // pruner's defensive guard.
+                for sweptId in sweptIds {
+                    await dedupAndMaybePrune(sessionId: sweptId)
+                }
                 _ = try await bringUpPipelines(
                     session: fresh,
                     locale: currentLocale,
@@ -1457,7 +1691,7 @@ public actor RecordingEngine {
             // `openFreshSession` creates a new active row.
             guard currentSession != nil else { return }
             do {
-                try await repository.sweepActiveOrphans()
+                let sweptIds = try await repository.sweepActiveOrphans()
                 let fresh = try await repository.openFreshSession(locale: currentLocale)
                 currentSession = fresh
                 // Reset segment counter for the fresh session.
@@ -1467,6 +1701,12 @@ public actor RecordingEngine {
                 // does not carry one (per HealRule contract).
                 pendingMicHealMarker = nil
                 pendingMicHealedGap = nil
+                // U12: prune the just-closed session(s) if empty. Done
+                // AFTER currentSession is replaced so a concurrent path
+                // referencing currentSession sees the fresh row.
+                for sweptId in sweptIds {
+                    await dedupAndMaybePrune(sessionId: sweptId)
+                }
                 // Surface the rollover to the TUI.
                 await emit(.healed(gapSeconds: gap))
             } catch {
@@ -1523,6 +1763,9 @@ public actor RecordingEngine {
         sysRestartEntryTime = nil
         gapStartedAt = nil
         lastMicFormat = nil
+        for (_, task) in pendingDedupTriggers { task.cancel() }
+        pendingDedupTriggers.removeAll()
+        currentMicSegmentPeak = 0
     }
 }
 

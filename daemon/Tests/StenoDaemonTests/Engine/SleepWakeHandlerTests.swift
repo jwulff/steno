@@ -102,6 +102,11 @@ struct SleepWakeHandlerTests {
             timeThreshold: 3600
         )
 
+        // U12 thresholds disabled by default in this suite — these tests
+        // pre-date U12 and assert post-rollover sessions remain visible
+        // (interrupted) for inspection. The U12 integration tests in
+        // `EmptySessionPruneIntegrationTests.swift` cover the prune
+        // behavior on rollover paths separately.
         let engine = RecordingEngine(
             repository: actualRepo,
             permissionService: perms,
@@ -113,7 +118,10 @@ struct SleepWakeHandlerTests {
             powerAssertion: powerAssertion,
             deviceUIDProvider: deviceUIDProvider,
             healThresholdSeconds: 30,
-            now: { Date() }
+            now: { Date() },
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
         )
         return (engine, actualRepo, af, recognizerFactory, del, powerAssertion)
     }
@@ -372,7 +380,12 @@ struct SleepWakeHandlerTests {
             powerAssertion: power,
             deviceUIDProvider: { "BuiltInMic" },
             healThresholdSeconds: 30,
-            now: clock
+            now: clock,
+            // U12 disabled — this test asserts the rollover keeps the
+            // original session as `interrupted` for inspection.
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
         )
 
         let originalSession = try await engine.start()

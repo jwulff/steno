@@ -40,6 +40,21 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// segment delivered after a successful restart (U5).
     public let healMarker: String?
 
+    /// Set by `DedupCoordinator` (U11) when this segment is a duplicate of
+    /// another segment in the same session. `nil` means canonical / not yet
+    /// evaluated. Surfaces the U2-schema `segments.duplicate_of` column.
+    public let duplicateOf: UUID?
+
+    /// One of `.exact / .normalized / .fuzzy` when `duplicateOf` is set;
+    /// `nil` otherwise. Surfaces the U2-schema `segments.dedup_method` column.
+    public let dedupMethod: DedupMethod?
+
+    /// Peak dBFS observed during a mic segment's lifetime. Used by U11's
+    /// audio-level guard to avoid marking actively-spoken mic content as
+    /// duplicate. `nil` for non-mic segments and for rows persisted before
+    /// per-segment metering landed.
+    public let micPeakDb: Double?
+
     public init(
         id: UUID = UUID(),
         sessionId: UUID,
@@ -50,7 +65,10 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         sequenceNumber: Int,
         createdAt: Date = Date(),
         source: AudioSourceType = .microphone,
-        healMarker: String? = nil
+        healMarker: String? = nil,
+        duplicateOf: UUID? = nil,
+        dedupMethod: DedupMethod? = nil,
+        micPeakDb: Double? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -62,6 +80,9 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.createdAt = createdAt
         self.source = source
         self.healMarker = healMarker
+        self.duplicateOf = duplicateOf
+        self.dedupMethod = dedupMethod
+        self.micPeakDb = micPeakDb
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.
