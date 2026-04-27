@@ -57,9 +57,11 @@ struct RunCommand: ParsableCommand {
                 let permissionService = SystemPermissionService()
                 let summarizer: SummarizationService = FoundationModelSummarizationService()
 
+                let settingsForSummary = StenoSettings.load()
                 let summaryCoordinator = RollingSummaryCoordinator(
                     repository: repository,
-                    summarizer: summarizer
+                    summarizer: summarizer,
+                    minSegmentsForExtraction: settingsForSummary.topicExtractionMinSegments
                 )
 
                 let audioSourceFactory = DefaultAudioSourceFactory()
@@ -89,7 +91,10 @@ struct RunCommand: ParsableCommand {
                     deviceUIDProvider: { defaultInputDeviceUID() },
                     healThresholdSeconds: settings.healGapSeconds,
                     dedupCoordinator: dedupCoordinator,
-                    dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds)
+                    dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
+                    emptySessionMinChars: settings.emptySessionMinChars,
+                    emptySessionMinDurationSeconds: settings.emptySessionMinDurationSeconds,
+                    retentionDays: settings.retentionDays
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)

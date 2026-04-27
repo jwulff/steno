@@ -81,8 +81,19 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         return session
     }
 
-    public func sweepActiveOrphans() async throws {
+    @discardableResult
+    public func sweepActiveOrphans() async throws -> [UUID] {
         try await dbQueue.write { db in
+            // Snapshot the active-session IDs BEFORE the UPDATE so we can
+            // return them to the caller. Emitted in a single transaction
+            // alongside the UPDATE so a concurrent writer can't race a
+            // session into `active` between the SELECT and the UPDATE.
+            let ids = try String.fetchAll(
+                db,
+                sql: "SELECT id FROM sessions WHERE status = ?",
+                arguments: [Session.Status.active.rawValue]
+            )
+
             try db.execute(sql: """
                 UPDATE sessions
                 SET status = ?,
@@ -95,6 +106,8 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
                 Session.Status.interrupted.rawValue,
                 Session.Status.active.rawValue
             ])
+
+            return ids.compactMap { UUID(uuidString: $0) }
         }
     }
 
@@ -331,8 +344,22 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
 
     // MARK: - Summaries
 
+    /// Defensive write — pre-checks parent-session existence inside the
+    /// same write transaction (U12). The `RollingSummaryCoordinator` may
+    /// be mid-LLM-call (45s timeout) when the empty-session pruner deletes
+    /// a session; without the guard, the FK cascade would have already
+    /// orphaned this insert, and SQLite would raise a CONSTRAINT_FOREIGNKEY
+    /// error. The guard is the explicit-pre-check variant rather than
+    /// "swallow the FK error" so any OTHER constraint failure still
+    /// propagates as a genuine bug.
     public func saveSummary(_ summary: Summary) async throws {
         try await dbQueue.write { db in
+            let exists = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?)",
+                arguments: [summary.sessionId.uuidString]
+            ) ?? false
+            guard exists else { return }
             try SummaryRecord.from(summary).insert(db)
         }
     }
@@ -359,8 +386,19 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
 
     // MARK: - Topics
 
+    /// Defensive write — pre-checks parent-session existence inside the
+    /// same write transaction (U12). Same shape as `saveSummary` above:
+    /// the empty-session pruner may have deleted the session between the
+    /// LLM call's start and this insert. Pre-check is explicit so a
+    /// genuine constraint violation still propagates.
     public func saveTopic(_ topic: Topic) async throws {
         try await dbQueue.write { db in
+            let exists = try Bool.fetchOne(
+                db,
+                sql: "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?)",
+                arguments: [topic.sessionId.uuidString]
+            ) ?? false
+            guard exists else { return }
             try TopicRecord.from(topic).insert(db)
         }
     }
@@ -372,6 +410,123 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
                 .order(Column("segmentRangeStart").asc)
                 .fetchAll(db)
                 .compactMap { $0.toDomain() }
+        }
+    }
+
+    // MARK: - U12 Empty-Session Prune + Retention
+
+    public func maybeDeleteIfEmpty(
+        sessionId: UUID,
+        minChars: Int,
+        minDurationSeconds: Double
+    ) async throws -> Bool {
+        try await dbQueue.write { db in
+            // Single-transaction read-decide-delete. Any concurrent writer
+            // is serialized by GRDB's DatabaseQueue, so the counts and
+            // duration we read are the same the DELETE acts on.
+            struct Probe: FetchableRecord {
+                let status: String
+                let startedAt: Double
+                let endedAt: Double?
+                let nonDupCount: Int
+                let nonDupChars: Int
+
+                init(row: Row) {
+                    self.status = row["status"]
+                    self.startedAt = row["startedAt"]
+                    self.endedAt = row["endedAt"]
+                    self.nonDupCount = row["non_dup_count"]
+                    self.nonDupChars = row["non_dup_chars"]
+                }
+            }
+
+            guard let probe = try Probe.fetchOne(
+                db,
+                sql: """
+                    SELECT
+                        s.status,
+                        s.startedAt,
+                        s.endedAt,
+                        (SELECT COUNT(*) FROM segments
+                         WHERE sessionId = s.id AND duplicate_of IS NULL)
+                            AS non_dup_count,
+                        (SELECT COALESCE(SUM(LENGTH(text)), 0) FROM segments
+                         WHERE sessionId = s.id AND duplicate_of IS NULL)
+                            AS non_dup_chars
+                    FROM sessions s
+                    WHERE s.id = ?
+                """,
+                arguments: [sessionId.uuidString]
+            ) else {
+                // Session not found — nothing to prune.
+                return false
+            }
+
+            // Defensive: do NOT prune an active session, ever. Caller bug.
+            if probe.status == Session.Status.active.rawValue {
+                return false
+            }
+            guard let endedAt = probe.endedAt else {
+                // status is non-active but endedAt is NULL — pathological;
+                // refuse to prune to avoid masking the inconsistency.
+                return false
+            }
+
+            let duration = endedAt - probe.startedAt
+            let trips = probe.nonDupCount == 0
+                || probe.nonDupChars < minChars
+                || duration < minDurationSeconds
+
+            guard trips else { return false }
+
+            // Cascade-delete via FK. Verify by re-counting segments.
+            try db.execute(
+                sql: "DELETE FROM sessions WHERE id = ?",
+                arguments: [sessionId.uuidString]
+            )
+
+            // Defensive cascade verification — if FK cascade silently
+            // failed (e.g. PRAGMA foreign_keys was off), the segments
+            // would be orphaned. Treat as a hard error since the caller
+            // expects a clean delete.
+            let leftoverSegs = try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM segments WHERE sessionId = ?",
+                arguments: [sessionId.uuidString]
+            ) ?? 0
+            if leftoverSegs > 0 {
+                throw DatabaseError(
+                    message: "FK cascade failed: \(leftoverSegs) segments orphaned for session \(sessionId)"
+                )
+            }
+            return true
+        }
+    }
+
+    @discardableResult
+    public func applyRetentionPolicy(retentionDays: Int) async throws -> Int {
+        guard retentionDays > 0 else { return 0 }
+        let cutoff = Date().timeIntervalSince1970 - Double(retentionDays) * 86_400.0
+        return try await dbQueue.write { db in
+            // SELECT first so we can return the count of deleted rows.
+            // FK cascade handles segments/summaries/topics.
+            let ids = try String.fetchAll(
+                db,
+                sql: """
+                    SELECT id FROM sessions
+                    WHERE endedAt IS NOT NULL AND endedAt < ?
+                """,
+                arguments: [cutoff]
+            )
+            guard !ids.isEmpty else { return 0 }
+            try db.execute(
+                sql: """
+                    DELETE FROM sessions
+                    WHERE endedAt IS NOT NULL AND endedAt < ?
+                """,
+                arguments: [cutoff]
+            )
+            return ids.count
         }
     }
 }

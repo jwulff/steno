@@ -37,7 +37,13 @@ public protocol TranscriptRepository: Sendable {
     ///
     /// Uses the same `endedAt = COALESCE(MAX(segments.endedAt), startedAt)`
     /// rule as `recoverOrphansAndOpenFresh`.
-    func sweepActiveOrphans() async throws
+    ///
+    /// Returns the IDs of the sessions that were just swept from `active`
+    /// to `interrupted`. Callers (U6 wake-rollover, U7 device-change-rollover,
+    /// U4 daemon-start) feed these IDs into `maybeDeleteIfEmpty` so empty
+    /// orphans are pruned at the same close path U10/U12 already covers.
+    @discardableResult
+    func sweepActiveOrphans() async throws -> [UUID]
 
     /// Open a fresh `active` session in a single write, without sweeping
     /// orphans first. Used by U4's daemon-start path AFTER a separate
@@ -180,7 +186,12 @@ public protocol TranscriptRepository: Sendable {
 
     // MARK: - Topics
 
-    /// Save a topic.
+    /// Save a topic. Defensive: if the parent session has been pruned
+    /// (deleted) between the LLM call's start and this write, the insert
+    /// is silently skipped and no FK constraint violation is raised. See
+    /// U12 — `RollingSummaryCoordinator` runs LLM calls asynchronously
+    /// against a session that may have been deleted by the empty-session
+    /// pruner mid-call.
     ///
     /// - Parameter topic: The topic to save.
     func saveTopic(_ topic: Topic) async throws
@@ -190,4 +201,44 @@ public protocol TranscriptRepository: Sendable {
     /// - Parameter sessionId: The session ID.
     /// - Returns: Array of topics in order.
     func topics(for sessionId: UUID) async throws -> [Topic]
+
+    // MARK: - U12 Empty-Session Prune + Retention
+
+    /// Delete `sessionId` if it meets any "empty" criterion. Safe to call
+    /// on any closed session (`status != 'active'`). Operates as a single
+    /// transaction: read counts/duration → decide → delete (or no-op).
+    /// Returns `true` iff the session was deleted.
+    ///
+    /// Empty criteria (any one trips deletion):
+    /// - Zero non-duplicate segments (`COUNT(*) WHERE duplicate_of IS NULL == 0`)
+    /// - Sum of non-duplicate segment text length `< minChars` (default 20)
+    /// - Wall-clock duration (`endedAt - startedAt`) `< minDurationSeconds` (default 3.0)
+    ///
+    /// Refuses to operate on a session whose `status == 'active'` or whose
+    /// `endedAt IS NULL` — defensive: pruning a session that's still
+    /// recording would be a bug. Returns `false` in those cases.
+    ///
+    /// Cascade-deletes segments, summaries, and topics via the existing
+    /// `ON DELETE CASCADE` foreign keys — a single `DELETE FROM sessions
+    /// WHERE id = ?` is sufficient.
+    ///
+    /// Sequencing: callers should run `DedupCoordinator.runPass(sessionId:)`
+    /// FIRST so the "non-duplicate text length" check sees the post-dedup
+    /// truth.
+    func maybeDeleteIfEmpty(
+        sessionId: UUID,
+        minChars: Int,
+        minDurationSeconds: Double
+    ) async throws -> Bool
+
+    /// Delete every session whose `endedAt` is older than
+    /// `now - retentionDays * 86400`. Cascade-deletes segments, summaries,
+    /// and topics via FK. Sessions with `endedAt IS NULL` (still active)
+    /// are never touched. Returns the number of sessions deleted.
+    ///
+    /// Called at daemon start (top of `recoverOrphansAndAutoStart`)
+    /// before the orphan sweep so old data is cleaned up before the
+    /// fresh session opens. Disk-growth hedge per U12.
+    @discardableResult
+    func applyRetentionPolicy(retentionDays: Int) async throws -> Int
 }

@@ -155,7 +155,9 @@ struct RollingSummaryCoordinatorTests {
         let coordinator = RollingSummaryCoordinator(
             repository: repo,
             summarizer: summarizer,
-            triggerCount: 2
+            triggerCount: 2,
+            // Lower the U12 extraction gate so a 2-segment batch fires.
+            minSegmentsForExtraction: 1
         )
 
         let session = try await repo.createSession(locale: Locale(identifier: "en_US"))

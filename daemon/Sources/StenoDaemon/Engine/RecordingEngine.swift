@@ -34,6 +34,21 @@ public actor RecordingEngine {
     private let speechRecognizerFactory: SpeechRecognizerFactory
     private var delegate: (any RecordingEngineDelegate)?
 
+    // MARK: - U12 prune + retention thresholds
+
+    /// Min non-duplicate text length below which a just-closed session is
+    /// pruned. Resolved from `StenoSettings.emptySessionMinChars`.
+    private let emptySessionMinChars: Int
+
+    /// Min wall-clock duration below which a just-closed session is pruned.
+    /// Resolved from `StenoSettings.emptySessionMinDurationSeconds`.
+    private let emptySessionMinDurationSeconds: Double
+
+    /// Retention cap (days). Sessions older than this are cascade-deleted
+    /// at daemon-start (top of `recoverOrphansAndAutoStart`). 0 disables.
+    /// Resolved from `StenoSettings.retentionDays`.
+    private let retentionDays: Int
+
     /// Sleep used by the U5 restart-with-backoff loop. Production passes
     /// `Task.sleep(for:)`; tests inject a faster (or zero-duration)
     /// closure so the curve is observable without paying real wall-clock.
@@ -182,7 +197,10 @@ public actor RecordingEngine {
         healThresholdSeconds: Int = 30,
         now: @Sendable @escaping () -> Date = { Date() },
         dedupCoordinator: DedupCoordinator? = nil,
-        dedupTriggerDebounce: Duration = .seconds(5)
+        dedupTriggerDebounce: Duration = .seconds(5),
+        emptySessionMinChars: Int = 20,
+        emptySessionMinDurationSeconds: Double = 3.0,
+        retentionDays: Int = 90
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -197,6 +215,9 @@ public actor RecordingEngine {
         self.nowProvider = now
         self.dedupCoordinator = dedupCoordinator
         self.dedupTriggerDebounce = dedupTriggerDebounce
+        self.emptySessionMinChars = emptySessionMinChars
+        self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
+        self.retentionDays = retentionDays
     }
 
     // MARK: - Public Commands
@@ -432,12 +453,38 @@ public actor RecordingEngine {
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
 
+        // Step 0: U12 retention guard. Cascade-delete sessions whose
+        // `endedAt` is older than the retention cap. Runs BEFORE the
+        // orphan sweep so old data is cleaned up first, leaving the
+        // sweep + prune to act only on recent rows. Best-effort: a
+        // failure here is logged transiently and we proceed — the
+        // sweep is more important to the daemon's health than the
+        // retention policy.
+        if retentionDays > 0 {
+            do {
+                let deleted = try await repository.applyRetentionPolicy(
+                    retentionDays: retentionDays
+                )
+                if deleted > 0 {
+                    await emit(.recovering(
+                        reason: "retention:purged=\(deleted) sessions older than \(retentionDays)d"
+                    ))
+                }
+            } catch {
+                await emit(.error(
+                    "Daemon-start: retention sweep failed: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
+
         // Step 1: orphan sweep first (independent of pause-state and
         // permissions). R9 — stranded `active` rows must be closed on
         // every daemon start. Failure here surfaces non-transiently and
         // ends the call without crashing or opening a fresh session.
+        let sweptOrphanIds: [UUID]
         do {
-            try await repository.sweepActiveOrphans()
+            sweptOrphanIds = try await repository.sweepActiveOrphans()
         } catch {
             await setStatus(.error)
             await emit(.error(
@@ -447,6 +494,15 @@ public actor RecordingEngine {
                 isTransient: false
             ))
             return nil
+        }
+
+        // U12: prune swept orphans that meet any empty-criterion. The
+        // repository check is conservative — orphans with real (post-dedup)
+        // text or duration are KEPT (R9 says crashed sessions are valuable
+        // even when interrupted). The pruner's behavior is identical to
+        // the close-path call: dedup pass first, then maybeDeleteIfEmpty.
+        for orphanId in sweptOrphanIds {
+            await dedupAndMaybePrune(sessionId: orphanId)
         }
 
         // Step 2: privacy-critical pause-state restore check (ties to U10).
@@ -564,9 +620,13 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
 
-        // End session
-        if let session = currentSession {
-            try? await repository.endSession(session.id)
+        // End session, then run dedup + empty-session prune (U12). The
+        // prune runs unconditionally on close; sessions that don't meet
+        // any empty-criterion remain. Future U10 pause/demarcate close
+        // paths use the same `dedupAndMaybePrune(sessionId:)` helper.
+        let closingSessionId = currentSession?.id
+        if let id = closingSessionId {
+            try? await repository.endSession(id)
         }
         currentSession = nil
         isSystemAudioEnabled = false
@@ -588,6 +648,14 @@ public actor RecordingEngine {
         for (_, task) in pendingDedupTriggers { task.cancel() }
         pendingDedupTriggers.removeAll()
         currentMicSegmentPeak = 0
+
+        // U12: dedup + empty-session prune for the just-closed session.
+        // Done AFTER the cancel-all above so the synchronous pass we run
+        // here is the only one in-flight. The pruner is no-op on
+        // sessions that meet none of the empty criteria.
+        if let id = closingSessionId {
+            await dedupAndMaybePrune(sessionId: id)
+        }
 
         await setStatus(.idle)
         isStopping = false
@@ -1277,6 +1345,66 @@ public actor RecordingEngine {
         pendingDedupTriggers[sessionId] = nil
     }
 
+    // MARK: - U12 Empty-Session Prune
+
+    /// Run a synchronous dedup pass for the just-closed session, then ask
+    /// the repository to prune it if it meets any empty-session criterion.
+    /// Sequencing matters: dedup-then-prune ensures the pruner's
+    /// "non-duplicate text length" check sees the post-dedup truth (mic
+    /// segments newly marked as duplicates of sys segments don't count
+    /// toward the threshold). Failures in either step are logged via the
+    /// `.error` event channel as transient — pruning is best-effort.
+    ///
+    /// Cancels any pending debounced dedup trigger for this session: that
+    /// debounced pass would otherwise run AFTER the synchronous pass +
+    /// prune, possibly against a deleted session. Cancelling here is the
+    /// cleanest way to avoid that wasted pass and the matching FK-check
+    /// inside the dedup repo calls.
+    ///
+    /// Called by every session-close path: `stop()`, sleep-rollover (U6),
+    /// device-change-rollover (U7), the daemon-start orphan sweep
+    /// (U4 → `recoverOrphansAndAutoStart`), and the future U10 pause /
+    /// resume / demarcate paths (those callers wire it themselves).
+    private func dedupAndMaybePrune(sessionId: UUID) async {
+        // 1. Cancel any in-flight debounced trigger for this session.
+        pendingDedupTriggers[sessionId]?.cancel()
+        pendingDedupTriggers[sessionId] = nil
+
+        // 2. Synchronous dedup pass first (so the pruner's non-dup-text
+        //    check is meaningful). The coordinator owns its own
+        //    reentrance — if a pass is already running it returns
+        //    `.empty` and we move on. Borderline by design: a concurrent
+        //    pass might still be writing duplicates as we read counts;
+        //    the pruner's threshold is conservative enough that this
+        //    doesn't change outcomes in practice.
+        if let coordinator = dedupCoordinator {
+            _ = await coordinator.runPass(sessionId: sessionId)
+        }
+
+        // Pruner is "disabled" sentinel: both thresholds at 0 means tests
+        // (or a config that wants the pruner off) skip the delete entirely.
+        // The "non_dup_count == 0" criterion would otherwise still trigger
+        // even with `minChars: 0` because zero-segment sessions are always
+        // empty by count.
+        guard emptySessionMinChars > 0 || emptySessionMinDurationSeconds > 0 else {
+            return
+        }
+
+        // 3. Pruner. Tolerates already-deleted sessions (returns false).
+        do {
+            _ = try await repository.maybeDeleteIfEmpty(
+                sessionId: sessionId,
+                minChars: emptySessionMinChars,
+                minDurationSeconds: emptySessionMinDurationSeconds
+            )
+        } catch {
+            await emit(.error(
+                "Empty-session pruner failed for session \(sessionId): \(error.localizedDescription)",
+                isTransient: true
+            ))
+        }
+    }
+
     // MARK: - U6 Sleep/Wake Handlers
 
     /// Called on `kIOMessageSystemWillSleep` (wired via
@@ -1408,8 +1536,16 @@ public actor RecordingEngine {
             // openFreshSession) since the active session is effectively
             // an "orphan" of the pre-sleep capture.
             do {
-                try await repository.sweepActiveOrphans()
+                let sweptIds = try await repository.sweepActiveOrphans()
                 let fresh = try await repository.openFreshSession(locale: currentLocale)
+                // U12: prune the just-closed session(s) if empty. Done
+                // AFTER opening the fresh session so the new session is
+                // already in place when the prune commits. The new
+                // session is `active` and therefore not eligible for the
+                // pruner's defensive guard.
+                for sweptId in sweptIds {
+                    await dedupAndMaybePrune(sessionId: sweptId)
+                }
                 _ = try await bringUpPipelines(
                     session: fresh,
                     locale: currentLocale,
@@ -1555,7 +1691,7 @@ public actor RecordingEngine {
             // `openFreshSession` creates a new active row.
             guard currentSession != nil else { return }
             do {
-                try await repository.sweepActiveOrphans()
+                let sweptIds = try await repository.sweepActiveOrphans()
                 let fresh = try await repository.openFreshSession(locale: currentLocale)
                 currentSession = fresh
                 // Reset segment counter for the fresh session.
@@ -1565,6 +1701,12 @@ public actor RecordingEngine {
                 // does not carry one (per HealRule contract).
                 pendingMicHealMarker = nil
                 pendingMicHealedGap = nil
+                // U12: prune the just-closed session(s) if empty. Done
+                // AFTER currentSession is replaced so a concurrent path
+                // referencing currentSession sees the fresh row.
+                for sweptId in sweptIds {
+                    await dedupAndMaybePrune(sessionId: sweptId)
+                }
                 // Surface the rollover to the TUI.
                 await emit(.healed(gapSeconds: gap))
             } catch {

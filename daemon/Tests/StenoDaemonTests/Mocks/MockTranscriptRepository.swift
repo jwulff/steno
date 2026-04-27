@@ -56,15 +56,19 @@ actor MockTranscriptRepository: TranscriptRepository {
         return session
     }
 
-    func sweepActiveOrphans() async throws {
+    @discardableResult
+    func sweepActiveOrphans() async throws -> [UUID] {
         if let error = sweepActiveOrphansError { throw error }
+        var sweptIds: [UUID] = []
         for (id, var session) in sessions where session.status == .active {
             let segs = segments[id] ?? []
             let endedAt = segs.map(\.endedAt).max() ?? session.startedAt
             session.status = .interrupted
             session.endedAt = endedAt
             sessions[id] = session
+            sweptIds.append(id)
         }
+        return sweptIds
     }
 
     func recoverOrphansAndOpenFresh(locale: Locale) async throws -> Session {
@@ -262,6 +266,10 @@ actor MockTranscriptRepository: TranscriptRepository {
     // MARK: - Summaries
 
     func saveSummary(_ summary: Summary) async throws {
+        // Defensive write — match SQLite repo: only persist when parent
+        // session still exists. Mirrors U12's pre-check pattern so tests
+        // catching pruner-aware behavior see the same shape.
+        guard sessions[summary.sessionId] != nil else { return }
         summaries[summary.sessionId, default: []].append(summary)
     }
 
@@ -276,11 +284,63 @@ actor MockTranscriptRepository: TranscriptRepository {
     // MARK: - Topics
 
     func saveTopic(_ topic: Topic) async throws {
+        // Defensive write — match SQLite repo: only persist when parent
+        // session still exists. The empty-session pruner may have deleted
+        // the session between the LLM call's start and this insert.
+        guard sessions[topic.sessionId] != nil else { return }
         topics[topic.sessionId, default: []].append(topic)
     }
 
     func topics(for sessionId: UUID) async throws -> [Topic] {
         (topics[sessionId] ?? []).sorted { $0.segmentRange.lowerBound < $1.segmentRange.lowerBound }
+    }
+
+    // MARK: - U12 Empty-Session Prune + Retention
+
+    func maybeDeleteIfEmpty(
+        sessionId: UUID,
+        minChars: Int,
+        minDurationSeconds: Double
+    ) async throws -> Bool {
+        guard let session = sessions[sessionId] else { return false }
+        // Defensive: never prune an active session.
+        if session.status == .active { return false }
+        guard let endedAt = session.endedAt else { return false }
+
+        let segs = segments[sessionId] ?? []
+        let nonDup = segs.filter { $0.duplicateOf == nil }
+        let nonDupCount = nonDup.count
+        let nonDupChars = nonDup.reduce(0) { $0 + $1.text.count }
+        let duration = endedAt.timeIntervalSince(session.startedAt)
+
+        let trips = nonDupCount == 0
+            || nonDupChars < minChars
+            || duration < minDurationSeconds
+
+        guard trips else { return false }
+
+        sessions.removeValue(forKey: sessionId)
+        segments.removeValue(forKey: sessionId)
+        summaries.removeValue(forKey: sessionId)
+        topics.removeValue(forKey: sessionId)
+        return true
+    }
+
+    @discardableResult
+    func applyRetentionPolicy(retentionDays: Int) async throws -> Int {
+        guard retentionDays > 0 else { return 0 }
+        let cutoff = Date().addingTimeInterval(-Double(retentionDays) * 86_400.0)
+        let toDelete = sessions.filter { _, s in
+            guard let endedAt = s.endedAt else { return false }
+            return endedAt < cutoff
+        }.map(\.key)
+        for id in toDelete {
+            sessions.removeValue(forKey: id)
+            segments.removeValue(forKey: id)
+            summaries.removeValue(forKey: id)
+            topics.removeValue(forKey: id)
+        }
+        return toDelete.count
     }
 
     // MARK: - Test Helpers

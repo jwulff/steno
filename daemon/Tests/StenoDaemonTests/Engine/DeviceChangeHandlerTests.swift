@@ -35,6 +35,10 @@ struct DeviceChangeHandlerTests {
             triggerCount: 100,
             timeThreshold: 3600
         )
+        // U12 thresholds disabled here — these tests pre-date U12 and
+        // assert post-rollover sessions remain visible (interrupted) for
+        // inspection. The U12 prune-on-rollover behavior is covered by
+        // `EmptySessionPruneIntegrationTests`.
         let engine = RecordingEngine(
             repository: repo,
             permissionService: perms,
@@ -45,7 +49,10 @@ struct DeviceChangeHandlerTests {
             backoffSleep: { _ in /* no wait */ },
             deviceUIDProvider: deviceUIDProvider,
             healThresholdSeconds: 30,
-            now: { Date() }
+            now: { Date() },
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
         )
         return (engine, repo, af, del)
     }

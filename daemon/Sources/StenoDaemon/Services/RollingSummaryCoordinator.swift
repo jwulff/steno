@@ -40,6 +40,11 @@ public actor RollingSummaryCoordinator {
     private let summarizer: SummarizationService
     private let triggerCount: Int
     private let timeThreshold: TimeInterval
+    /// U12 gate: minimum non-duplicate segment count below which the LLM
+    /// call is skipped entirely. Sessions below this count are likely to
+    /// be empty-pruned at close, so spending 45s of LLM time on them is
+    /// wasted work.
+    private let minSegmentsForExtraction: Int
     private var lastSummaryTime: [UUID: Date] = [:]
     private var onSummaryGenerated: ((SummaryResult) -> Void)?
     private var isGenerating = false
@@ -51,18 +56,24 @@ public actor RollingSummaryCoordinator {
     ///   - summarizer: The service to use for generating summaries.
     ///   - triggerCount: Number of new segments to trigger a summary (default: 10).
     ///   - timeThreshold: Seconds since last summary to trigger with any new segment (default: 30).
+    ///   - minSegmentsForExtraction: Minimum non-duplicate segment count to
+    ///     fire an LLM call. Below this, `onSegmentSaved` returns nil
+    ///     without invoking the model. Avoids wasted 45s timeouts on
+    ///     sessions about to be empty-session-pruned. Default 3.
     ///   - onSummaryGenerated: Callback when new summary is generated.
     public init(
         repository: TranscriptRepository,
         summarizer: SummarizationService,
         triggerCount: Int = 10,
         timeThreshold: TimeInterval = 30,
+        minSegmentsForExtraction: Int = 3,
         onSummaryGenerated: ((SummaryResult) -> Void)? = nil
     ) {
         self.repository = repository
         self.summarizer = summarizer
         self.triggerCount = triggerCount
         self.timeThreshold = timeThreshold
+        self.minSegmentsForExtraction = minSegmentsForExtraction
         self.onSummaryGenerated = onSummaryGenerated
     }
 
@@ -88,6 +99,18 @@ public actor RollingSummaryCoordinator {
             let lastSummarizedSequence = lastSummary?.segmentRangeEnd ?? 0
 
             let newSegmentCount = count - lastSummarizedSequence
+
+            // U12: Gate by minimum segment count BEFORE the LLM is invoked.
+            // Sessions with too few segments are almost certain to be
+            // pruned at close (R11 empty-session policy); spending a 45s
+            // LLM timeout on them is wasted work. The gate uses the total
+            // session segment count rather than the new-segment delta so
+            // a long-running session with a recent summary still re-fires
+            // promptly when the next batch lands.
+            if count < minSegmentsForExtraction {
+                logSummary("Segments: \(count) — below extraction gate (\(minSegmentsForExtraction)), skipping LLM")
+                return nil
+            }
 
             // Check time since last summary
             let now = Date()

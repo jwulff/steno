@@ -41,13 +41,20 @@ struct AutoStartTests {
             timeThreshold: 3600
         )
 
+        // U12 thresholds disabled — auto-start tests pre-date U12 and
+        // assert orphan-sweep observations (e.g. orphan ends as
+        // .interrupted, not deleted). The U12 prune-on-orphan-sweep
+        // behavior is covered by `EmptySessionPruneIntegrationTests`.
         let engine = RecordingEngine(
             repository: repo,
             permissionService: perms,
             summaryCoordinator: coordinator,
             audioSourceFactory: af,
             speechRecognizerFactory: rf,
-            delegate: del
+            delegate: del,
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
         )
 
         return (engine, repo, perms, af, rf, del)
