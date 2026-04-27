@@ -32,6 +32,14 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// The audio source that produced this segment.
     public let source: AudioSourceType
 
+    /// Heal-marker annotation written by U5/U6 when an in-place pipeline
+    /// restart preserves the session across a gap. Example:
+    /// `"after_gap:12s"`. `nil` for normal (non-healed) segments.
+    /// Surfaces the U2-schema `segments.heal_marker` column on the
+    /// domain model so the engine can stamp the marker on the first
+    /// segment delivered after a successful restart (U5).
+    public let healMarker: String?
+
     public init(
         id: UUID = UUID(),
         sessionId: UUID,
@@ -41,7 +49,8 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         confidence: Float? = nil,
         sequenceNumber: Int,
         createdAt: Date = Date(),
-        source: AudioSourceType = .microphone
+        source: AudioSourceType = .microphone,
+        healMarker: String? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -52,6 +61,7 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.sequenceNumber = sequenceNumber
         self.createdAt = createdAt
         self.source = source
+        self.healMarker = healMarker
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.

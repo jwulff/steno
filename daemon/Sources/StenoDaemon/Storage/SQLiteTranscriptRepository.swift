@@ -216,6 +216,24 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func maxSegmentSequence(for sessionId: UUID) async throws -> Int {
+        try await dbQueue.read { db in
+            // SELECT MAX(sequenceNumber) returns NULL for an empty
+            // segment set; coalesce to 0 so callers can use
+            // `current = max + 1` without an empty-case branch.
+            let value = try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COALESCE(MAX(sequenceNumber), 0)
+                    FROM segments
+                    WHERE sessionId = ?
+                """,
+                arguments: [sessionId.uuidString]
+            )
+            return value ?? 0
+        }
+    }
+
     // MARK: - Summaries
 
     public func saveSummary(_ summary: Summary) async throws {

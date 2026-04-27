@@ -46,18 +46,28 @@ public struct StenoSettings: Codable, Sendable {
     /// the user explicitly turns it off.
     public var lastSystemAudioEnabled: Bool
 
+    /// U6 heal-rule reuse-window threshold, in seconds. Wakes / device
+    /// changes with `gap < healGapSeconds && deviceUID == lastDeviceUID`
+    /// reuse the current session and stamp `heal_marker = "after_gap:<N>s"`
+    /// on the next finalized segment. Larger gaps or device changes roll
+    /// the session over (close as `interrupted`, open a fresh active).
+    /// Default: 30s per the plan.
+    public var healGapSeconds: Int
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
         anthropicModel: String = "claude-3-5-haiku-20241022",
         lastDevice: String? = nil,
-        lastSystemAudioEnabled: Bool = true
+        lastSystemAudioEnabled: Bool = true,
+        healGapSeconds: Int = 30
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
         self.anthropicModel = anthropicModel
         self.lastDevice = lastDevice
         self.lastSystemAudioEnabled = lastSystemAudioEnabled
+        self.healGapSeconds = healGapSeconds
     }
 
     // MARK: - Codable
@@ -71,6 +81,7 @@ public struct StenoSettings: Codable, Sendable {
         case anthropicModel
         case lastDevice
         case lastSystemAudioEnabled
+        case healGapSeconds
     }
 
     public init(from decoder: Decoder) throws {
@@ -80,6 +91,7 @@ public struct StenoSettings: Codable, Sendable {
         self.anthropicModel = try container.decodeIfPresent(String.self, forKey: .anthropicModel) ?? "claude-3-5-haiku-20241022"
         self.lastDevice = try container.decodeIfPresent(String.self, forKey: .lastDevice)
         self.lastSystemAudioEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastSystemAudioEnabled) ?? true
+        self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? 30
     }
 
     // MARK: - Persistence

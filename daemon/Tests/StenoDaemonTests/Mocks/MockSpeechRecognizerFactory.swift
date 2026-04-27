@@ -55,8 +55,18 @@ final class MockSpeechRecognizerHandle: SpeechRecognizerHandle, @unchecked Senda
 }
 
 /// Mock factory that creates MockSpeechRecognizerHandle instances.
+///
+/// Two modes of operation:
+///   1. *Single-handle mode (default):* `micHandle` and `sysHandle` are
+///      reused for every `makeRecognizer` call. Existing tests rely on
+///      this — a single, persistent handle they can drive directly.
+///   2. *Per-call queue mode (U5+):* If a test enqueues handles via
+///      `enqueueMicHandle(_:)` / `enqueueSysHandle(_:)`, the factory
+///      returns one handle per `makeRecognizer` call from that queue.
+///      Used for restart-with-backoff tests where the first handle
+///      throws, then a fresh handle is brought up on the rebuild.
 final class MockSpeechRecognizerFactory: SpeechRecognizerFactory, @unchecked Sendable {
-    /// Per-source handles for dual-source tests.
+    /// Per-source handles for dual-source tests (single-handle mode).
     let micHandle = MockSpeechRecognizerHandle()
     let sysHandle = MockSpeechRecognizerHandle()
 
@@ -72,19 +82,59 @@ final class MockSpeechRecognizerFactory: SpeechRecognizerFactory, @unchecked Sen
 
     private(set) var lastSource: AudioSourceType?
 
+    /// Total number of `makeRecognizer` calls, regardless of source.
+    private(set) var makeRecognizerCallCount: Int = 0
+    /// Per-source call counts.
+    private(set) var micMakeCount: Int = 0
+    private(set) var sysMakeCount: Int = 0
+
+    /// Optional queues of per-call handles. When non-empty for a given
+    /// source, each `makeRecognizer` call dequeues the next handle
+    /// instead of returning the persistent `micHandle` / `sysHandle`.
+    private var micHandleQueue: [MockSpeechRecognizerHandle] = []
+    private var sysHandleQueue: [MockSpeechRecognizerHandle] = []
+
+    func enqueueMicHandle(_ handle: MockSpeechRecognizerHandle) {
+        micHandleQueue.append(handle)
+    }
+
+    func enqueueSysHandle(_ handle: MockSpeechRecognizerHandle) {
+        sysHandleQueue.append(handle)
+    }
+
+    /// All mic handles produced so far (queue mode), in order.
+    private(set) var producedMicHandles: [MockSpeechRecognizerHandle] = []
+    /// All sys handles produced so far (queue mode), in order.
+    private(set) var producedSysHandles: [MockSpeechRecognizerHandle] = []
+
     func makeRecognizer(locale: Locale, format: AVAudioFormat, source: AudioSourceType)
         async throws -> SpeechRecognizerHandle {
         recognizerCreated = true
         lastLocale = locale
         lastSource = source
+        makeRecognizerCallCount += 1
 
         if let error = factoryError {
             throw error
         }
 
         switch source {
-        case .microphone: return micHandle
-        case .systemAudio: return sysHandle
+        case .microphone:
+            micMakeCount += 1
+            if !micHandleQueue.isEmpty {
+                let next = micHandleQueue.removeFirst()
+                producedMicHandles.append(next)
+                return next
+            }
+            return micHandle
+        case .systemAudio:
+            sysMakeCount += 1
+            if !sysHandleQueue.isEmpty {
+                let next = sysHandleQueue.removeFirst()
+                producedSysHandles.append(next)
+                return next
+            }
+            return sysHandle
         }
     }
 }

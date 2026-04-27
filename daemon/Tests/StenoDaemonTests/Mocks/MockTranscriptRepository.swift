@@ -180,6 +180,12 @@ actor MockTranscriptRepository: TranscriptRepository {
         segments[sessionId]?.count ?? 0
     }
 
+    func maxSegmentSequence(for sessionId: UUID) async throws -> Int {
+        // Mirror the SQLite contract: 0 when the session has no
+        // segments, otherwise the max `sequenceNumber` value.
+        segments[sessionId]?.map(\.sequenceNumber).max() ?? 0
+    }
+
     // MARK: - Summaries
 
     func saveSummary(_ summary: Summary) async throws {

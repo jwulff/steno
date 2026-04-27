@@ -69,7 +69,8 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             confidence: confidence.map { Float($0) },
             sequenceNumber: sequenceNumber,
             createdAt: Date(timeIntervalSince1970: createdAt),
-            source: AudioSourceType(rawValue: source) ?? .microphone
+            source: AudioSourceType(rawValue: source) ?? .microphone,
+            healMarker: healMarker
         )
     }
 
@@ -78,8 +79,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     /// - Parameter segment: The domain StoredSegment.
     /// - Returns: A SegmentRecord ready for persistence.
     ///
-    /// Note: U2 dedup/heal fields default to NULL here. Writers in U5/U11
-    /// will mutate them via dedicated UPDATE queries on the repository.
+    /// Note: U2 dedup fields (`duplicateOf`, `dedupMethod`) default to
+    /// NULL here — those writers land in U11. The `healMarker` field is
+    /// pulled directly off the domain model: U5's restart path stamps it
+    /// on the first segment after a successful pipeline rebuild.
     static func from(_ segment: StoredSegment) -> SegmentRecord {
         SegmentRecord(
             id: segment.id.uuidString,
@@ -93,7 +96,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             source: segment.source.rawValue,
             duplicateOf: nil,
             dedupMethod: nil,
-            healMarker: nil,
+            healMarker: segment.healMarker,
             micPeakDb: nil
         )
     }

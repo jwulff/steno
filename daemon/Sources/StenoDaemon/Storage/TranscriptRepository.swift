@@ -108,6 +108,21 @@ public protocol TranscriptRepository: Sendable {
     /// - Returns: Number of segments.
     func segmentCount(for sessionId: UUID) async throws -> Int
 
+    /// Largest `sequenceNumber` already persisted for `sessionId`. Returns
+    /// 0 when the session has no segments yet (so callers can use
+    /// `currentSequenceNumber = max + 1` on the next save without a
+    /// special-case for empty sessions).
+    ///
+    /// Used by the wake-reuse path on `RecordingEngine.bringUpPipelines`
+    /// so a resumed session does not collide with its own pre-sleep
+    /// segments under the `UNIQUE(sessionId, sequenceNumber)` schema
+    /// constraint. Cheap — a single indexed `MAX(sequenceNumber)` lookup.
+    ///
+    /// - Parameter sessionId: The session ID.
+    /// - Returns: The maximum `sequenceNumber` across the session's
+    ///   segments, or 0 when the session has no segments.
+    func maxSegmentSequence(for sessionId: UUID) async throws -> Int
+
     // MARK: - Summaries
 
     /// Save a summary.

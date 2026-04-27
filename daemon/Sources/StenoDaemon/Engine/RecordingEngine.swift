@@ -32,6 +32,38 @@ public actor RecordingEngine {
     private let speechRecognizerFactory: SpeechRecognizerFactory
     private var delegate: (any RecordingEngineDelegate)?
 
+    /// Sleep used by the U5 restart-with-backoff loop. Production passes
+    /// `Task.sleep(for:)`; tests inject a faster (or zero-duration)
+    /// closure so the curve is observable without paying real wall-clock.
+    /// The closure must throw `CancellationError` when its task is
+    /// cancelled — otherwise `stop()` cannot abort an in-flight backoff.
+    private let backoffSleep: @Sendable (Duration) async throws -> Void
+
+    // MARK: - U6 dependencies (sleep/wake supervisor)
+
+    /// IOKit-backed power assertion held while the engine is in the
+    /// `.recording` status. Acquired on first transition into
+    /// `.recording`, released on every transition OUT of `.recording`,
+    /// re-acquired on transitions back into `.recording`. Surfaces in
+    /// `pmset -g assertions` as `"Steno: capturing audio"`.
+    private let powerAssertion: any PowerAssertionManaging
+
+    /// Resolves the current default-input device UID for the heal rule.
+    /// Production injects a Core Audio HAL lookup
+    /// (`kAudioHardwarePropertyDefaultInputDevice` → device UID); tests
+    /// inject a closure that returns synthetic UIDs to exercise the
+    /// "device changed across sleep" rollover branch.
+    private let deviceUIDProvider: @Sendable () -> String?
+
+    /// Heal-rule reuse threshold in seconds. Resolved from
+    /// `StenoSettings.healGapSeconds` at construction time.
+    private let healThresholdSeconds: Int
+
+    /// Wall-clock provider. Tests inject a deterministic clock so the
+    /// rollover-vs-reuse path can be exercised without a real 30-second
+    /// sleep.
+    private let nowProvider: @Sendable () -> Date
+
     // MARK: - Internal state
 
     private var micRecognizerHandle: (any SpeechRecognizerHandle)?
@@ -49,6 +81,72 @@ public actor RecordingEngine {
     /// Minimum interval between audio level events (10Hz = 100ms).
     private let levelInterval: TimeInterval = 0.1
 
+    // MARK: - U5 restart-with-backoff state
+
+    /// Locale captured at start time so the restart path can rebuild
+    /// recognizers without re-threading locale through every call.
+    private var currentLocale: Locale = .current
+
+    /// Independent backoff policies per source. The mic and system audio
+    /// pipelines fail (and recover) independently per the plan: a
+    /// recognizer error on the system audio pipeline must not throttle
+    /// mic-pipeline rebuilds.
+    private var micBackoff = BackoffPolicy()
+    private var sysBackoff = BackoffPolicy()
+
+    /// In-flight restart tasks. While non-nil for a source, that source
+    /// is mid-restart — additional errors arriving via the (already
+    /// cancelled) recognizer stream are ignored. `stop()` cancels both
+    /// to terminate the cancellable backoff sleep cleanly.
+    private var micRestartTask: Task<Void, Never>?
+    private var sysRestartTask: Task<Void, Never>?
+
+    /// Heal markers staged for the *first* segment finalized after a
+    /// successful restart on each source. Cleared by the segment-save
+    /// path on consumption.
+    private var pendingMicHealMarker: String?
+    private var pendingSysHealMarker: String?
+
+    /// Wall-clock timestamps of restart entry per source. Used to
+    /// compute the `healed(gapSeconds:)` value once the rebuild
+    /// completes and the next segment lands.
+    private var micRestartEntryTime: Date?
+    private var sysRestartEntryTime: Date?
+
+    /// Pre-computed gap-seconds awaiting consumption by the next
+    /// finalized segment of the rebuilt pipeline. Set after a successful
+    /// rebuild, cleared on consumption.
+    private var pendingMicHealedGap: Double?
+    private var pendingSysHealedGap: Double?
+
+    /// Whether `stop()` has been entered. Restart loops check this to
+    /// abort cleanly mid-backoff.
+    private var isStopping: Bool = false
+
+    // MARK: - U6 sleep/wake state
+
+    /// Wall-clock moment the most recent `handleSystemWillSleep()` (or
+    /// equivalent teardown) recorded the gap entry. The wake handler
+    /// computes `gap = nowProvider() - gapStartedAt` to drive the heal
+    /// rule. Cleared when the wake handler returns (success or rollover).
+    private var gapStartedAt: Date?
+
+    /// Device UID captured at the last successful pipeline bring-up
+    /// (start, restart, or wake-reuse). Used by the heal rule on the
+    /// next wake to detect "device changed across sleep" and force a
+    /// rollover even when the gap is short.
+    private var lastDeviceUID: String?
+
+    // MARK: - U7 device-change observer state
+
+    /// Audio format captured at the last successful pipeline
+    /// bring-up. Used by `handleAudioDeviceChange(deviceUID:format:)`
+    /// to distinguish "device changed" (rollover candidate) from
+    /// "format changed within same device" (still triggers heal rule
+    /// because format affects the analyzer) from "neither changed"
+    /// (cheap restart, no heal-rule trigger).
+    private var lastMicFormat: AVAudioFormat?
+
     // MARK: - Init
 
     public init(
@@ -57,7 +155,14 @@ public actor RecordingEngine {
         summaryCoordinator: RollingSummaryCoordinator,
         audioSourceFactory: AudioSourceFactory,
         speechRecognizerFactory: SpeechRecognizerFactory,
-        delegate: (any RecordingEngineDelegate)? = nil
+        delegate: (any RecordingEngineDelegate)? = nil,
+        backoffSleep: @Sendable @escaping (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        },
+        powerAssertion: (any PowerAssertionManaging)? = nil,
+        deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
+        healThresholdSeconds: Int = 30,
+        now: @Sendable @escaping () -> Date = { Date() }
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -65,6 +170,11 @@ public actor RecordingEngine {
         self.audioSourceFactory = audioSourceFactory
         self.speechRecognizerFactory = speechRecognizerFactory
         self.delegate = delegate
+        self.backoffSleep = backoffSleep
+        self.powerAssertion = powerAssertion ?? PowerAssertion()
+        self.deviceUIDProvider = deviceUIDProvider
+        self.healThresholdSeconds = healThresholdSeconds
+        self.nowProvider = now
     }
 
     // MARK: - Public Commands
@@ -90,6 +200,16 @@ public actor RecordingEngine {
         guard status == .idle || status == .error else {
             throw RecordingEngineError.alreadyRecording
         }
+
+        // Reset backoff state on every entry into `.starting`. This is
+        // a no-op when we came from `.idle` (a fresh `BackoffPolicy` is
+        // already there), but it is load-bearing when we came from
+        // `.error`: a prior surrender leaves `isExhausted == true`, and
+        // the next transient failure would otherwise short-circuit
+        // straight back to `recoveryExhausted` without retrying. See
+        // PR #35 review (issue 2).
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
 
         await setStatus(.starting)
 
@@ -166,13 +286,31 @@ public actor RecordingEngine {
     ) async throws -> Session {
         currentSession = session
         currentDevice = device
-        currentSequenceNumber = 0
-        segmentCount = 0
+        currentLocale = locale
+        // Rehydrate the segment counter from the repository every time
+        // we bring up pipelines. For a brand-new session the MAX query
+        // returns 0 (so the first segment lands at sequenceNumber=1, as
+        // before). For a *resumed* session — wake/reuse, device-change
+        // reuse — we pick up where the pre-sleep segments left off,
+        // avoiding collisions under the `UNIQUE(sessionId,
+        // sequenceNumber)` schema constraint that previously caused
+        // post-wake segment writes to fail silently until the counter
+        // naturally passed the old max. See PR #35 review (issue 1).
+        let resumeFrom = (try? await repository.maxSegmentSequence(for: session.id)) ?? 0
+        currentSequenceNumber = resumeFrom
+        segmentCount = resumeFrom
+        // U6: capture the device UID at this bring-up so the next wake
+        // / config-change can compare against it for the heal rule.
+        lastDeviceUID = deviceUIDProvider()
 
         // Start microphone
         do {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: device)
             micStopClosure = stopMic
+            // U7: remember the format so the device-change handler can
+            // distinguish "format changed within same device" from
+            // "neither changed."
+            lastMicFormat = format
 
             // Wrap buffer stream to compute mic levels as buffers pass through
             let micBuffers = tappedStream(buffers, isMic: true)
@@ -190,7 +328,7 @@ public actor RecordingEngine {
                         await self?.handleRecognizerResult(result)
                     }
                 } catch {
-                    await self?.handleRecognizerError(error)
+                    await self?.handleRecognizerError(error, source: .microphone)
                 }
             }
         } catch {
@@ -262,6 +400,15 @@ public actor RecordingEngine {
         guard status == .idle || status == .error else {
             throw RecordingEngineError.alreadyRecording
         }
+
+        // Reset backoff state when coming out of `.error`. A prior
+        // surrender leaves `isExhausted == true`; without this reset,
+        // the next transient failure after the auto-start completes
+        // would short-circuit back to `recoveryExhausted` instead of
+        // honouring the curve. From `.idle` this is a no-op. See
+        // PR #35 review (issue 2).
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
 
         // Step 1: orphan sweep first (independent of pause-state and
         // permissions). R9 — stranded `active` rows must be closed on
@@ -355,9 +502,23 @@ public actor RecordingEngine {
 
     /// Stop recording and finalize the session.
     public func stop() async {
-        guard status == .recording || status == .starting else { return }
+        // Allow stopping from `.recovering` too (U5): an in-flight
+        // restart must be cancellable mid-backoff so user-initiated
+        // teardown is not blocked by the wait.
+        guard status == .recording
+            || status == .starting
+            || status == .recovering else { return }
 
+        isStopping = true
         await setStatus(.stopping)
+
+        // Cancel any in-flight restart tasks. Their `Task.sleep(for:)`
+        // raises CancellationError and the loop returns early without
+        // re-arming a rebuild attempt.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
 
         // Stop recognizers
         recognizerTask?.cancel()
@@ -388,7 +549,19 @@ public actor RecordingEngine {
         currentSession = nil
         isSystemAudioEnabled = false
 
+        // Clear U5 restart bookkeeping for the next start.
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+        pendingMicHealMarker = nil
+        pendingSysHealMarker = nil
+        pendingMicHealedGap = nil
+        pendingSysHealedGap = nil
+        micRestartEntryTime = nil
+        sysRestartEntryTime = nil
+        lastMicFormat = nil
+
         await setStatus(.idle)
+        isStopping = false
     }
 
     /// List available audio devices.
@@ -397,10 +570,39 @@ public actor RecordingEngine {
         []
     }
 
+    /// Current cached mic format from the last successful pipeline
+    /// bring-up. Used by `AudioDeviceObserver`'s `formatProvider`
+    /// closure so the trailing-edge fire compares against the engine's
+    /// real current format instead of always-nil — without this, U7's
+    /// "same UID + same format" cheap-restart optimization never fires
+    /// (lastMicFormat is non-nil after start, the provider always
+    /// returns nil → comparison always reports a format mismatch).
+    /// See PR #35 review (issue 5).
+    public func currentMicFormat() -> AVAudioFormat? {
+        lastMicFormat
+    }
+
     // MARK: - Private
 
     private func setStatus(_ newStatus: EngineStatus) async {
+        let previous = status
         status = newStatus
+        // U6: power assertion lifecycle. Take on entry into `.recording`,
+        // release on every transition OUT of `.recording`. Idempotent in
+        // both directions so concurrent rebuild paths can call freely
+        // without leaking duplicate assertions.
+        if previous != .recording && newStatus == .recording {
+            do {
+                try powerAssertion.acquire()
+            } catch {
+                await emit(.error(
+                    "Failed to acquire power assertion: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        } else if previous == .recording && newStatus != .recording {
+            powerAssertion.release()
+        }
         await emit(.statusChanged(newStatus))
     }
 
@@ -417,6 +619,20 @@ public actor RecordingEngine {
             currentSequenceNumber += 1
             segmentCount = currentSequenceNumber
 
+            // U5: stamp the heal marker on the *first* segment after a
+            // successful pipeline restart on the matching source. The
+            // marker is consumed (cleared) here so subsequent normal
+            // segments have heal_marker = NULL.
+            let healMarker: String?
+            switch result.source {
+            case .microphone:
+                healMarker = pendingMicHealMarker
+                pendingMicHealMarker = nil
+            case .systemAudio:
+                healMarker = pendingSysHealMarker
+                pendingSysHealMarker = nil
+            }
+
             let segment = StoredSegment(
                 sessionId: session.id,
                 text: result.text,
@@ -424,7 +640,8 @@ public actor RecordingEngine {
                 endedAt: Date(),
                 confidence: result.confidence,
                 sequenceNumber: currentSequenceNumber,
-                source: result.source
+                source: result.source,
+                healMarker: healMarker
             )
 
             // Persist
@@ -436,6 +653,34 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
+
+            // U5: a finalized segment counts toward the per-source
+            // backoff reset (segment-finalized gate). The wall-clock
+            // gate is enforced separately in `tryReset(now:)` below.
+            switch result.source {
+            case .microphone:
+                micBackoff.recordSegmentFinalized()
+                micBackoff.tryReset()
+            case .systemAudio:
+                sysBackoff.recordSegmentFinalized()
+                sysBackoff.tryReset()
+            }
+
+            // U5: emit `healed(gapSeconds:)` once on the first segment
+            // after a successful restart. The gap was pre-computed at
+            // rebuild-success time, so this lands deterministically.
+            switch result.source {
+            case .microphone:
+                if let gap = pendingMicHealedGap {
+                    await emit(.healed(gapSeconds: gap))
+                    pendingMicHealedGap = nil
+                }
+            case .systemAudio:
+                if let gap = pendingSysHealedGap {
+                    await emit(.healed(gapSeconds: gap))
+                    pendingSysHealedGap = nil
+                }
+            }
 
             // Trigger summary
             await emit(.modelProcessing(true))
@@ -450,17 +695,399 @@ public actor RecordingEngine {
         }
     }
 
-    private func handleRecognizerError(_ error: Error) async {
+    /// Recognizer-error entry point. Dispatches to the per-source
+    /// `restart…Pipeline(reason:)` so U5's bounded-backoff machinery can
+    /// rebuild without surfacing the failure to the user as long as the
+    /// policy stays under the surrender threshold.
+    ///
+    /// Cancellation errors arriving from a teardown (e.g. an in-flight
+    /// `restartMicPipeline` finishing the previous handle's stream) are
+    /// silently ignored — only genuine recognizer failures should
+    /// trigger a fresh restart attempt.
+    private func handleRecognizerError(_ error: Error, source: AudioSourceType) async {
         let message = error.localizedDescription
-        let isCancellation = message.lowercased().contains("cancel")
-        if !isCancellation {
-            await emit(.error(message, isTransient: true))
+        let isCancellation = (error is CancellationError)
+            || message.lowercased().contains("cancel")
+        if isCancellation { return }
+
+        // If we're already in the middle of stopping, don't spawn a
+        // restart — the user-initiated teardown owns the state machine.
+        if isStopping || status == .stopping || status == .idle { return }
+
+        // U8: mic-side TCC revocation surface. AVAudioEngine permission
+        // errors (typically `kAudioServicesNoSuchHardware`-class or
+        // AVAudioSession permission-denied errors) are NON-RETRYABLE —
+        // cycling through U5's backoff loop on TCC revocation produces
+        // ambiguous orange-indicator flicker while silently failing.
+        // The exact `MIC_OR_SCREEN_PERMISSION_REVOKED` token is
+        // load-bearing: U9's TUI surface matches on it.
+        if source == .microphone,
+           MicrophonePermissionErrorDetector.isPermissionRevocation(error) {
+            await handleMicrophonePermissionRevoked(message: message)
+            return
         }
+
+        switch source {
+        case .microphone:
+            // Drop duplicate failures while a restart is already running.
+            if micRestartTask != nil { return }
+            await scheduleMicRestart(reason: "recognizer:\(message)", errorCode: errorCode(for: error))
+        case .systemAudio:
+            if sysRestartTask != nil { return }
+            await scheduleSysRestart(reason: "recognizer:\(message)", errorCode: errorCode(for: error))
+        }
+    }
+
+    /// Handle a microphone TCC-revocation surface. Tear down the mic
+    /// pipeline (no rebuild), emit the load-bearing
+    /// `MIC_OR_SCREEN_PERMISSION_REVOKED` `recoveryExhausted` event,
+    /// transition to `.error`. Mirrors the SCStream `userDeclined`
+    /// path (see `systemAudioPermissionRevoked()` below) so the TUI
+    /// surfaces a single non-transient failure regardless of which
+    /// pipeline tripped the revocation.
+    private func handleMicrophonePermissionRevoked(message: String) async {
+        // Cancel any in-flight mic restart loop — it would only
+        // re-enter this path on the next attempt anyway.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+
+        // Tear down the mic pipeline so the engine is in a clean
+        // state when the user re-grants permission and a future
+        // command (or U6/U9 retry path) re-attempts bringup.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
+        await setStatus(.error)
+    }
+
+    /// Compute a stable error code for backoff "same-error" tracking.
+    /// Strategy: if the error is an `NSError`, use `domain#code`; otherwise,
+    /// use the type name. This gives U5's `BackoffPolicy` a deterministic
+    /// key string without coupling to any specific error enum.
+    private nonisolated func errorCode(for error: Error) -> String {
+        let ns = error as NSError
+        return "\(ns.domain)#\(ns.code)"
+    }
+
+    // MARK: - U5 Restart machinery
+
+    /// Schedule a mic-pipeline restart and remember the in-flight task
+    /// so concurrent error reports / `stop()` can join or cancel it.
+    private func scheduleMicRestart(reason: String, errorCode: String) async {
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.restartMicPipeline(reason: reason, errorCode: errorCode)
+        }
+        micRestartTask = task
+    }
+
+    private func scheduleSysRestart(reason: String, errorCode: String) async {
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.restartSystemPipeline(reason: reason, errorCode: errorCode)
+        }
+        sysRestartTask = task
+    }
+
+    /// Restart the microphone pipeline with bounded exponential backoff (U5).
+    ///
+    /// Sequence:
+    ///   1. Set status to `.recovering`, broadcast `.recovering(reason:)`.
+    ///   2. Tear down the current mic pipeline (recognizer task, recognizer
+    ///      handle, audio source).
+    ///   3. Record the error in `micBackoff`. If the policy surrenders,
+    ///      broadcast `.recoveryExhausted(reason:)`, set status to
+    ///      `.error`, exit. The engine will only recover via external
+    ///      stimulus (resume, device-change — see plan's "Engine-state
+    ///      recovery from `error`" section).
+    ///   4. Sleep for the backoff delay. The sleep is cancellable —
+    ///      `stop()` cancels the restart task and the wait aborts cleanly.
+    ///   5. Rebuild the mic pipeline (audio source + recognizer +
+    ///      consumer task). The recognizer is created via the same
+    ///      `speechRecognizerFactory` used at start time; the
+    ///      SpeechAnalyzer factory implementation owns the `@MainActor`
+    ///      hop internally per project convention.
+    ///   6. On success: stage `pendingMicHealMarker` for the first
+    ///      finalized segment, pre-compute `pendingMicHealedGap`, restore
+    ///      status to `.recording` (unless sys is also recovering).
+    ///
+    /// **Heal-rule scope (U5):** always reuses the current session and
+    /// stamps `heal_marker = "after_gap:<N>s"` on the next segment.
+    /// Session rollover for long gaps is U6's heal-rule decision, not U5's.
+    func restartMicPipeline(reason: String, errorCode: String) async {
+        await beginRecovering(reason: reason)
+        let entryTime = Date()
+        micRestartEntryTime = entryTime
+
+        // Tear down the current mic pipeline. Cancellation of the
+        // existing recognizerTask is the load-bearing step — it stops
+        // the consumer that would otherwise re-emit the same error and
+        // re-enter this method.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        // Record the error and decide whether to wait or surrender.
+        let outcome = micBackoff.record(error: errorCode)
+        switch outcome {
+        case .exhausted:
+            await emit(.recoveryExhausted(reason: reason))
+            await setStatus(.error)
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            return
+        case .delay(let duration):
+            // Cancellable sleep — `stop()` triggers Task cancellation
+            // which makes this throw and return cleanly.
+            do {
+                try await backoffSleep(duration)
+            } catch {
+                // Either cancelled by `stop()` or by another teardown.
+                micRestartTask = nil
+                micRestartEntryTime = nil
+                return
+            }
+        }
+
+        // If `stop()` arrived during the wait, do NOT rebuild.
+        if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            return
+        }
+
+        // Rebuild.
+        do {
+            let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: currentDevice)
+            micStopClosure = stopMic
+            // U7: refresh cached mic format on successful rebuild so
+            // a subsequent device-change handler compares against the
+            // post-restart format, not the pre-restart format.
+            lastMicFormat = format
+            // Refresh the cached device UID — a config-change-driven
+            // restart may have landed on a new default-input device.
+            lastDeviceUID = deviceUIDProvider()
+
+            let micBuffers = tappedStream(buffers, isMic: true)
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(
+                locale: currentLocale,
+                format: format,
+                source: .microphone
+            )
+            micRecognizerHandle = recognizer
+
+            let results = recognizer.transcribe(buffers: micBuffers)
+            recognizerTask = Task { [weak self] in
+                do {
+                    for try await result in results {
+                        await self?.handleRecognizerResult(result)
+                    }
+                } catch {
+                    await self?.handleRecognizerError(error, source: .microphone)
+                }
+            }
+
+            // Successful rebuild. Compute gap, stage heal marker, mark
+            // restart-time for backoff reset.
+            let gap = Date().timeIntervalSince(entryTime)
+            let gapSeconds = max(0, Int(gap.rounded()))
+            pendingMicHealMarker = "after_gap:\(gapSeconds)s"
+            pendingMicHealedGap = gap
+            micBackoff.recordRestart()
+        } catch {
+            // Rebuild itself failed (e.g. `makeMicrophoneSource` or
+            // `makeRecognizer` threw immediately). Without explicit
+            // re-scheduling here, `handleRecognizerError` never fires
+            // again — there is no recognizer consumer task left to
+            // surface a failure — so the mic pipeline would stay stuck
+            // until the next external stimulus (device-change,
+            // sleep/wake). The original `record(error:)` call near the
+            // top of this function already bumped the policy for this
+            // attempt; the rebuild failure is the realization of that
+            // same attempt. We re-enter the restart loop by enqueuing
+            // a fresh task, which calls `record(error:)` again at its
+            // top — counting as the next attempt. See PR #35 review
+            // (issues 3 & 4).
+            await emit(.error(
+                "Mic pipeline rebuild failed: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            let nestedCode = self.errorCode(for: error)
+            // Honour cancellation arriving during the rebuild — don't
+            // schedule another attempt if the engine is being torn down.
+            micRestartTask = nil
+            micRestartEntryTime = nil
+            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+                return
+            }
+            // If the policy is already exhausted, surrender now. We
+            // peek at the policy without bumping it again — the next
+            // `restartMicPipeline` invocation would call `record` for
+            // us, and we don't want to double-count this rebuild
+            // failure.
+            if micBackoff.isExhausted {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+                return
+            }
+            await scheduleMicRestart(
+                reason: "rebuild:\(error.localizedDescription)",
+                errorCode: nestedCode
+            )
+            return
+        }
+
+        // Restore status. If sys is still recovering, leave status at
+        // `.recovering` until both pipelines are healthy.
+        micRestartTask = nil
+        micRestartEntryTime = nil
+        await maybeRestoreRecordingStatus()
+    }
+
+    /// Restart the system-audio pipeline with bounded exponential backoff (U5).
+    /// Mirror of `restartMicPipeline` operating on the sys-audio state.
+    func restartSystemPipeline(reason: String, errorCode: String) async {
+        await beginRecovering(reason: reason)
+        let entryTime = Date()
+        sysRestartEntryTime = entryTime
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        let outcome = sysBackoff.record(error: errorCode)
+        switch outcome {
+        case .exhausted:
+            await emit(.recoveryExhausted(reason: reason))
+            await setStatus(.error)
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            return
+        case .delay(let duration):
+            do {
+                try await backoffSleep(duration)
+            } catch {
+                sysRestartTask = nil
+                sysRestartEntryTime = nil
+                return
+            }
+        }
+
+        if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            return
+        }
+
+        let source = audioSourceFactory.makeSystemAudioSource()
+        systemAudioSource = source
+        // U8: re-wire the SCStream recovery delegate on the rebuilt source.
+        if let recoverable = source as? SystemAudioSource {
+            recoverable.recoveryDelegate = self
+        }
+
+        do {
+            let (buffers, format) = try await source.start()
+            let sysBuffers = tappedStream(buffers, isMic: false)
+            let recognizer = try await speechRecognizerFactory.makeRecognizer(
+                locale: currentLocale,
+                format: format,
+                source: .systemAudio
+            )
+            sysRecognizerHandle = recognizer
+
+            let results = recognizer.transcribe(buffers: sysBuffers)
+            systemRecognizerTask = Task { [weak self] in
+                do {
+                    for try await result in results {
+                        await self?.handleRecognizerResult(result)
+                    }
+                } catch {
+                    await self?.handleRecognizerError(error, source: .systemAudio)
+                }
+            }
+
+            let gap = Date().timeIntervalSince(entryTime)
+            let gapSeconds = max(0, Int(gap.rounded()))
+            pendingSysHealMarker = "after_gap:\(gapSeconds)s"
+            pendingSysHealedGap = gap
+            sysBackoff.recordRestart()
+        } catch {
+            // Mirror of mic-side handling — see `restartMicPipeline`'s
+            // catch block. Without an explicit reschedule, the system
+            // pipeline stays stuck after a rebuild throw because there
+            // is no recognizer consumer task left to re-trigger
+            // `handleRecognizerError`. PR #35 review (issue 4).
+            await emit(.error(
+                "System pipeline rebuild failed: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            let nestedCode = self.errorCode(for: error)
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+                return
+            }
+            if sysBackoff.isExhausted {
+                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
+                await setStatus(.error)
+                return
+            }
+            await scheduleSysRestart(
+                reason: "rebuild:\(error.localizedDescription)",
+                errorCode: nestedCode
+            )
+            return
+        }
+
+        sysRestartTask = nil
+        sysRestartEntryTime = nil
+        await maybeRestoreRecordingStatus()
+    }
+
+    /// Transition into the `.recovering` status (idempotent — multiple
+    /// concurrent restarts only emit one transition because the second
+    /// call sees status already at `.recovering`).
+    private func beginRecovering(reason: String) async {
+        await emit(.recovering(reason: reason))
+        if status != .recovering && status != .error {
+            await setStatus(.recovering)
+        }
+    }
+
+    /// After a successful restart, restore status to `.recording`
+    /// unless another pipeline is still mid-restart or the engine has
+    /// surrendered to `.error`.
+    private func maybeRestoreRecordingStatus() async {
+        if status == .error { return }
+        if micRestartTask != nil || sysRestartTask != nil { return }
+        if isStopping || status == .stopping || status == .idle { return }
+        await setStatus(.recording)
     }
 
     private func startSystemAudio(locale: Locale) async {
         let source = audioSourceFactory.makeSystemAudioSource()
         systemAudioSource = source
+        // U8: wire the SCStream recovery delegate so error-code-aware
+        // recovery flows back through the engine. Production source is
+        // `SystemAudioSource`; mocks (e.g. `MockAudioSource`) are not
+        // required to support recovery delegation — the SCStream
+        // delegate path is exercised directly in
+        // `SystemAudioSourceTests` against synthetic NSErrors.
+        if let recoverable = source as? SystemAudioSource {
+            recoverable.recoveryDelegate = self
+        }
 
         do {
             let (buffers, format) = try await source.start()
@@ -477,7 +1104,7 @@ public actor RecordingEngine {
                         await self?.handleRecognizerResult(result)
                     }
                 } catch {
-                    await self?.handleRecognizerError(error)
+                    await self?.handleRecognizerError(error, source: .systemAudio)
                 }
             }
         } catch {
@@ -552,9 +1179,325 @@ public actor RecordingEngine {
         return peak
     }
 
+    // MARK: - U6 Sleep/Wake Handlers
+
+    /// Called on `kIOMessageSystemWillSleep` (wired via
+    /// `PowerManagementObserver`). Drains pipelines, persists in-flight
+    /// segments, releases the power assertion, and stamps
+    /// `gapStartedAt`. The heal rule decision is deferred to wake.
+    ///
+    /// **Ordering invariant (load-bearing — see plan's "Power-assertion
+    /// ordering (U6 test)" section):** the call sequence inside this
+    /// method MUST be (1) stop pipelines and confirm stopped, (2) release
+    /// the power assertion, (3) return to caller (which then invokes
+    /// `IOAllowPowerChange`). This closes the race where a still-active
+    /// mic pipeline could capture audio after the power assertion is
+    /// released but before the system actually sleeps.
+    ///
+    /// Cleanup is unconditional — runs even from `.error` state.
+    public func handleSystemWillSleep() async {
+        // Stamp the gap moment before tearing anything down so the wake
+        // handler can compute the elapsed time accurately.
+        gapStartedAt = nowProvider()
+
+        // Cancel any in-flight restart tasks. Their `Task.sleep(for:)`
+        // raises CancellationError and the loop returns early without
+        // re-arming a rebuild attempt during sleep.
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+
+        // (1) Stop pipelines and confirm stopped. Each `await` returns
+        // only after the underlying handle / closure has finished its
+        // teardown.
+        recognizerTask?.cancel()
+        recognizerTask = nil
+        await micRecognizerHandle?.stop()
+        micRecognizerHandle = nil
+        await micStopClosure?()
+        micStopClosure = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        levelThrottleTask?.cancel()
+        levelThrottleTask = nil
+
+        // (2) Release the power assertion AFTER pipelines confirm
+        // stopped. Releasing is idempotent — the .recording -> .recovering
+        // transition below would also release it if we hadn't already.
+        powerAssertion.release()
+
+        // Transition to `.recovering` to reflect the sleep gap. We don't
+        // close the session here — the heal rule decides on wake whether
+        // to reuse or roll over.
+        if status != .error && status != .idle && status != .stopping {
+            await setStatus(.recovering)
+        }
+
+        // (3) Caller (PowerManagementObserver) calls IOAllowPowerChange
+        // next.
+    }
+
+    /// Called on `kIOMessageSystemHasPoweredOn` (wired via
+    /// `PowerManagementObserver`). Computes the gap, applies the heal
+    /// rule, and brings up pipelines around either the surviving session
+    /// (reuse) or a fresh one (rollover). Re-acquires the power
+    /// assertion via the `.recording` status transition.
+    public func handleSystemDidWake() async {
+        // No-op safety: if we never entered `.recording` (e.g., engine
+        // was idle before sleep, paused, or error-with-no-session), we
+        // have nothing to bring back up. This guards the test scenario
+        // where `handleSystemDidWake` is invoked on an idle engine.
+        guard let gapStarted = gapStartedAt else {
+            // Wake without a prior willSleep — nothing to do.
+            return
+        }
+        gapStartedAt = nil
+
+        guard let session = currentSession else {
+            // Status was non-.recording at sleep-time (e.g. error). Stay
+            // wherever we are; the engine-recovery path (plan "Engine-state
+            // recovery from `error`") drives a re-attempt elsewhere.
+            return
+        }
+
+        let gap = nowProvider().timeIntervalSince(gapStarted)
+        let currentDeviceUID = deviceUIDProvider()
+        let outcome = HealRule.decide(
+            gap: gap,
+            deviceUID: currentDeviceUID,
+            lastDeviceUID: lastDeviceUID,
+            thresholdSeconds: healThresholdSeconds
+        )
+
+        await emit(.recovering(reason: "wake:gap=\(Int(gap.rounded()))s"))
+
+        switch outcome {
+        case .reuseSession(let healMarker):
+            // Stage the heal marker for the first segment of each
+            // rebuilt pipeline so the post-wake transcription carries
+            // the U2-schema `heal_marker` annotation.
+            pendingMicHealMarker = healMarker
+            pendingSysHealMarker = healMarker
+            pendingMicHealedGap = gap
+            pendingSysHealedGap = gap
+
+            do {
+                _ = try await bringUpPipelines(
+                    session: session,
+                    locale: currentLocale,
+                    device: currentDevice,
+                    systemAudio: isSystemAudioEnabled
+                )
+            } catch {
+                // bringUpPipelines transitions to .error on failure and
+                // emits a non-transient error event.
+                await emit(.error(
+                    "Wake (reuse) bring-up failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+            }
+
+        case .rollover:
+            // Close current session as `interrupted`. Use the same
+            // path orphan-sweep uses (sweepActiveOrphans then
+            // openFreshSession) since the active session is effectively
+            // an "orphan" of the pre-sleep capture.
+            do {
+                try await repository.sweepActiveOrphans()
+                let fresh = try await repository.openFreshSession(locale: currentLocale)
+                _ = try await bringUpPipelines(
+                    session: fresh,
+                    locale: currentLocale,
+                    device: currentDevice,
+                    systemAudio: isSystemAudioEnabled
+                )
+                // Emit a healed event reflecting the gap that triggered
+                // the rollover so the TUI surfaces a visible recovery.
+                await emit(.healed(gapSeconds: gap))
+            } catch {
+                await emit(.error(
+                    "Wake (rollover) failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+                await setStatus(.error)
+            }
+        }
+    }
+
+    // MARK: - U7 Device-Change Handler
+
+    /// Called by `AudioDeviceObserver` after a 250ms-debounced burst
+    /// of `AVAudioEngine.configurationChangeNotification` events
+    /// settles. Compares the post-debounce device UID and format
+    /// against the cached values from the last successful pipeline
+    /// bring-up and routes through the appropriate path:
+    ///
+    /// - **Same UID + same format** → cheap restart only. The
+    ///   AVAudioEngine has internally torn down (per Apple's docs the
+    ///   engine has already stopped by the time we receive the
+    ///   notification), so we still rebuild via U5's
+    ///   `restartMicPipeline`, but we do NOT invoke the heal rule.
+    ///   The first segment after rebuild gets `heal_marker =
+    ///   "after_gap:Ns"` per U5's machinery — that's the existing
+    ///   transient-restart behavior, not a heal-rule outcome.
+    ///
+    /// - **Different UID OR different format** → restart + heal rule.
+    ///   The heal rule's "device change → rollover" branch kicks in
+    ///   on UID mismatch; on format-only mismatch with same UID, the
+    ///   gap will be < 30s so the rule's `reuseSession` branch fires
+    ///   and the next segment carries a heal marker. The restart
+    ///   itself routes through U5's machinery.
+    ///
+    /// **Concurrency:** This runs on the actor, serialized against
+    /// recognizer-error-driven restarts and sleep/wake handlers. A
+    /// device-change arriving while a restart is already in flight
+    /// is dropped (the in-flight restart will rebuild against the
+    /// post-change device anyway). A device-change arriving while
+    /// the engine is `.idle`, `.stopping`, or stopped is a no-op.
+    public func handleAudioDeviceChange(deviceUID: String?, format: AVAudioFormat?) async {
+        // No-op safety: device-change events arriving outside an
+        // active recording are uninteresting (no pipeline to
+        // rebuild). Same gating as recognizer-error.
+        if isStopping || status == .stopping || status == .idle {
+            return
+        }
+        // Drop duplicates while a mic restart is already running —
+        // the in-flight restart will rebuild against whatever the
+        // current default-input device is when it lands.
+        if micRestartTask != nil { return }
+        // No active session means there's no mic pipeline to rebuild.
+        guard currentSession != nil else { return }
+
+        // Decide the path. Per the plan's "Key Technical Decisions":
+        // > Compare device UID before/after to distinguish "device
+        // > changed" (full session-rollover candidate) from "format
+        // > changed within same device" (cheaper re-tap path; still
+        // > triggers heal rule because format affects the analyzer).
+        let cachedUID = lastDeviceUID
+        let cachedFormat = lastMicFormat
+
+        let sameUID = (deviceUID == cachedUID)
+        let sameFormat = formatsEqual(format, cachedFormat)
+        let needsHealRule = !sameUID || !sameFormat
+
+        // Stamp gap entry so the heal rule (if invoked below) sees a
+        // realistic time-since-engine-stopped. The AVAudioEngine has
+        // already stopped by the time the notification arrives, so we
+        // approximate "engine stopped" with "now."
+        let gapEntry = nowProvider()
+
+        // Build a reason string the TUI surfaces via the
+        // .recovering(reason:) event.
+        let reason: String
+        if !sameUID {
+            reason = "device-change:uid:\(deviceUID ?? "nil")"
+        } else if !sameFormat {
+            reason = "device-change:format"
+        } else {
+            reason = "device-change:retap"
+        }
+
+        // Always go through U5's mic-restart machinery. The restart
+        // path tears down the recognizer, runs the (zero-or-short)
+        // backoff, and rebuilds via the audio source factory — which
+        // owns the new MicrophoneAudioSource + fresh AVAudioEngine.
+        await scheduleMicRestart(reason: reason, errorCode: "device_change")
+
+        // Wait for the restart to land before evaluating the heal
+        // rule. The restart task we just scheduled will clear
+        // micRestartTask on success. We poll the actor's own state
+        // (cheap — same actor) up to a short ceiling; if the restart
+        // is still going past the ceiling, we punt and let the U5
+        // exhaustion path own the outcome.
+        let pollDeadline = Date().addingTimeInterval(5.0)
+        while micRestartTask != nil && Date() < pollDeadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+
+        guard needsHealRule else {
+            // Cheap re-tap path — restart already ran via U5 (which
+            // staged its own `after_gap:Ns` heal marker). No heal-rule
+            // invocation, no session boundary change.
+            return
+        }
+
+        // Engine surrendered? Heal rule has nothing to act on.
+        if status == .error { return }
+
+        let gap = nowProvider().timeIntervalSince(gapEntry)
+        let outcome = HealRule.decide(
+            gap: gap,
+            deviceUID: deviceUID,
+            lastDeviceUID: cachedUID,
+            thresholdSeconds: healThresholdSeconds
+        )
+
+        switch outcome {
+        case .reuseSession(let healMarker):
+            // U5's restart machinery already staged a heal marker on
+            // the rebuilt mic pipeline. Replace it with the heal-rule's
+            // marker so the segment carries the rule's authoritative
+            // value (typically the same `after_gap:Ns` string, but the
+            // rule is the source of truth for the format).
+            pendingMicHealMarker = healMarker
+            pendingMicHealedGap = gap
+
+        case .rollover:
+            // UID changed → close current session as `interrupted`
+            // and open a fresh active session. Mirrors the wake
+            // rollover path: `sweepActiveOrphans()` marks any active
+            // session (the current one) as `interrupted`, then
+            // `openFreshSession` creates a new active row.
+            guard currentSession != nil else { return }
+            do {
+                try await repository.sweepActiveOrphans()
+                let fresh = try await repository.openFreshSession(locale: currentLocale)
+                currentSession = fresh
+                // Reset segment counter for the fresh session.
+                currentSequenceNumber = 0
+                segmentCount = 0
+                // Clear any pending mic heal-marker — the new session
+                // does not carry one (per HealRule contract).
+                pendingMicHealMarker = nil
+                pendingMicHealedGap = nil
+                // Surface the rollover to the TUI.
+                await emit(.healed(gapSeconds: gap))
+            } catch {
+                await emit(.error(
+                    "Device-change rollover failed: \(error.localizedDescription)",
+                    isTransient: false
+                ))
+            }
+        }
+    }
+
+    /// Compare two `AVAudioFormat` values for the purposes of the
+    /// device-change handler. Two `nil` formats compare equal (both
+    /// "unknown"). Otherwise we compare sample rate, channel count,
+    /// and common format — these are the dimensions the analyzer
+    /// cares about for the pipeline rebuild decision.
+    private nonisolated func formatsEqual(_ a: AVAudioFormat?, _ b: AVAudioFormat?) -> Bool {
+        if a == nil && b == nil { return true }
+        guard let a, let b else { return false }
+        return a.sampleRate == b.sampleRate
+            && a.channelCount == b.channelCount
+            && a.commonFormat == b.commonFormat
+    }
+
     // MARK: - Cleanup
 
     private func cleanup() async {
+        micRestartTask?.cancel()
+        micRestartTask = nil
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
         recognizerTask?.cancel()
         recognizerTask = nil
         await micRecognizerHandle?.stop()
@@ -570,5 +1513,105 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
         currentSession = nil
+        micBackoff = BackoffPolicy()
+        sysBackoff = BackoffPolicy()
+        pendingMicHealMarker = nil
+        pendingSysHealMarker = nil
+        pendingMicHealedGap = nil
+        pendingSysHealedGap = nil
+        micRestartEntryTime = nil
+        sysRestartEntryTime = nil
+        gapStartedAt = nil
+        lastMicFormat = nil
+    }
+}
+
+// MARK: - PowerEventTarget conformance (U6)
+
+/// `RecordingEngine` is the `PowerEventTarget` for
+/// `PowerManagementObserver`. Both methods are `async`, satisfied
+/// directly by the actor's isolated implementations.
+extension RecordingEngine: PowerEventTarget {
+    public nonisolated func systemWillSleep() async {
+        await handleSystemWillSleep()
+    }
+
+    public nonisolated func systemDidWake() async {
+        await handleSystemDidWake()
+    }
+}
+
+// MARK: - AudioDeviceEventTarget conformance (U7)
+
+/// `RecordingEngine` is the `AudioDeviceEventTarget` for
+/// `AudioDeviceObserver`. The protocol method is `async`, satisfied
+/// directly by the actor's isolated `handleAudioDeviceChange(...)`.
+extension RecordingEngine: AudioDeviceEventTarget {
+    public nonisolated func audioConfigurationChanged(deviceUID: String?, format: AVAudioFormat?) async {
+        await handleAudioDeviceChange(deviceUID: deviceUID, format: format)
+    }
+}
+
+// MARK: - SystemAudioRecoveryDelegate conformance (U8)
+
+/// `RecordingEngine` is the `SystemAudioRecoveryDelegate` for
+/// `SystemAudioSource`. The SCStream's delegate callback runs on its
+/// own internal queue; both methods are `async` and trampoline back
+/// onto the actor's isolation domain via the actor-isolated
+/// `handleSystemAudio*` implementations.
+extension RecordingEngine: SystemAudioRecoveryDelegate {
+
+    /// Called by `SystemAudioSource.stream(_:didStopWithError:)` after
+    /// classifying a transient SCStream error. Routes through U5's
+    /// `restartSystemPipeline(reason:errorCode:)` so the bounded
+    /// backoff handles wait + rebuild + surrender semantics. The
+    /// `errorCode` is the `domain#code` backoff key that
+    /// `BackoffPolicy` uses for "same-error" tracking.
+    public nonisolated func systemAudioRequestsRetry(errorCode: String, reason: String) async {
+        await handleSystemAudioRetry(errorCode: errorCode, reason: reason)
+    }
+
+    /// Called by `SystemAudioSource.stream(_:didStopWithError:)` after
+    /// classifying `userDeclined` (Screen Recording TCC revocation).
+    /// Emits a non-transient `recoveryExhausted` event with the
+    /// load-bearing `MIC_OR_SCREEN_PERMISSION_REVOKED` token,
+    /// transitions to `.error`, does NOT retry.
+    public nonisolated func systemAudioPermissionRevoked() async {
+        await handleSystemAudioPermissionRevoked()
+    }
+}
+
+extension RecordingEngine {
+
+    /// Actor-isolated handler for SCStream-driven retry requests. Drops
+    /// the request if a sys restart is already in flight (the in-flight
+    /// restart will rebuild against the freshly-classified failure
+    /// state) or if the engine is mid-teardown.
+    func handleSystemAudioRetry(errorCode: String, reason: String) async {
+        if isStopping || status == .stopping || status == .idle { return }
+        if sysRestartTask != nil { return }
+        await scheduleSysRestart(reason: reason, errorCode: errorCode)
+    }
+
+    /// Actor-isolated handler for SCStream `userDeclined` (TCC
+    /// revocation). Mirrors `handleMicrophonePermissionRevoked` in
+    /// shape: tear down the sys pipeline, emit the load-bearing
+    /// recoveryExhausted event, transition to `.error`. Mic
+    /// pipeline is unaffected — engine isolation between mic and sys
+    /// is preserved.
+    func handleSystemAudioPermissionRevoked() async {
+        // Cancel any in-flight sys restart.
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
+        await setStatus(.error)
     }
 }

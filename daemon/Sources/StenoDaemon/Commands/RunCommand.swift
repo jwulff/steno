@@ -68,21 +68,65 @@ struct RunCommand: ParsableCommand {
                 // 5. Create engine, broadcaster, dispatcher
                 let broadcaster = EventBroadcaster()
 
+                let settings = StenoSettings.load()
+
                 let engine = RecordingEngine(
                     repository: repository,
                     permissionService: permissionService,
                     summaryCoordinator: summaryCoordinator,
                     audioSourceFactory: audioSourceFactory,
                     speechRecognizerFactory: speechRecognizerFactory,
-                    delegate: broadcaster
+                    delegate: broadcaster,
+                    deviceUIDProvider: { defaultInputDeviceUID() },
+                    healThresholdSeconds: settings.healGapSeconds
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
 
-                // U6: register IOKit power observer here, BEFORE auto-start.
-                // The observer must be installed first so a willSleep arriving
-                // during the orphan sweep is queued (the actor serializes),
-                // not lost. U6 will land that observer; the slot is here.
+                // U6: register IOKit power observer BEFORE auto-start so
+                // a willSleep arriving during the orphan sweep is
+                // delivered to the actor (which serializes) and not lost.
+                // The observer routes its notification port through
+                // libdispatch on the main queue (not CFRunLoop, which
+                // doesn't pump under `dispatchMain()`).
+                let powerObserver = PowerManagementObserver()
+                do {
+                    try powerObserver.start(target: engine)
+                    log.info("Power observer registered (IOKit)")
+                } catch {
+                    // Non-fatal: the daemon can still record; we just
+                    // won't gracefully drain across sleep/wake. Surface
+                    // as a warning and continue.
+                    log.error("Power observer registration failed: \(error)")
+                }
+
+                // U7: register AVAudioEngine config-change observer
+                // BEFORE auto-start. Same reasoning as U6: a
+                // notification arriving during the orphan sweep should
+                // serialize through the actor, not be dropped on the
+                // floor. The observer subscribes to
+                // `AVAudioEngine.configurationChangeNotification` on
+                // `NotificationCenter.default` and trampolines
+                // debounced events into `engine.audioConfigurationChanged(...)`.
+                // formatProvider awaits the engine's cached mic format
+                // so U7's "same UID + same format" cheap-restart path
+                // can fire (the previous `{ nil }` placeholder always
+                // looked like a format change because lastMicFormat
+                // becomes non-nil after start). See PR #35 review
+                // (issue 5).
+                let deviceObserver = AudioDeviceObserver(
+                    deviceUIDProvider: { defaultInputDeviceUID() },
+                    formatProvider: { [engine] in await engine.currentMicFormat() }
+                )
+                do {
+                    try deviceObserver.start(target: engine)
+                    log.info("Audio device observer registered (AVAudioEngine config-change)")
+                } catch {
+                    // Non-fatal: the daemon can still record; we just
+                    // won't react to AirPods disconnect / USB unplug
+                    // until the next user-driven event.
+                    log.error("Audio device observer registration failed: \(error)")
+                }
 
                 // 5b. Auto-start recording. R1/R9: the daemon must never
                 // sit in `idle` after launch. Failure is logged but does
@@ -90,7 +134,6 @@ struct RunCommand: ParsableCommand {
                 // (e.g., mic permission denied) and the user can grant
                 // permission and trigger a retry via the TUI. Settings
                 // restore the last-known device + systemAudio choice.
-                let settings = StenoSettings.load()
                 do {
                     _ = try await engine.recoverOrphansAndAutoStart(
                         locale: .current,
@@ -125,6 +168,8 @@ struct RunCommand: ParsableCommand {
                 }
 
                 // 8. Graceful shutdown
+                powerObserver.stop()
+                deviceObserver.stop()
                 await engine.stop()
                 await server.stop()
                 pidFile.release()
