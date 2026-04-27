@@ -234,6 +234,101 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    // MARK: - Dedup (U11)
+
+    public func segmentsAfterDedupCursor(
+        sessionId: UUID,
+        source: AudioSourceType
+    ) async throws -> [StoredSegment] {
+        try await dbQueue.read { db in
+            // Read the session's cursor inside the same read so a concurrent
+            // `advanceDedupCursor` write can't race past us mid-iteration.
+            let cursor = try Int.fetchOne(
+                db,
+                sql: "SELECT last_deduped_segment_seq FROM sessions WHERE id = ?",
+                arguments: [sessionId.uuidString]
+            ) ?? 0
+
+            return try SegmentRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM segments
+                    WHERE sessionId = ?
+                      AND source = ?
+                      AND sequenceNumber > ?
+                      AND duplicate_of IS NULL
+                    ORDER BY sequenceNumber ASC
+                """,
+                arguments: [sessionId.uuidString, source.rawValue, cursor]
+            ).compactMap { $0.toDomain() }
+        }
+    }
+
+    public func overlappingSegments(
+        sessionId: UUID,
+        source: AudioSourceType,
+        from: Date,
+        to: Date
+    ) async throws -> [StoredSegment] {
+        try await dbQueue.read { db in
+            try SegmentRecord.fetchAll(
+                db,
+                sql: """
+                    SELECT * FROM segments
+                    WHERE sessionId = ?
+                      AND source = ?
+                      AND startedAt >= ?
+                      AND startedAt <= ?
+                    ORDER BY startedAt ASC
+                """,
+                arguments: [
+                    sessionId.uuidString,
+                    source.rawValue,
+                    from.timeIntervalSince1970,
+                    to.timeIntervalSince1970
+                ]
+            ).compactMap { $0.toDomain() }
+        }
+    }
+
+    public func markDuplicate(
+        micSegmentId: UUID,
+        sysSegmentId: UUID,
+        method: DedupMethod
+    ) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    UPDATE segments
+                    SET duplicate_of = ?, dedup_method = ?
+                    WHERE id = ?
+                """,
+                arguments: [
+                    sysSegmentId.uuidString,
+                    method.rawValue,
+                    micSegmentId.uuidString
+                ]
+            )
+        }
+    }
+
+    public func advanceDedupCursor(sessionId: UUID, toSequence: Int) async throws {
+        try await dbQueue.write { db in
+            // GREATEST-style guard: never let the cursor move backwards.
+            // SQLite's `MAX(a, b)` scalar function gives us this in-line so
+            // a concurrent pass that already advanced past `toSequence`
+            // doesn't get rolled back.
+            try db.execute(
+                sql: """
+                    UPDATE sessions
+                    SET last_deduped_segment_seq = MAX(last_deduped_segment_seq, ?)
+                    WHERE id = ?
+                """,
+                arguments: [toSequence, sessionId.uuidString]
+            )
+        }
+    }
+
     // MARK: - Summaries
 
     public func saveSummary(_ summary: Summary) async throws {

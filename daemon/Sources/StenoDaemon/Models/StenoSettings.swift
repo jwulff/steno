@@ -54,13 +54,41 @@ public struct StenoSettings: Codable, Sendable {
     /// Default: 30s per the plan.
     public var healGapSeconds: Int
 
+    /// U11 dedup overlap window, in seconds. A mic segment matches a sys
+    /// segment whose `startedAt` falls within `[mic.startedAt -
+    /// dedupOverlapSeconds, mic.startedAt + dedupOverlapSeconds]`. Default
+    /// 3.0s per the plan.
+    public var dedupOverlapSeconds: Double
+
+    /// U11 dedup similarity-score threshold. Mic segments scoring at or
+    /// above this against any overlapping sys candidate are marked as
+    /// duplicates. Default 0.92 — borderline scores fall below and are
+    /// KEPT (better to show a duplicate occasionally than to silently lose
+    /// unique mic content).
+    public var dedupScoreThreshold: Double
+
+    /// U11 audio-level guard threshold, in dBFS. A mic segment whose
+    /// `mic_peak_db` is at or above this is treated as actively spoken
+    /// (not passive pickup) and is KEPT regardless of similarity score.
+    /// Default -25.0 dBFS.
+    public var dedupMicPeakThresholdDb: Double
+
+    /// U11 trigger debounce window, in seconds. Multiple
+    /// `RecordingEngine.saveSegment` triggers for the same session
+    /// within this window collapse to a single dedup pass. Default 5.0s.
+    public var dedupTriggerDebounceSeconds: Double
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
         anthropicModel: String = "claude-3-5-haiku-20241022",
         lastDevice: String? = nil,
         lastSystemAudioEnabled: Bool = true,
-        healGapSeconds: Int = 30
+        healGapSeconds: Int = 30,
+        dedupOverlapSeconds: Double = 3.0,
+        dedupScoreThreshold: Double = 0.92,
+        dedupMicPeakThresholdDb: Double = -25.0,
+        dedupTriggerDebounceSeconds: Double = 5.0
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -68,6 +96,10 @@ public struct StenoSettings: Codable, Sendable {
         self.lastDevice = lastDevice
         self.lastSystemAudioEnabled = lastSystemAudioEnabled
         self.healGapSeconds = healGapSeconds
+        self.dedupOverlapSeconds = dedupOverlapSeconds
+        self.dedupScoreThreshold = dedupScoreThreshold
+        self.dedupMicPeakThresholdDb = dedupMicPeakThresholdDb
+        self.dedupTriggerDebounceSeconds = dedupTriggerDebounceSeconds
     }
 
     // MARK: - Codable
@@ -82,6 +114,10 @@ public struct StenoSettings: Codable, Sendable {
         case lastDevice
         case lastSystemAudioEnabled
         case healGapSeconds
+        case dedupOverlapSeconds
+        case dedupScoreThreshold
+        case dedupMicPeakThresholdDb
+        case dedupTriggerDebounceSeconds
     }
 
     public init(from decoder: Decoder) throws {
@@ -92,6 +128,10 @@ public struct StenoSettings: Codable, Sendable {
         self.lastDevice = try container.decodeIfPresent(String.self, forKey: .lastDevice)
         self.lastSystemAudioEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastSystemAudioEnabled) ?? true
         self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? 30
+        self.dedupOverlapSeconds = try container.decodeIfPresent(Double.self, forKey: .dedupOverlapSeconds) ?? 3.0
+        self.dedupScoreThreshold = try container.decodeIfPresent(Double.self, forKey: .dedupScoreThreshold) ?? 0.92
+        self.dedupMicPeakThresholdDb = try container.decodeIfPresent(Double.self, forKey: .dedupMicPeakThresholdDb) ?? -25.0
+        self.dedupTriggerDebounceSeconds = try container.decodeIfPresent(Double.self, forKey: .dedupTriggerDebounceSeconds) ?? 5.0
     }
 
     // MARK: - Persistence

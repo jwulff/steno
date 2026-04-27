@@ -186,6 +186,79 @@ actor MockTranscriptRepository: TranscriptRepository {
         segments[sessionId]?.map(\.sequenceNumber).max() ?? 0
     }
 
+    // MARK: - Dedup (U11)
+
+    /// Optional throw-injection: when set, `markDuplicate` raises and the
+    /// coordinator's cursor advance step is skipped. Used to test the
+    /// failure-safe (cursor-not-bumped-on-throw) contract.
+    private var markDuplicateError: Error?
+
+    func setMarkDuplicateError(_ error: Error?) {
+        markDuplicateError = error
+    }
+
+    func segmentsAfterDedupCursor(sessionId: UUID, source: AudioSourceType) async throws -> [StoredSegment] {
+        guard let session = sessions[sessionId] else { return [] }
+        let cursor = session.lastDedupedSegmentSeq
+        let segs = segments[sessionId] ?? []
+        return segs
+            .filter { $0.source == source && $0.sequenceNumber > cursor && $0.duplicateOf == nil }
+            .sorted { $0.sequenceNumber < $1.sequenceNumber }
+    }
+
+    func overlappingSegments(
+        sessionId: UUID,
+        source: AudioSourceType,
+        from: Date,
+        to: Date
+    ) async throws -> [StoredSegment] {
+        let segs = segments[sessionId] ?? []
+        return segs
+            .filter { $0.source == source && $0.startedAt >= from && $0.startedAt <= to }
+            .sorted { $0.startedAt < $1.startedAt }
+    }
+
+    func markDuplicate(
+        micSegmentId: UUID,
+        sysSegmentId: UUID,
+        method: DedupMethod
+    ) async throws {
+        if let err = markDuplicateError { throw err }
+        for (sid, segs) in segments {
+            if let idx = segs.firstIndex(where: { $0.id == micSegmentId }) {
+                let old = segs[idx]
+                let updated = StoredSegment(
+                    id: old.id,
+                    sessionId: old.sessionId,
+                    text: old.text,
+                    startedAt: old.startedAt,
+                    endedAt: old.endedAt,
+                    confidence: old.confidence,
+                    sequenceNumber: old.sequenceNumber,
+                    createdAt: old.createdAt,
+                    source: old.source,
+                    healMarker: old.healMarker,
+                    duplicateOf: sysSegmentId,
+                    dedupMethod: method,
+                    micPeakDb: old.micPeakDb
+                )
+                var copy = segs
+                copy[idx] = updated
+                segments[sid] = copy
+                return
+            }
+        }
+    }
+
+    func advanceDedupCursor(sessionId: UUID, toSequence: Int) async throws {
+        guard var session = sessions[sessionId] else { return }
+        // GREATEST-style — never move backwards.
+        if toSequence > session.lastDedupedSegmentSeq {
+            session.lastDedupedSegmentSeq = toSequence
+            sessions[sessionId] = session
+        }
+    }
+
     // MARK: - Summaries
 
     func saveSummary(_ summary: Summary) async throws {

@@ -28,6 +28,8 @@ public actor RecordingEngine {
     private let repository: TranscriptRepository
     private let permissionService: PermissionService
     private let summaryCoordinator: RollingSummaryCoordinator
+    private let dedupCoordinator: DedupCoordinator?
+    private let dedupTriggerDebounce: Duration
     private let audioSourceFactory: AudioSourceFactory
     private let speechRecognizerFactory: SpeechRecognizerFactory
     private var delegate: (any RecordingEngineDelegate)?
@@ -77,6 +79,22 @@ public actor RecordingEngine {
     private var lastLevelEmitTime: Date = .distantPast
     private var pendingMicLevel: Float = 0
     private var pendingSystemLevel: Float = 0
+
+    /// Peak linear-PCM amplitude observed on the mic across the *current
+    /// in-flight segment*. Updated on every buffer (max), snapshotted +
+    /// converted to dBFS at segment-finalize time, then reset on the next
+    /// partial-text emission for that source. `0` represents silence /
+    /// no-buffers-seen-yet — the converter floors the dBFS at -90 to
+    /// avoid `log10(0) = -inf`.
+    private var currentMicSegmentPeak: Float = 0
+
+    // MARK: - U11 dedup-trigger debounce state
+
+    /// Per-session trailing-edge debounce tasks. A fresh `saveSegment`
+    /// trigger replaces the prior task with a new one that sleeps for the
+    /// configured debounce window and then runs `dedupCoordinator.runPass`.
+    /// Multiple segment writes within the window collapse to a single pass.
+    private var pendingDedupTriggers: [UUID: Task<Void, Never>] = [:]
 
     /// Minimum interval between audio level events (10Hz = 100ms).
     private let levelInterval: TimeInterval = 0.1
@@ -162,7 +180,9 @@ public actor RecordingEngine {
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
         healThresholdSeconds: Int = 30,
-        now: @Sendable @escaping () -> Date = { Date() }
+        now: @Sendable @escaping () -> Date = { Date() },
+        dedupCoordinator: DedupCoordinator? = nil,
+        dedupTriggerDebounce: Duration = .seconds(5)
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -175,6 +195,8 @@ public actor RecordingEngine {
         self.deviceUIDProvider = deviceUIDProvider
         self.healThresholdSeconds = healThresholdSeconds
         self.nowProvider = now
+        self.dedupCoordinator = dedupCoordinator
+        self.dedupTriggerDebounce = dedupTriggerDebounce
     }
 
     // MARK: - Public Commands
@@ -560,6 +582,13 @@ public actor RecordingEngine {
         sysRestartEntryTime = nil
         lastMicFormat = nil
 
+        // U11: cancel any in-flight dedup-trigger debounce tasks. Their
+        // sleeps will throw and the tasks return without invoking the
+        // coordinator — a clean teardown.
+        for (_, task) in pendingDedupTriggers { task.cancel() }
+        pendingDedupTriggers.removeAll()
+        currentMicSegmentPeak = 0
+
         await setStatus(.idle)
         isStopping = false
     }
@@ -633,6 +662,18 @@ public actor RecordingEngine {
                 pendingSysHealMarker = nil
             }
 
+            // U11: snapshot the per-segment mic peak (linear PCM) and
+            // convert to dBFS for the dedup audio-level guard. Reset to
+            // 0 so the next mic segment's metering starts fresh. Sys-side
+            // segments don't carry this — `mic_peak_db` is mic-only.
+            let micPeakDb: Double?
+            if result.source == .microphone {
+                micPeakDb = Self.linearPeakToDbFS(currentMicSegmentPeak)
+                currentMicSegmentPeak = 0
+            } else {
+                micPeakDb = nil
+            }
+
             let segment = StoredSegment(
                 sessionId: session.id,
                 text: result.text,
@@ -641,7 +682,8 @@ public actor RecordingEngine {
                 confidence: result.confidence,
                 sequenceNumber: currentSequenceNumber,
                 source: result.source,
-                healMarker: healMarker
+                healMarker: healMarker,
+                micPeakDb: micPeakDb
             )
 
             // Persist
@@ -653,6 +695,12 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
+
+            // U11: schedule a debounced dedup pass for this session. The
+            // pass runs in a detached task so the segment-save hot path
+            // is not blocked. Multiple triggers within the debounce
+            // window collapse to a single pass per session.
+            scheduleDedupTrigger(sessionId: session.id)
 
             // U5: a finalized segment counts toward the per-source
             // backoff reset (segment-finalized gate). The wall-clock
@@ -1144,6 +1192,10 @@ public actor RecordingEngine {
 
     private func updateMicLevel(_ peak: Float) {
         pendingMicLevel = max(pendingMicLevel, peak)
+        // U11: track the peak across the *current in-flight mic segment*
+        // for the dedup audio-level guard. Snapshotted + reset on segment
+        // finalize.
+        currentMicSegmentPeak = max(currentMicSegmentPeak, peak)
     }
 
     private func updateSystemLevel(_ peak: Float) {
@@ -1177,6 +1229,52 @@ public actor RecordingEngine {
             if sample > peak { peak = sample }
         }
         return peak
+    }
+
+    /// Convert a linear-PCM peak (0.0–1.0) to dBFS for the U11 dedup
+    /// audio-level guard. Floors at -90 dBFS for silence to avoid
+    /// `log10(0) = -inf`. Anything at or above 1.0 (clipping) reports as
+    /// 0 dBFS.
+    static func linearPeakToDbFS(_ peak: Float) -> Double {
+        let p = Double(peak)
+        guard p > 0 else { return -90.0 }
+        let db = 20.0 * log10(min(p, 1.0))
+        return max(-90.0, db)
+    }
+
+    // MARK: - U11 Dedup-Trigger Debounce
+
+    /// Schedule (or reset) the trailing-edge debounce timer for a session's
+    /// dedup pass. A new trigger replaces any prior pending task — the new
+    /// one sleeps for `dedupTriggerDebounce`, then runs the pass. If the
+    /// engine has no `dedupCoordinator` (test default), this is a no-op.
+    private func scheduleDedupTrigger(sessionId: UUID) {
+        guard let coordinator = dedupCoordinator else { return }
+        // Cancel the prior pending task — its sleep will throw and the
+        // task returns without invoking the coordinator.
+        pendingDedupTriggers[sessionId]?.cancel()
+        let debounce = dedupTriggerDebounce
+        let task: Task<Void, Never> = Task { [weak self] in
+            do {
+                try await Task.sleep(for: debounce)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await self.clearPendingDedupTrigger(sessionId: sessionId)
+            // The coordinator owns its own reentrance — multiple cross-session
+            // passes can run in parallel; same-session collapse is the
+            // coordinator's responsibility.
+            await coordinator.runPass(sessionId: sessionId)
+        }
+        pendingDedupTriggers[sessionId] = task
+    }
+
+    /// Clear the entry for a session's pending trigger. Called by the
+    /// debounce task itself after it fires (so a fresh trigger arriving
+    /// AFTER the pass starts schedules a new task rather than racing).
+    private func clearPendingDedupTrigger(sessionId: UUID) {
+        pendingDedupTriggers[sessionId] = nil
     }
 
     // MARK: - U6 Sleep/Wake Handlers
@@ -1523,6 +1621,9 @@ public actor RecordingEngine {
         sysRestartEntryTime = nil
         gapStartedAt = nil
         lastMicFormat = nil
+        for (_, task) in pendingDedupTriggers { task.cancel() }
+        pendingDedupTriggers.removeAll()
+        currentMicSegmentPeak = 0
     }
 }
 

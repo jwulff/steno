@@ -123,6 +123,42 @@ public protocol TranscriptRepository: Sendable {
     ///   segments, or 0 when the session has no segments.
     func maxSegmentSequence(for sessionId: UUID) async throws -> Int
 
+    // MARK: - Dedup (U11)
+
+    /// Segments past the session's `last_deduped_segment_seq` cursor that
+    /// match the given source AND are not already marked as duplicates.
+    /// Used by `DedupCoordinator` to enumerate candidates for evaluation.
+    ///
+    /// - Parameters:
+    ///   - sessionId: The session ID.
+    ///   - source: Filter by source (typically `.microphone`).
+    /// - Returns: Segments ordered by `sequenceNumber` ascending.
+    func segmentsAfterDedupCursor(sessionId: UUID, source: AudioSourceType) async throws -> [StoredSegment]
+
+    /// Segments in `sessionId` of the given `source` whose `startedAt`
+    /// falls within `[from, to]`. Used by `DedupCoordinator` to find
+    /// time-overlapping sys candidates for a given mic segment.
+    func overlappingSegments(
+        sessionId: UUID,
+        source: AudioSourceType,
+        from: Date,
+        to: Date
+    ) async throws -> [StoredSegment]
+
+    /// Mark a mic segment as a duplicate of a sys segment. Sets both
+    /// `duplicate_of` and `dedup_method` in a single UPDATE.
+    func markDuplicate(
+        micSegmentId: UUID,
+        sysSegmentId: UUID,
+        method: DedupMethod
+    ) async throws
+
+    /// Advance the per-session dedup cursor to `toSequence`. Last step of
+    /// a `DedupCoordinator.runPass` — only committed after all
+    /// `markDuplicate` calls succeed, so a partial failure leaves the
+    /// cursor unchanged and the next pass re-evaluates from the same point.
+    func advanceDedupCursor(sessionId: UUID, toSequence: Int) async throws
+
     // MARK: - Summaries
 
     /// Save a summary.

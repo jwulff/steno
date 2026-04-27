@@ -60,6 +60,9 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             return nil
         }
 
+        let dupUUID = duplicateOf.flatMap { UUID(uuidString: $0) }
+        let method = dedupMethod.flatMap { DedupMethod(rawValue: $0) }
+
         return StoredSegment(
             id: uuid,
             sessionId: sessionUUID,
@@ -70,7 +73,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             sequenceNumber: sequenceNumber,
             createdAt: Date(timeIntervalSince1970: createdAt),
             source: AudioSourceType(rawValue: source) ?? .microphone,
-            healMarker: healMarker
+            healMarker: healMarker,
+            duplicateOf: dupUUID,
+            dedupMethod: method,
+            micPeakDb: micPeakDb
         )
     }
 
@@ -79,10 +85,13 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     /// - Parameter segment: The domain StoredSegment.
     /// - Returns: A SegmentRecord ready for persistence.
     ///
-    /// Note: U2 dedup fields (`duplicateOf`, `dedupMethod`) default to
-    /// NULL here — those writers land in U11. The `healMarker` field is
-    /// pulled directly off the domain model: U5's restart path stamps it
-    /// on the first segment after a successful pipeline rebuild.
+    /// Note: dedup fields (`duplicateOf`, `dedupMethod`) typically stay
+    /// `nil` at insert time — `DedupCoordinator` (U11) writes them via
+    /// `markDuplicate`'s UPDATE, not via re-insert. The `healMarker`
+    /// field is pulled directly off the domain model: U5's restart
+    /// path stamps it on the first segment after a successful pipeline
+    /// rebuild. `micPeakDb` is plumbed through from the engine for mic
+    /// segments (U11 audio-level guard).
     static func from(_ segment: StoredSegment) -> SegmentRecord {
         SegmentRecord(
             id: segment.id.uuidString,
@@ -94,10 +103,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             sequenceNumber: segment.sequenceNumber,
             createdAt: segment.createdAt.timeIntervalSince1970,
             source: segment.source.rawValue,
-            duplicateOf: nil,
-            dedupMethod: nil,
+            duplicateOf: segment.duplicateOf?.uuidString,
+            dedupMethod: segment.dedupMethod?.rawValue,
             healMarker: segment.healMarker,
-            micPeakDb: nil
+            micPeakDb: segment.micPeakDb
         )
     }
 }

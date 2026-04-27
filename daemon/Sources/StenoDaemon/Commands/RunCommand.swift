@@ -70,6 +70,15 @@ struct RunCommand: ParsableCommand {
 
                 let settings = StenoSettings.load()
 
+                // U11: cross-source dedup coordinator runs as a background
+                // pass after each segment write, debounced per-session.
+                let dedupCoordinator = DedupCoordinator(
+                    repository: repository,
+                    overlapSeconds: settings.dedupOverlapSeconds,
+                    scoreThreshold: settings.dedupScoreThreshold,
+                    micPeakThresholdDb: settings.dedupMicPeakThresholdDb
+                )
+
                 let engine = RecordingEngine(
                     repository: repository,
                     permissionService: permissionService,
@@ -78,7 +87,9 @@ struct RunCommand: ParsableCommand {
                     speechRecognizerFactory: speechRecognizerFactory,
                     delegate: broadcaster,
                     deviceUIDProvider: { defaultInputDeviceUID() },
-                    healThresholdSeconds: settings.healGapSeconds
+                    healThresholdSeconds: settings.healGapSeconds,
+                    dedupCoordinator: dedupCoordinator,
+                    dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds)
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
