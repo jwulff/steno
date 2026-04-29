@@ -97,9 +97,13 @@ public struct StenoSettings: Codable, Sendable {
 
     /// U12 retention guard: sessions whose `endedAt` is older than
     /// `now - retentionDays * 86400` are cascade-deleted at daemon start.
-    /// Default 90 days. Set to 0 to disable. A more sophisticated retention
-    /// policy is a deferred follow-up; this is the minimal hedge against
-    /// unbounded disk growth.
+    /// **Default 0 = indefinite** — keep everything. Back-of-envelope
+    /// (~150 wpm × 10 active hrs/day × 365 days) puts a year of always-on
+    /// transcript text at ~100–200 MB on disk including indexes and dedup
+    /// metadata, which is small enough on modern hardware that an automatic
+    /// cap is more likely to lose moments the user wanted than to save
+    /// meaningful disk. Set to a positive integer if you want a hard
+    /// rolling window for privacy or storage reasons.
     public var retentionDays: Int
 
     public init(
@@ -116,7 +120,7 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
-        retentionDays: Int = 90
+        retentionDays: Int = 0
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -171,7 +175,7 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinChars = try container.decodeIfPresent(Int.self, forKey: .emptySessionMinChars) ?? 20
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
-        self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 90
+        self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
     }
 
     // MARK: - Persistence
