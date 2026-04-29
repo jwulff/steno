@@ -37,6 +37,16 @@ public enum EngineEvent: Sendable {
     /// attempts (U5). Engine status transitions to `.error`. The TUI
     /// surfaces this as a non-transient error (U9).
     case recoveryExhausted(reason: String)
+    /// Ephemeral: pause state changed (U10). Emitted on every transition
+    /// into and out of `.paused`.
+    ///
+    /// - `paused`: `true` when entering the paused state, `false` when
+    ///   resuming.
+    /// - `indefinite`: `true` when paused with no auto-resume (R3 —
+    ///   privacy-critical disambiguator). Always `false` on resume.
+    /// - `expiresAt`: wall-clock instant the auto-resume timer will fire.
+    ///   `nil` for indefinite pauses and on resume.
+    case pauseStateChanged(paused: Bool, indefinite: Bool, expiresAt: Date?)
 }
 
 /// Status of the recording engine.
@@ -51,6 +61,11 @@ public enum EngineStatus: String, Sendable, Codable {
     /// should expect a brief gap in transcription. Status returns to
     /// `.recording` on success or `.error` on surrender.
     case recovering
+    /// User-requested hard pause (U10). NO audio capture, NO recognizer,
+    /// NO power assertion held. The most-recent session row carries the
+    /// `pause_expires_at` / `paused_indefinitely` columns so a daemon
+    /// restart re-enters this state (R-F privacy invariant).
+    case paused
 }
 
 /// Delegate that receives events from the RecordingEngine.

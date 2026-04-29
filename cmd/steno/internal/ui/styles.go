@@ -100,4 +100,52 @@ var (
 	MagentaStyle = lipgloss.NewStyle().
 			Foreground(ColorMagenta).
 			Bold(true)
+
+	// U9 — health-surface state styles.
+
+	// PausedStyle: blue/cyan paused indicator.
+	PausedStyle = lipgloss.NewStyle().
+			Foreground(ColorCyan).
+			Bold(true)
+
+	// RecoveringStyle: yellow ⚠ for in-progress pipeline restart (transient).
+	RecoveringStyle = lipgloss.NewStyle().
+			Foreground(ColorYellow).
+			Bold(true)
+
+	// FailedStyle: red ✗ for non-transient surrender.
+	FailedStyle = lipgloss.NewStyle().
+			Foreground(ColorRed).
+			Bold(true)
+
+	// DisconnectedStyle: gray ◌ for daemon socket lost / TUI-side reconnect.
+	// Visually distinct from RECOVERING (which is daemon-internal).
+	DisconnectedStyle = lipgloss.NewStyle().
+				Foreground(ColorGray).
+				Bold(true)
+
+	// LastSegWarnStyle: yellow text for the "last segment Ns ago" annotation
+	// when N >= 60s while not paused.
+	LastSegWarnStyle = lipgloss.NewStyle().
+				Foreground(ColorYellow)
+
+	// HealMarkerStyle: dim yellow inline annotation in the segment timeline.
+	HealMarkerStyle = lipgloss.NewStyle().
+			Foreground(ColorYellow).
+			Italic(true)
+
+	// FirstLaunchBannerStyle: cyan banner for the consent disclosure on
+	// first launch.
+	FirstLaunchBannerStyle = lipgloss.NewStyle().
+				Foreground(ColorCyan).
+				Bold(true).
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(ColorCyan).
+				Padding(0, 1)
+
+	// ErrorModalStyle: bordered overlay for the `e` error-history modal.
+	ErrorModalStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColorRed).
+			Padding(0, 1)
 )

@@ -120,3 +120,25 @@ type SummaryLoadedMsg struct {
 
 // ReconnectTickMsg triggers a reconnection attempt.
 type ReconnectTickMsg struct{}
+
+// PauseResponseMsg carries the response to a pause/resume command (U9).
+type PauseResponseMsg struct {
+	Response daemon.Response
+}
+
+// DemarcateResponseMsg carries the response to a demarcate command (U9).
+type DemarcateResponseMsg struct {
+	Response daemon.Response
+}
+
+// PauseHintMsg flashes a "press p to resume first" hint at the bottom of
+// the status bar when the user presses spacebar while paused. Cleared
+// after ~2s by ClearPauseHintMsg.
+type PauseHintMsg struct{}
+
+// ClearPauseHintMsg clears a transient pause-hint after a timeout.
+type ClearPauseHintMsg struct{}
+
+// StatusTickMsg fires once per second so the status bar (countdown,
+// last-seg-ago) can re-render even when no upstream events arrive.
+type StatusTickMsg struct{}

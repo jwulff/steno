@@ -40,6 +40,10 @@ func createTestDB(t *testing.T) *sql.DB {
 			sequenceNumber INTEGER NOT NULL,
 			createdAt REAL NOT NULL,
 			source TEXT NOT NULL DEFAULT 'microphone',
+			duplicate_of TEXT,
+			dedup_method TEXT,
+			heal_marker TEXT,
+			mic_peak_db REAL,
 			UNIQUE(sessionId, sequenceNumber)
 		);
 

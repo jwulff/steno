@@ -348,11 +348,16 @@ func (s *Store) SummariesForSession(sessionID string) ([]Summary, error) {
 }
 
 // SegmentsForSession returns paginated segments for a session.
+//
+// Default-filter (U9): rows where `duplicate_of IS NOT NULL` are excluded
+// — these are mic segments that the daemon's DedupCoordinator (U11)
+// marked as duplicates of an overlapping system-audio segment. Raw access
+// to all segments (including duplicates) is reserved for diagnostic SQL.
 func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
 		FROM segments
-		WHERE sessionId = ?
+		WHERE sessionId = ? AND duplicate_of IS NULL
 		ORDER BY sequenceNumber ASC
 		LIMIT ? OFFSET ?
 	`, sessionID, limit, offset)
@@ -364,11 +369,14 @@ func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segme
 }
 
 // SegmentsForRange returns segments within a sequence number range for a session.
+//
+// Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
 		FROM segments
 		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
+		  AND duplicate_of IS NULL
 		ORDER BY sequenceNumber ASC
 	`, sessionID, start, end)
 	if err != nil {
@@ -379,9 +387,11 @@ func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, e
 }
 
 // SegmentsForTimeRange returns segments within a time window for a session.
+//
+// Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time) ([]Segment, error) {
 	query := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
-		FROM segments WHERE sessionId = ?`
+		FROM segments WHERE sessionId = ? AND duplicate_of IS NULL`
 	args := []any{sessionID}
 
 	if after != nil {
@@ -404,9 +414,11 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 }
 
 // SearchSegments searches segment text using LIKE.
+//
+// Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, error) {
 	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
-		FROM segments WHERE text LIKE ? ESCAPE '\'`
+		FROM segments WHERE text LIKE ? ESCAPE '\' AND duplicate_of IS NULL`
 	args := []any{"%" + escapeLike(query) + "%"}
 
 	if sessionID != "" {
@@ -489,9 +501,12 @@ func (s *Store) SearchSummaries(query, sessionID string, limit int) ([]Summary, 
 }
 
 // SessionCounts returns segment, topic, and summary counts for a session.
+//
+// Default-filter (U9): segment count excludes `duplicate_of IS NOT NULL`
+// rows, matching the default-filter applied by the segment readers.
 func (s *Store) SessionCounts(sessionID string) (SessionCounts, error) {
 	var c SessionCounts
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM segments WHERE sessionId = ?`, sessionID).Scan(&c.Segments)
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM segments WHERE sessionId = ? AND duplicate_of IS NULL`, sessionID).Scan(&c.Segments)
 	if err != nil {
 		return c, fmt.Errorf("count segments: %w", err)
 	}

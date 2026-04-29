@@ -87,7 +87,7 @@ func createTestDB(t *testing.T) *sql.DB {
 	d.SetMaxOpenConns(1)
 	schema := `
 		CREATE TABLE sessions (id TEXT PRIMARY KEY, locale TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL, title TEXT, status TEXT NOT NULL DEFAULT 'active', createdAt REAL NOT NULL);
-		CREATE TABLE segments (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), text TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL NOT NULL, confidence REAL, sequenceNumber INTEGER NOT NULL, createdAt REAL NOT NULL, source TEXT NOT NULL DEFAULT 'microphone', UNIQUE(sessionId, sequenceNumber));
+		CREATE TABLE segments (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), text TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL NOT NULL, confidence REAL, sequenceNumber INTEGER NOT NULL, createdAt REAL NOT NULL, source TEXT NOT NULL DEFAULT 'microphone', duplicate_of TEXT, dedup_method TEXT, heal_marker TEXT, mic_peak_db REAL, UNIQUE(sessionId, sequenceNumber));
 		CREATE TABLE topics (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), title TEXT NOT NULL, summary TEXT NOT NULL, segmentRangeStart INTEGER NOT NULL, segmentRangeEnd INTEGER NOT NULL, createdAt REAL NOT NULL);
 		CREATE TABLE summaries (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), content TEXT NOT NULL, summaryType TEXT NOT NULL, segmentRangeStart INTEGER NOT NULL, segmentRangeEnd INTEGER NOT NULL, modelId TEXT NOT NULL, createdAt REAL NOT NULL);
 	`

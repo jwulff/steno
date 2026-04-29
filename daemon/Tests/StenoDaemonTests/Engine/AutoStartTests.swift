@@ -214,7 +214,7 @@ struct AutoStartTests {
 
     // MARK: - Pause-state restore (privacy-critical)
 
-    @Test("Pause-state-restore: paused_indefinitely=1 prevents auto-start, sweeps orphans, engine stays idle")
+    @Test("Pause-state-restore: paused_indefinitely=1 prevents auto-start, sweeps orphans, engine restores .paused (U10)")
     func pausedIndefinitelyPreventsAutoStart() async throws {
         let repo = MockTranscriptRepository()
 
@@ -252,9 +252,9 @@ struct AutoStartTests {
         // No fresh active session opened.
         #expect(result == nil)
 
-        // Engine remains idle (privacy-critical: not `.recording`).
+        // U10: engine restores into `.paused` (privacy-critical: not `.recording`).
         let status = await engine.status
-        #expect(status == .idle)
+        #expect(status == .paused)
 
         // Orphan is still closed (sweep ran).
         let orphanAfter = try await repo.session(orphanId)
@@ -270,7 +270,7 @@ struct AutoStartTests {
         #expect(errors.contains(where: { $0.0.contains("pause is still active") && $0.1 == false }))
     }
 
-    @Test("Pause-state-restore: pause_expires_at in the future prevents auto-start")
+    @Test("Pause-state-restore: pause_expires_at in the future restores .paused (U10)")
     func pauseExpiresAtFuturePreventsAutoStart() async throws {
         let repo = MockTranscriptRepository()
 
@@ -296,7 +296,7 @@ struct AutoStartTests {
 
         #expect(result == nil)
         let status = await engine.status
-        #expect(status == .idle)
+        #expect(status == .paused)
     }
 
     @Test("Pause-state-restore: pause_expires_at in the past allows auto-start to proceed")

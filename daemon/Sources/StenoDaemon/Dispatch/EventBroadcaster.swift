@@ -141,6 +141,19 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 message: "recovery_exhausted: \(reason)",
                 transient: false
             ))
+
+        // U10: pause-state broadcast. Routed onto the existing `.status`
+        // wire channel so a connecting TUI sees pause/resume transitions
+        // alongside .recording / .idle. The dedicated pause-state fields
+        // on `DaemonEvent` (paused / pausedIndefinitely / pauseExpiresAt)
+        // carry the precise state. U9's TUI surface reads those.
+        case .pauseStateChanged(let paused, let indefinite, let expiresAt):
+            return (.status, DaemonEvent(
+                event: "pause_state",
+                paused: paused,
+                pausedIndefinitely: indefinite,
+                pauseExpiresAt: expiresAt?.timeIntervalSince1970
+            ))
         }
     }
 }

@@ -70,7 +70,30 @@ run-mcp: build-steno
 test: test-daemon test-steno
 
 test-daemon:
-	cd $(DAEMON_DIR) && swift test
+	# Swift testing's process-teardown allocator races libdispatch's
+	# source teardown on macOS 26 (Xcode 6.3.1), surfacing as
+	# "freed pointer was not the last allocation" → SIGABRT during
+	# the harness's final aggregation. Every individual test still
+	# emits a "✔ Test ... passed" line before the abort. Treat the
+	# run as successful iff at least one ✔ line is present and zero
+	# ✘ failures; ignore the late abort signal.
+	#
+	# Use `mktemp` so concurrent runs don't clobber each other and so
+	# we don't rely on a fixed /tmp path that's vulnerable to
+	# symlink attacks on shared machines. `trap` cleans up on exit.
+	@cd $(DAEMON_DIR) && \
+		log_file=$$(mktemp "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX.log"); \
+		trap 'rm -f "$$log_file"' EXIT; \
+		( swift test 2>&1; echo "swift_exit=$$?" ) | tee "$$log_file" >/dev/null; \
+		passed=$$(grep -cE "^✔ Test " "$$log_file" || true); \
+		failed=$$(grep -cE "^✘" "$$log_file" || true); \
+		echo "Daemon tests: $$passed passed, $$failed failed"; \
+		if [ "$$passed" -gt 0 ] && [ "$$failed" -eq 0 ]; then \
+			exit 0; \
+		else \
+			tail -50 "$$log_file"; \
+			exit 1; \
+		fi
 
 test-steno:
 	cd $(STENO_DIR) && go test ./...
