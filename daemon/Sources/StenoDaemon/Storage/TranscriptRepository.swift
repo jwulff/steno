@@ -62,6 +62,25 @@ public protocol TranscriptRepository: Sendable {
     /// - Parameter sessionId: The ID of the session to end.
     func endSession(_ sessionId: UUID) async throws
 
+    /// Atomically close `closingId` (UPDATE → status='completed', endedAt=now)
+    /// AND insert a fresh active session — both inside a single SQLite
+    /// write transaction. Used by U10's `demarcate` to guarantee the
+    /// invariant that at most one row is `status='active'` at any
+    /// instant: if the close fails, the new row is NOT inserted; if
+    /// the insert fails, the close is rolled back.
+    ///
+    /// Required because the prior implementation used two separate
+    /// writes (`endSession` then `openFreshSession`) with `try?` on the
+    /// close — a UPDATE failure could leave the closing session
+    /// `active` while the new session was also `active`, violating the
+    /// invariant. (Cluster-4 review finding; see PR #37.)
+    ///
+    /// - Parameters:
+    ///   - closingId: The session to close.
+    ///   - locale: The locale for the newly opened session.
+    /// - Returns: The newly opened active session.
+    func closeAndOpenSession(closingId: UUID, locale: Locale) async throws -> Session
+
     /// Retrieve a session by ID.
     ///
     /// - Parameter id: The session ID.

@@ -162,11 +162,20 @@ public actor CommandDispatcher {
     private func handleDemarcate() async -> DaemonResponse {
         do {
             let fresh = try await engine.demarcate()
+            // Re-read the engine status AFTER `demarcate()` returns. The
+            // happy path leaves status at `.recording`, but `demarcate`
+            // can succeed in `.recovering` (the queued path returns the
+            // current pre-recovery session and waits for the next
+            // return-to-`.recording` transition to apply the boundary).
+            // Reporting `recording: true / status: "recording"` in the
+            // recovering case would lie to the client; mirror what the
+            // engine actually says.
+            let status = await engine.status
             return DaemonResponse(
                 ok: true,
                 sessionId: fresh.id.uuidString,
-                recording: true,
-                status: EngineStatus.recording.rawValue
+                recording: status == .recording,
+                status: status.rawValue
             )
         } catch {
             return DaemonResponse.failure(error.localizedDescription)

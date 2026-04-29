@@ -25,6 +25,8 @@ actor MockTranscriptRepository: TranscriptRepository {
     private var sweepActiveOrphansError: Error?
     private var recoverOrphansAndOpenFreshError: Error?
     private var openFreshSessionError: Error?
+    private var endSessionError: Error?
+    private var closeAndOpenSessionError: Error?
 
     func setMostRecentlyModifiedSessionError(_ error: Error?) {
         mostRecentlyModifiedSessionError = error
@@ -37,6 +39,12 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
     func setOpenFreshSessionError(_ error: Error?) {
         openFreshSessionError = error
+    }
+    func setEndSessionError(_ error: Error?) {
+        endSessionError = error
+    }
+    func setCloseAndOpenSessionError(_ error: Error?) {
+        closeAndOpenSessionError = error
     }
 
     // MARK: - Sessions
@@ -122,6 +130,7 @@ actor MockTranscriptRepository: TranscriptRepository {
     }
 
     func endSession(_ sessionId: UUID) async throws {
+        if let error = endSessionError { throw error }
         guard var session = sessions[sessionId] else { return }
         session = Session(
             id: session.id,
@@ -135,6 +144,29 @@ actor MockTranscriptRepository: TranscriptRepository {
             pausedIndefinitely: session.pausedIndefinitely
         )
         sessions[sessionId] = session
+    }
+
+    func closeAndOpenSession(closingId: UUID, locale: Locale) async throws -> Session {
+        if let error = closeAndOpenSessionError { throw error }
+        // Atomic in spirit: if endSession fails, openFreshSession is
+        // never reached. Here in the mock we simulate the "commit the
+        // pair or neither" semantics by performing the close in-memory
+        // first, then the open; if either step throws (via the error
+        // injectors above), the previous state is restored.
+        let closingSnapshot = sessions[closingId]
+        try await endSession(closingId)
+        do {
+            return try await openFreshSession(locale: locale)
+        } catch {
+            // Restore the closing session so the failure looks atomic
+            // to the caller (no half-state observable). Tests that want
+            // to observe a partial close-only state should call
+            // endSession + openFreshSession individually instead.
+            if let snapshot = closingSnapshot {
+                sessions[closingId] = snapshot
+            }
+            throw error
+        }
     }
 
     func session(_ id: UUID) async throws -> Session? {

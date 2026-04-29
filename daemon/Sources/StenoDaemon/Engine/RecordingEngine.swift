@@ -1939,6 +1939,16 @@ public actor RecordingEngine {
         pauseInProgress = true
         defer { pauseInProgress = false }
 
+        // Cluster-4 review fix: if a `demarcate()` call was queued during
+        // `.recovering` (pendingDemarcate=true) and the user pauses
+        // before recovery completes, the queue must NOT survive the
+        // pause. Otherwise the boundary would fire on the next
+        // return-to-`.recording` after a future resume — a stale
+        // intent that no longer matches user expectations. Drop the
+        // queue + any timestamp routing immediately.
+        pendingDemarcate = false
+        clearDemarcationRouting()
+
         // Cancel any in-flight backoff/restart tasks. Their cancellable
         // sleeps abort with CancellationError and the tasks return early.
         micRestartTask?.cancel()
@@ -1980,9 +1990,11 @@ public actor RecordingEngine {
             try? await repository.endSession(id)
         }
         currentSession = nil
-        // Cancel any pending demarcate/dedup-trigger machinery — we are
-        // ending this session cleanly.
-        clearDemarcationRouting()
+        // Cancel any dedup-trigger machinery — we are ending this
+        // session cleanly. (`pendingDemarcate` + demarcation routing
+        // were already cleared at the top of `pause()`; calling
+        // `clearDemarcationRouting()` again here would be redundant
+        // since no path could re-arm them between the gate and now.)
         for (_, task) in pendingDedupTriggers { task.cancel() }
         pendingDedupTriggers.removeAll()
 
@@ -2159,8 +2171,10 @@ public actor RecordingEngine {
             // Caller still wants a Session value back; the contract here
             // is "the boundary will fire when recovery completes." We
             // return the current session (effectively the closing one)
-            // so the caller has a non-nil result; tests that need precise
-            // semantics drive through `performDemarcate` directly.
+            // so the caller has a non-nil result. `performDemarcate` is
+            // private — tests exercise the queued path by entering
+            // `.recovering` via the public surface (e.g. driving a
+            // recovery scenario) rather than poking the private method.
             if let current = currentSession { return current }
             throw RecordingEngineError.notRecording
         case .paused:
@@ -2182,15 +2196,21 @@ public actor RecordingEngine {
 
         let demarcateAt = nowProvider()
 
-        // Close the current session at T. We set endedAt via the standard
-        // `endSession` path (which uses `Date()` for endedAt) — the wall-
-        // clock skew between T and the DB write is the natural latency of
-        // the storage operation and well under our segment-routing
-        // tolerance.
-        try? await repository.endSession(closing.id)
-
-        // Open a fresh active session at T.
-        let fresh = try await repository.openFreshSession(locale: currentLocale)
+        // Close the current session at T AND open a fresh active session
+        // in a single atomic write. The cluster-4 review caught a bug
+        // where this path used `try?` on `endSession` followed by a
+        // separate `openFreshSession`: a UPDATE failure (e.g. disk
+        // pressure, lock contention surfaced as throw) was swallowed
+        // while the INSERT still ran, leaving the DB with two
+        // `status='active'` rows — a hard invariant break.
+        //
+        // `closeAndOpenSession` runs both statements inside one GRDB
+        // write transaction; either both commit or neither does, and
+        // any error propagates to `demarcate()`'s caller.
+        let fresh = try await repository.closeAndOpenSession(
+            closingId: closing.id,
+            locale: currentLocale
+        )
 
         // Seed timestamp-based routing. In-flight finalized segments
         // arriving with `result.timestamp < demarcateAt` will be
@@ -2297,6 +2317,14 @@ public actor RecordingEngine {
         return (status == .paused, isPauseIndefinite, pauseExpiresAt)
     }
 
+    /// Test-only read of `pendingDemarcate`. Used by cluster-4 tests to
+    /// verify the pause()-clears-queued-demarcate invariant. Production
+    /// callers must not observe this state directly — its lifecycle is
+    /// owned by `demarcate` / `pause` / `maybeRestoreRecordingStatus`.
+    internal var pendingDemarcateForTesting: Bool {
+        return pendingDemarcate
+    }
+
     // MARK: - Cleanup
 
     private func cleanup() async {
@@ -2332,8 +2360,10 @@ public actor RecordingEngine {
         for (_, task) in pendingDedupTriggers { task.cancel() }
         pendingDedupTriggers.removeAll()
         currentMicSegmentPeak = 0
-        // U10: cancel pause timer + clear demarcate routing on full cleanup.
-        // Use `peek` to avoid lazily instantiating the timer here.
+        // U10: cancel pause timer + clear demarcate routing on full
+        // cleanup. `pauseTimer` is a non-lazy `let` initialized in the
+        // engine's `init`, so cancelling here is always safe — there's
+        // no lazy-instantiation concern.
         pauseTimer.cancel()
         pausedSessionId = nil
         pauseExpiresAt = nil

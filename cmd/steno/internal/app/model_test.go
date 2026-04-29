@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/jwulff/steno/internal/daemon"
 )
 
@@ -1017,5 +1019,245 @@ func TestTimeFromUnix(t *testing.T) {
 	got := timeFromUnix(1700000000.5)
 	if got.Unix() != 1700000000 {
 		t.Errorf("timeFromUnix unix = %d, want 1700000000", got.Unix())
+	}
+}
+
+// --- Cluster-4 review fixes (PR #37) ---
+
+// TestPauseStateResumeKeepsErrorEngineStatus exercises the fix for the
+// Codex P1 finding: a failed-resume sequence
+// (pause_state(true) → error event → pause_state(false)) must NOT mask
+// the error by forcing engineStatus back to `recording`.
+func TestPauseStateResumeKeepsErrorEngineStatus(t *testing.T) {
+	m := New()
+	m.engineStatus = StatusRecording
+
+	// (a) Pause.
+	expires := float64(time.Now().Add(30 * time.Minute).Unix())
+	pausedTrue, indefFalse := true, false
+	m.handleEvent(daemon.Event{
+		Event:              "pause_state",
+		Paused:             &pausedTrue,
+		PausedIndefinitely: &indefFalse,
+		PauseExpiresAt:     &expires,
+	})
+	if m.engineStatus != StatusPaused {
+		t.Fatalf("setup: engineStatus = %q, want paused", m.engineStatus)
+	}
+
+	// (b) Recovery_exhausted-prefixed error → daemon surrendered.
+	tr := false
+	m.handleEvent(daemon.Event{
+		Event:     "error",
+		Message:   "recovery_exhausted: bring-up failed",
+		Transient: &tr,
+	})
+	if m.engineStatus != StatusError {
+		t.Fatalf("after error: engineStatus = %q, want error", m.engineStatus)
+	}
+
+	// (c) Resume event arrives anyway. Pause fields must clear, but
+	// engineStatus must STAY error — the prior fix forced
+	// StatusRecording here, which masked the failure.
+	pausedFalse := false
+	m.handleEvent(daemon.Event{
+		Event:  "pause_state",
+		Paused: &pausedFalse,
+	})
+
+	if m.engineStatus != StatusError {
+		t.Errorf("after resume event: engineStatus = %q, want error (mask-prevention)", m.engineStatus)
+	}
+	if m.pauseExpiresAt != nil {
+		t.Error("pauseExpiresAt should be cleared on resume even when masked")
+	}
+	if m.pausedIndefinitely {
+		t.Error("pausedIndefinitely should be cleared on resume even when masked")
+	}
+}
+
+// TestPauseStateResumeKeepsPermissionRevokedSurface ensures the
+// permission-revoked surface is not cleared by a stray
+// `pause_state(false)` while the underlying TCC failure is still active.
+func TestPauseStateResumeKeepsPermissionRevokedSurface(t *testing.T) {
+	m := New()
+	m.engineStatus = StatusPaused
+	m.permissionRevoked = true
+
+	pausedFalse := false
+	m.handleEvent(daemon.Event{
+		Event:  "pause_state",
+		Paused: &pausedFalse,
+	})
+
+	if !m.permissionRevoked {
+		t.Error("permissionRevoked should NOT be cleared while a permission failure is active")
+	}
+	// Engine status should remain StatusPaused (mask-prevention path).
+	if m.engineStatus != StatusPaused {
+		t.Errorf("engineStatus = %q, want paused (no flip while permissionRevoked)", m.engineStatus)
+	}
+}
+
+// TestDemarcateResponseUpdatesSessionID exercises the fix for the
+// Codex P2 finding: a successful demarcate must update m.sessionID so
+// right-hand panels (topics / summary) load against the new session.
+func TestDemarcateResponseUpdatesSessionID(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "old-session"
+	// Pre-populate a topic so we can assert the reset.
+	m.topics = []TopicDisplay{{ID: "t1", Title: "old topic"}}
+
+	resp := DemarcateResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "new-session",
+	}}
+
+	updated, _ := m.Update(resp)
+	got := updated.(Model)
+
+	if got.sessionID != "new-session" {
+		t.Errorf("sessionID = %q, want new-session", got.sessionID)
+	}
+	if len(got.topics) != 0 {
+		t.Errorf("topics should be cleared on session switch; got %d", len(got.topics))
+	}
+}
+
+// TestDemarcateResponseFailureLeavesSessionID confirms a failed demarcate
+// does NOT clobber the current session ID.
+func TestDemarcateResponseFailureLeavesSessionID(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "current-session"
+
+	resp := DemarcateResponseMsg{Response: daemon.Response{
+		OK:    false,
+		Error: "demarcate failed",
+	}}
+
+	updated, _ := m.Update(resp)
+	got := updated.(Model)
+
+	if got.sessionID != "current-session" {
+		t.Errorf("sessionID = %q, want current-session unchanged", got.sessionID)
+	}
+}
+
+// TestDeviceToggleKeybindRemoved confirms the i / I keypresses no
+// longer mutate device state. Cluster-4 fix per Codex P2.
+func TestDeviceToggleKeybindRemoved(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.devices = []string{"Mic A", "Mic B"}
+	m.deviceName = "Mic A"
+	m.width, m.height = 80, 24
+
+	// Press 'i' — should be a no-op (binding removed).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	got := updated.(Model)
+	if got.deviceName != "Mic A" {
+		t.Errorf("deviceName changed to %q after 'i' press; binding should be removed", got.deviceName)
+	}
+
+	// Press 'I' — also a no-op.
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'I'}})
+	got2 := updated.(Model)
+	if got2.deviceName != "Mic A" {
+		t.Errorf("deviceName changed to %q after 'I' press; binding should be removed", got2.deviceName)
+	}
+}
+
+// TestFirstLaunchBannerShowsWhenStatErrors exercises the fix for the
+// Copilot first-launch finding: a stat() error that's NOT IsNotExist
+// (e.g. permission denied) must default to SHOW the banner.
+//
+// We can't easily inject a stat error from a unit test, so we test the
+// HOME-unresolvable path (which returns "" from firstLaunchMarkerPath)
+// and assert the banner is shown.
+func TestFirstLaunchBannerShowsWhenMarkerPathUnresolvable(t *testing.T) {
+	// Make UserHomeDir fail by clobbering HOME env. On darwin, with
+	// HOME unset and no /etc/passwd lookup, os.UserHomeDir returns
+	// an error → firstLaunchMarkerPath returns "" → safe default
+	// must show the banner.
+	t.Setenv("HOME", "")
+	t.Setenv("STENO_SUPPRESS_FIRST_LAUNCH_BANNER", "0")
+
+	if !shouldShowFirstLaunchBanner() {
+		t.Error("banner should show when HOME is unresolvable (over-disclose default)")
+	}
+}
+
+// TestFirstLaunchBannerHidesWhenMarkerPresent confirms the positive
+// case: marker exists → no banner. Anchor test for the inverted
+// failure semantics.
+func TestFirstLaunchBannerHidesWhenMarkerPresent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("STENO_SUPPRESS_FIRST_LAUNCH_BANNER", "0")
+
+	// Create the marker.
+	path := firstLaunchMarkerPath()
+	if path == "" {
+		t.Fatal("expected non-empty marker path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if shouldShowFirstLaunchBanner() {
+		t.Error("banner should be hidden when marker exists")
+	}
+}
+
+// TestFirstLaunchBannerShowsWhenMarkerAbsent confirms the IsNotExist
+// path (the "first launch ever" baseline) still shows the banner.
+func TestFirstLaunchBannerShowsWhenMarkerAbsent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("STENO_SUPPRESS_FIRST_LAUNCH_BANNER", "0")
+
+	if !shouldShowFirstLaunchBanner() {
+		t.Error("banner should show when marker is absent on a fresh HOME")
+	}
+}
+
+// TestTruncateToWidthPreservesANSI exercises the fix for the Copilot
+// finding that the fallback truncation in composeStatusBar was
+// rune-slicing across SGR escapes. With the ansi-aware fix,
+// `truncateToWidth` must keep the visible width within budget AND
+// preserve SGR pairs (every opening escape has a matching reset).
+func TestTruncateToWidthPreservesANSI(t *testing.T) {
+	// A long lipgloss-styled string with SGR escapes.
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("#ff0000")).Bold(true)
+	s := style.Render("● REC — recording on the long device with too much text")
+
+	out := truncateToWidth(s, 20)
+	w := lipgloss.Width(out)
+	if w > 20 {
+		t.Errorf("visible width = %d, want <= 20", w)
+	}
+	// The trailing ellipsis is the unmistakable signal that truncation
+	// happened. Without ANSI awareness an orphan escape sequence
+	// would land at the tail with no reset; ansi.Truncate guarantees
+	// a clean reset.
+	if !strings.Contains(out, "…") {
+		t.Errorf("truncated output missing ellipsis: %q", out)
+	}
+}
+
+// TestTruncateToWidthPassthroughWhenWithin asserts the no-op path
+// (already <= width) still works.
+func TestTruncateToWidthPassthroughWhenWithin(t *testing.T) {
+	s := "short"
+	out := truncateToWidth(s, 80)
+	if out != s {
+		t.Errorf("truncateToWidth = %q, want passthrough %q", out, s)
 	}
 }

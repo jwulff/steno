@@ -167,4 +167,29 @@ struct DemarcateTests {
         let prevSegmentsAfter = try await repo.segments(for: preDemarcateId)
         #expect(!prevSegmentsAfter.contains(where: { $0.text == "spoke after demarcate" }))
     }
+
+    // MARK: - Cluster-4 review fixes (PR #37)
+
+    /// Copilot finding: `performDemarcate` ran `endSession` then
+    /// `openFreshSession` as two separate writes with `try?` swallowing
+    /// the close failure. A close-failure + open-success would leave
+    /// two `status='active'` rows in the DB. The fix routes through a
+    /// single atomic `closeAndOpenSession` repository method.
+    @Test("demarcate: close-failure rolls back atomically (no two-active-rows invariant break)")
+    func demarcateAtomicCloseAndOpen() async throws {
+        let (engine, repo, _, _, _) = await makeEngine()
+        let started = try await engine.start()
+
+        // Inject a closeAndOpenSession error so the atomic call fails.
+        await repo.setCloseAndOpenSessionError(MockTranscriptRepository.InjectedError("disk full"))
+
+        await #expect(throws: (any Error).self) {
+            _ = try await engine.demarcate()
+        }
+
+        // The original session must remain active — nothing was closed
+        // and no new active row was inserted (atomic).
+        let original = try await repo.session(started.id)
+        #expect(original?.status == .active)
+    }
 }

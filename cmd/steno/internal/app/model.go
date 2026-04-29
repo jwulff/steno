@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/jwulff/steno/internal/daemon"
 	"github.com/jwulff/steno/internal/db"
 	"github.com/jwulff/steno/internal/ui"
@@ -113,7 +114,6 @@ type Model struct {
 	deviceName  string
 	systemAudio bool
 	devices     []string
-	deviceIndex int
 
 	// Pause state (U9 / U10 wire)
 	pauseExpiresAt     *time.Time // nil for indefinite or not-paused
@@ -219,10 +219,15 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(connectCmd(), statusTickCmd())
 }
 
-// shouldShowFirstLaunchBanner returns true when the marker file is
-// absent. Any error (permissions, missing parent dir) is treated as
-// "marker absent" — better to over-disclose than under-disclose given
-// this is a privacy-relevant consent banner.
+// shouldShowFirstLaunchBanner returns true when the marker file CANNOT
+// be confirmed to exist. Any uncertainty — HOME unresolvable, stat
+// returns a non-IsNotExist error (e.g. permission-denied), filesystem
+// glitch — defaults to `true` (show banner). The banner is a privacy /
+// consent surface for an always-on recorder; the safe default when in
+// doubt is to over-disclose, never under-disclose.
+//
+// Returns `false` only when stat succeeds and the marker is positively
+// present.
 //
 // `STENO_SUPPRESS_FIRST_LAUNCH_BANNER=1` short-circuits the check; tests
 // set this so they don't need to mock the user's home directory.
@@ -232,10 +237,17 @@ func shouldShowFirstLaunchBanner() bool {
 	}
 	path := firstLaunchMarkerPath()
 	if path == "" {
+		// HOME unresolvable — over-disclose.
+		return true
+	}
+	info, err := os.Stat(path)
+	if err == nil && info != nil {
+		// Marker positively exists; banner already dismissed previously.
 		return false
 	}
-	_, err := os.Stat(path)
-	return os.IsNotExist(err)
+	// Either IsNotExist (first launch) or some other stat failure
+	// (permission denied, transient FS error). Both paths over-disclose.
+	return true
 }
 
 // firstLaunchMarkerPath returns the marker file path, or "" if HOME is
@@ -686,9 +698,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorTransient = true
 			return m, clearTransientErrorCmd()
 		}
-		// On success the daemon will emit a fresh status / segment
-		// stream against the new session; nothing to do here.
-		return m, nil
+		// Demarcate succeeded — the daemon opened a fresh active session.
+		// Update m.sessionID so right-hand panels (topics / summary) start
+		// loading data for the NEW session instead of staying anchored to
+		// the old one. Mirror the StartResponseMsg pattern (line ~585):
+		// only overwrite when the response carries a non-empty sessionId.
+		var cmds []tea.Cmd
+		if msg.Response.SessionID != "" && msg.Response.SessionID != m.sessionID {
+			m.sessionID = msg.Response.SessionID
+			// Reset right-hand panels for the fresh session and trigger
+			// reloads. Topics for a freshly-opened session are empty
+			// initially, so the load is mostly to clear the prior
+			// session's view; the daemon will emit a `topics` event when
+			// the LLM finishes the first extraction.
+			m.topics = m.topics[:0]
+			m.selectedTopic = 0
+			if m.store != nil {
+				cmds = append(cmds, loadTopicsCmd(m.store, m.sessionID))
+				if m.showSummary {
+					cmds = append(cmds, loadSummaryCmd(m.store, m.sessionID))
+				}
+			}
+		}
+		// On success the daemon will also emit a fresh status / segment
+		// stream against the new session.
+		return m, tea.Batch(cmds...)
 
 	case PauseHintMsg:
 		m.pauseHint = true
@@ -730,18 +764,29 @@ func (m *Model) applyPauseFields(paused, indefinite *bool, expiresAt *float64) {
 			}
 		}
 	} else {
-		// Resumed.
+		// Resumed. Always clear the pause-related fields, but be careful
+		// about the engine-status transition: a resume can FAIL (the
+		// daemon emits `error` then `pause_state(false)`). In that case
+		// engineStatus has already moved to `StatusError` (or the model
+		// has flagged `permissionRevoked`). Forcing `StatusRecording`
+		// here would mask the failure — the TUI would display REC even
+		// though the engine is broken.
+		//
+		// Resolution: clear `pausedIndefinitely` / `pauseExpiresAt`
+		// unconditionally (the resume request was acknowledged either
+		// way), but only flip to `StatusRecording` if we were sitting in
+		// `StatusPaused` AND the model isn't already in a failed state.
+		// The canonical recording flag continues to arrive via
+		// `event:"status"`.
 		m.pausedIndefinitely = false
 		m.pauseExpiresAt = nil
-		// Don't blindly set engineStatus=recording — `event:"status"`
-		// carries the canonical recording flag right after a resume.
-		// But if we're currently sitting in StatusPaused, drop back.
-		if m.engineStatus == StatusPaused {
+		if m.engineStatus == StatusPaused && !m.permissionRevoked {
 			m.engineStatus = StatusRecording
+			// Pause/resume happy path clears any prior permission-
+			// revoked surface so the user can re-test after granting
+			// in System Settings.
+			m.permissionRevoked = false
 		}
-		// Pause/resume clears any prior permission-revoked surface so
-		// the user can re-test after granting in System Settings.
-		m.permissionRevoked = false
 	}
 }
 
@@ -1068,16 +1113,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case "i", "I":
-		// Cycle input device. In always-on mode we don't proactively
-		// stop/start — the daemon will pick up the new device on its
-		// next pipeline rebuild path. The TUI just shows the choice.
-		if !m.connected || len(m.devices) == 0 {
-			return m, nil
-		}
-		m.deviceIndex = (m.deviceIndex + 1) % len(m.devices)
-		m.deviceName = m.devices[m.deviceIndex]
-		return m, nil
+	// `i` / `I` (cycle input device) was removed in the cluster-4 review
+	// pass — the keybind mutated `m.deviceIndex` / `m.deviceName` locally
+	// but never sent a daemon command, so the displayed device drifted
+	// from the active capture device. See `keymap.go` for rationale.
 
 	case "a", "A":
 		if !m.connected {
@@ -1804,17 +1843,38 @@ func padRight(s string, width int) string {
 	return s + strings.Repeat(" ", width-visible)
 }
 
+// truncateToWidth shortens a (possibly ANSI-styled) string so its visible
+// width is at most `width`, appending an ellipsis. Uses
+// `ansi.Truncate` from `charmbracelet/x/ansi` so SGR escapes are
+// preserved correctly — naive rune-slicing would chop mid-escape and
+// emit orphan styling that bleeds into the rest of the line. The
+// previous implementation (rune-slice + ellipsis) was the source of the
+// cluster-4 review's "ANSI codes break under fallback truncation"
+// finding.
 func truncateToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	visible := lipgloss.Width(s)
 	if visible <= width {
 		return s
 	}
-	// Simple truncation for non-styled strings
-	runes := []rune(s)
-	if len(runes) > width-1 {
-		return string(runes[:width-1]) + "…"
+	// `ansi.Truncate` accepts `length` as visible-cell count and an
+	// optional tail string, total visible width = length + tail width.
+	// We want the final visible width to equal `width`, so subtract the
+	// tail's visible width. The ellipsis is one cell wide.
+	const tail = "…"
+	tailWidth := lipgloss.Width(tail)
+	if width <= tailWidth {
+		// Degenerate: the budget is too small for tail + at least one
+		// content cell. Return just the tail (or empty if even the tail
+		// doesn't fit).
+		if width >= tailWidth {
+			return tail
+		}
+		return ""
 	}
-	return s
+	return ansi.Truncate(s, width-tailWidth, tail)
 }
 
 // formatHealMarker renders the SegmentsForRange-returned heal marker

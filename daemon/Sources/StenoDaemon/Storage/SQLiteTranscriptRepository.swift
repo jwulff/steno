@@ -166,6 +166,45 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func closeAndOpenSession(closingId: UUID, locale: Locale) async throws -> Session {
+        // Single atomic write: UPDATE the closing row + INSERT the fresh
+        // row. GRDB's `dbQueue.write` runs its block inside an implicit
+        // SQLite transaction, so a throw from either statement rolls
+        // back the entire write — preserving the at-most-one-active
+        // invariant that demarcate's caller relies on.
+        let fresh = Session(
+            id: UUID(),
+            locale: locale,
+            startedAt: Date(),
+            endedAt: nil,
+            title: nil,
+            status: .active,
+            lastDedupedSegmentSeq: 0,
+            pauseExpiresAt: nil,
+            pausedIndefinitely: false
+        )
+
+        try await dbQueue.write { db in
+            // Close the prior active session.
+            try db.execute(
+                sql: """
+                    UPDATE sessions
+                    SET endedAt = ?, status = ?
+                    WHERE id = ?
+                """,
+                arguments: [
+                    Date().timeIntervalSince1970,
+                    Session.Status.completed.rawValue,
+                    closingId.uuidString
+                ]
+            )
+            // Open the fresh active session inside the same transaction.
+            try SessionRecord.from(fresh).insert(db)
+        }
+
+        return fresh
+    }
+
     public func session(_ id: UUID) async throws -> Session? {
         try await dbQueue.read { db in
             try SessionRecord

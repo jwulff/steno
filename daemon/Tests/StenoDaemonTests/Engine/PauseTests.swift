@@ -378,6 +378,73 @@ struct PauseTests {
         #expect(errors.contains(where: { $0.0.contains("pause_state_unverifiable") && $0.1 == false }))
     }
 
+    // MARK: - Cluster-4 review fix (PR #37)
+
+    /// Copilot finding: if a `demarcate()` is queued during `.recovering`
+    /// and the user pauses before recovery completes, `pendingDemarcate`
+    /// must NOT survive the pause — otherwise the queued boundary
+    /// would fire on the next return-to-`.recording` after a future
+    /// resume (a stale intent the user no longer expects).
+    @Test("pause from .recovering clears pendingDemarcate so the queue does not survive")
+    @MainActor
+    func pauseClearsPendingDemarcate() async throws {
+        // Build an engine with a failing recognizer + a stalled backoff
+        // sleep so the engine sits in `.recovering` long enough to drive
+        // the demarcate-queue + pause sequence.
+        let rf = MockSpeechRecognizerFactory()
+        rf.handle.errorToThrow = SpeechRecognitionError.recognitionFailed("test failure")
+
+        let repo = MockTranscriptRepository()
+        let perms = MockPermissionService()
+        let summarizer = MockSummarizationService()
+        let af = MockAudioSourceFactory()
+        let del = MockRecordingEngineDelegate()
+        let coordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: summarizer,
+            triggerCount: 100,
+            timeThreshold: 3600
+        )
+        let engine = RecordingEngine(
+            repository: repo,
+            permissionService: perms,
+            summaryCoordinator: coordinator,
+            audioSourceFactory: af,
+            speechRecognizerFactory: rf,
+            delegate: del,
+            backoffSleep: { _ in
+                try await Task.sleep(for: .seconds(60))
+            },
+            emptySessionMinChars: 0,
+            emptySessionMinDurationSeconds: 0,
+            retentionDays: 0
+        )
+
+        _ = try await engine.start()
+
+        // Wait for the engine to enter `.recovering`.
+        let entered = await waitFor(timeout: 1.0) {
+            await engine.status == .recovering
+        }
+        #expect(entered, "engine should enter .recovering after recognizer error")
+
+        // Queue a demarcate during recovering.
+        _ = try await engine.demarcate()
+        let queued = await engine.pendingDemarcateForTesting
+        #expect(queued == true, "demarcate during .recovering should queue")
+
+        // Pause now — the fix must clear `pendingDemarcate` synchronously
+        // at the top of `pause()`.
+        try await engine.pause(autoResumeSeconds: 600)
+
+        let cleared = await engine.pendingDemarcateForTesting
+        #expect(cleared == false, "pause must clear pendingDemarcate so a stale boundary does not fire later")
+
+        // And the engine is genuinely paused.
+        let status = await engine.status
+        #expect(status == .paused)
+    }
+
     // MARK: - Helpers
 
     private func waitFor(
