@@ -20,19 +20,26 @@ package app
 // the macOS system default before launch, or wait for a future settings
 // surface that issues a daemon-side pause/resume cycle with the new
 // device.
+//
+// The legacy `a` / `A` (toggle system-audio capture) keybind was removed
+// for the same reason: it only flipped a local boolean without sending
+// any daemon command. The daemon's capture configuration is set at
+// startup from `StenoSettings.lastSystemAudioEnabled` and is not
+// toggleable mid-flight via the current protocol. Users who want to
+// change the system-audio mode should edit
+// `~/Library/Application Support/Steno/settings.json` and restart the
+// daemon, or wait for a future protocol-level reconfigure command.
 const (
-	KeyQuit         = "q"
-	KeyQuitUpper    = "Q"
-	KeyCtrlC        = "ctrl+c"
-	KeySpace        = " "
-	KeyTab          = "tab"
-	KeyUp           = "up"
-	KeyDown         = "down"
-	KeyJ            = "j"
-	KeyK            = "k"
-	KeyEnter        = "enter"
-	KeyToggleSysAud = "a"
-	KeyToggleSysUp  = "A"
+	KeyQuit      = "q"
+	KeyQuitUpper = "Q"
+	KeyCtrlC     = "ctrl+c"
+	KeySpace     = " "
+	KeyTab       = "tab"
+	KeyUp        = "up"
+	KeyDown      = "down"
+	KeyJ         = "j"
+	KeyK         = "k"
+	KeyEnter     = "enter"
 	// U9 keybinds.
 	KeyPause           = "p"
 	KeyPauseIndefinite = "P"

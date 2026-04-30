@@ -76,11 +76,21 @@ const firstLaunchBanner = "Steno is now always-on. Recording started. Press spac
 const defaultPauseAutoResumeSeconds = 1800
 
 // TranscriptEntry is a finalized transcript line for display.
+//
+// `IsBoundary == true` marks a UI-only synthetic entry inserted when a
+// successful demarcate response arrives — it has no DB row, no sequence
+// number, and no source. The transcript renderer draws it as a
+// horizontal rule with the boundary timestamp instead of the usual
+// `[HH:MM:SS] [MIC]` segment line. Subsequent real segments append
+// after it and render normally. See the `DemarcateResponseMsg` handler
+// in `Update` for the insertion site, and `renderTranscriptPanel` for
+// the visual treatment.
 type TranscriptEntry struct {
-	Text      string
-	Source    string
-	Timestamp time.Time
-	SeqNum   int
+	Text       string
+	Source     string
+	Timestamp  time.Time
+	SeqNum     int
+	IsBoundary bool
 }
 
 // TopicDisplay holds a topic for display in the topic panel.
@@ -699,6 +709,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, clearTransientErrorCmd()
 		}
 		// Demarcate succeeded — the daemon opened a fresh active session.
+		// Insert a UI-only boundary marker into the transcript so the
+		// user gets immediate visible feedback that the spacebar press
+		// landed; without this the timeline silently keeps appending
+		// new segments below old ones with no perceptible boundary.
+		//
+		// The marker is purely visual: no DB row, no sequence number,
+		// no source. Inserted at the END of `m.entries` at the time of
+		// the response, since the boundary is logically at "now" when
+		// the user pressed space. Subsequent segments will append after
+		// it normally (U10's startedAt routing keeps the chronological
+		// invariant — new segments have timestamps >= boundary time).
+		//
+		// Edge case: if the daemon was `recovering` when the demarcate
+		// arrived, U10 documents the demarcate gets queued. We still
+		// insert the marker now — when the queued demarcate eventually
+		// applies, the marker is already in roughly the right place on
+		// the timeline. Acceptable approximation.
+		m.entries = append(m.entries, TranscriptEntry{
+			Timestamp:  time.Now(),
+			IsBoundary: true,
+		})
+		if m.transcriptLive {
+			m.scrollToBottom()
+		}
+
 		// Update m.sessionID so right-hand panels (topics / summary) start
 		// loading data for the NEW session instead of staying anchored to
 		// the old one. Mirror the StartResponseMsg pattern (line ~585):
@@ -1117,13 +1152,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// pass — the keybind mutated `m.deviceIndex` / `m.deviceName` locally
 	// but never sent a daemon command, so the displayed device drifted
 	// from the active capture device. See `keymap.go` for rationale.
-
-	case "a", "A":
-		if !m.connected {
-			return m, nil
-		}
-		m.systemAudio = !m.systemAudio
-		return m, nil
+	//
+	// `a` / `A` (toggle system-audio capture) was removed for the same
+	// reason: it only flipped `m.systemAudio` locally and sent no
+	// command. The daemon's capture configuration is set at startup
+	// from `StenoSettings.lastSystemAudioEnabled` and is not toggleable
+	// mid-flight. See `keymap.go` for rationale.
 	}
 
 	return m, nil
@@ -1728,7 +1762,20 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		indentStr := strings.Repeat(" ", prefixWidth)
 
 		var displayLines []string
+		// Width budget for the boundary rule: the transcript panel is
+		// `width` wide and the renderer indents each line by 2 spaces
+		// in the wrapping pass below. Match that so the rule sits
+		// flush with segment text.
+		boundaryWidth := max(10, width-2)
 		for _, e := range m.entries {
+			// Synthetic session-boundary marker (UI-only, inserted on a
+			// successful DemarcateResponseMsg). Rendered as a horizontal
+			// rule with a timestamp. No source, no sequence number.
+			if e.IsBoundary {
+				displayLines = append(displayLines,
+					renderSessionBoundary(e.Timestamp, boundaryWidth))
+				continue
+			}
 			// U9: heal-marker annotation — rendered on its own line
 			// BEFORE the segment so the user sees "⚠ healed after Ns
 			// gap" between two adjacent segments. Marker is keyed by
@@ -1875,6 +1922,28 @@ func truncateToWidth(s string, width int) string {
 		return ""
 	}
 	return ansi.Truncate(s, width-tailWidth, tail)
+}
+
+// renderSessionBoundary draws the UI-only session-boundary line shown
+// in the transcript when a successful demarcate response arrives. The
+// shape is `─── session boundary HH:MM:SS ───`, padded with em-dashes
+// out to `width` cells. Matches the dim styling used for other
+// non-segment annotations in the timeline (heal-marker, hint text).
+func renderSessionBoundary(ts time.Time, width int) string {
+	if width < 10 {
+		width = 10
+	}
+	label := fmt.Sprintf(" session boundary %s ", ts.Format("15:04:05"))
+	labelW := lipgloss.Width(label)
+	if labelW >= width {
+		// Pathologically narrow — return the label truncated, no rules.
+		return ui.DimStyle.Render(truncateToWidth(label, width))
+	}
+	pad := width - labelW
+	left := pad / 2
+	right := pad - left
+	rule := strings.Repeat("─", left) + label + strings.Repeat("─", right)
+	return ui.DimStyle.Render(rule)
 }
 
 // formatHealMarker renders the SegmentsForRange-returned heal marker

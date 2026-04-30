@@ -1169,6 +1169,135 @@ func TestDeviceToggleKeybindRemoved(t *testing.T) {
 	}
 }
 
+// TestSystemAudioToggleKeybindRemoved confirms the a / A keypresses no
+// longer mutate `m.systemAudio`. The keybind only flipped a local bool
+// and never sent a daemon command, so the displayed audio mode drifted
+// from the daemon's actual capture configuration.
+func TestSystemAudioToggleKeybindRemoved(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.systemAudio = false
+	m.width, m.height = 80, 24
+
+	// Press 'a' — should be a no-op (binding removed).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	got := updated.(Model)
+	if got.systemAudio {
+		t.Errorf("systemAudio flipped to true after 'a' press; binding should be removed")
+	}
+
+	// Press 'A' — also a no-op.
+	updated, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	got2 := updated.(Model)
+	if got2.systemAudio {
+		t.Errorf("systemAudio flipped to true after 'A' press; binding should be removed")
+	}
+}
+
+// TestDemarcateResponseInsertsBoundaryMarker exercises Bug 2: a
+// successful DemarcateResponseMsg must insert a synthetic session-
+// boundary marker into the transcript so the user sees visible feedback
+// (a horizontal rule with timestamp) when they press space.
+func TestDemarcateResponseInsertsBoundaryMarker(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "old-session"
+	m.width, m.height = 80, 24
+	// Seed a prior real segment so we can assert the marker is
+	// appended AFTER it, not prepended.
+	m.entries = []TranscriptEntry{
+		{Text: "earlier segment", Source: "microphone", Timestamp: time.Now().Add(-1 * time.Minute), SeqNum: 1},
+	}
+
+	resp := DemarcateResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "new-session",
+	}}
+
+	updated, _ := m.Update(resp)
+	got := updated.(Model)
+
+	if len(got.entries) != 2 {
+		t.Fatalf("expected 2 entries (1 segment + 1 boundary); got %d", len(got.entries))
+	}
+	if !got.entries[1].IsBoundary {
+		t.Errorf("entries[1].IsBoundary = false; want true (boundary marker should be appended)")
+	}
+	if got.entries[0].IsBoundary {
+		t.Errorf("entries[0].IsBoundary = true; want false (real segment must not be marked as boundary)")
+	}
+
+	// View() should render the boundary rule with the "session boundary"
+	// label visible to the user.
+	view := got.View()
+	if !strings.Contains(view, "session boundary") {
+		t.Errorf("View() missing 'session boundary' marker; got:\n%s", view)
+	}
+}
+
+// TestDemarcateResponseFailureNoMarker confirms that a failed demarcate
+// response does NOT insert a boundary marker — the spacebar press
+// effectively didn't happen, so there's nothing to mark.
+func TestDemarcateResponseFailureNoMarker(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "current-session"
+	m.width, m.height = 80, 24
+	m.entries = []TranscriptEntry{
+		{Text: "earlier segment", Source: "microphone", Timestamp: time.Now().Add(-1 * time.Minute), SeqNum: 1},
+	}
+
+	resp := DemarcateResponseMsg{Response: daemon.Response{
+		OK:    false,
+		Error: "press p to resume first",
+	}}
+
+	updated, _ := m.Update(resp)
+	got := updated.(Model)
+
+	if len(got.entries) != 1 {
+		t.Fatalf("expected entries unchanged on failure; got %d entries", len(got.entries))
+	}
+	for i, e := range got.entries {
+		if e.IsBoundary {
+			t.Errorf("entries[%d].IsBoundary = true; no marker should be inserted on failure", i)
+		}
+	}
+	if strings.Contains(got.View(), "session boundary") {
+		t.Errorf("View() contains 'session boundary' after failed demarcate; should be absent")
+	}
+}
+
+// TestDemarcateResponseMultipleMarkers confirms that rapid successive
+// demarcate responses each produce their own boundary marker (no
+// dedupe) — each spacebar press is a distinct event the user wants
+// confirmation of.
+func TestDemarcateResponseMultipleMarkers(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "s0"
+	m.width, m.height = 80, 24
+
+	r1 := DemarcateResponseMsg{Response: daemon.Response{OK: true, SessionID: "s1"}}
+	r2 := DemarcateResponseMsg{Response: daemon.Response{OK: true, SessionID: "s2"}}
+	r3 := DemarcateResponseMsg{Response: daemon.Response{OK: true, SessionID: "s3"}}
+
+	u1, _ := m.Update(r1)
+	u2, _ := u1.(Model).Update(r2)
+	u3, _ := u2.(Model).Update(r3)
+	got := u3.(Model)
+
+	boundaries := 0
+	for _, e := range got.entries {
+		if e.IsBoundary {
+			boundaries++
+		}
+	}
+	if boundaries != 3 {
+		t.Errorf("expected 3 boundary markers from 3 demarcates; got %d", boundaries)
+	}
+}
+
 // TestFirstLaunchBannerShowsWhenStatErrors exercises the fix for the
 // Copilot first-launch finding: a stat() error that's NOT IsNotExist
 // (e.g. permission denied) must default to SHOW the banner.
