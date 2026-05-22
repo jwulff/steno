@@ -88,7 +88,7 @@ test-daemon:
 	# and the second invocation fails with "File exists". Create a
 	# unique directory instead and put the log inside it.
 	@cd $(DAEMON_DIR) && \
-		log_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX"); \
+		log_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX") || { echo "mktemp -d failed (check TMPDIR=$${TMPDIR:-/tmp})" >&2; exit 1; }; \
 		log_file="$$log_dir/test.log"; \
 		trap 'rm -rf "$$log_dir"' EXIT; \
 		( swift test 2>&1; echo "swift_exit=$$?" ) | tee "$$log_file" >/dev/null; \
