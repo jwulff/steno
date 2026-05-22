@@ -58,8 +58,8 @@ but was sitting in the same working tree and was cheap to ship together.
 ## What's Next
 
 - Layout tests would catch this class of bug, but SwiftTUI doesn't
-  provide a great harness for that. Tracked informally until the Go/
-  bubbletea rewrite (PR #12) replaces this view entirely, at which point
-  the question is moot.
+  provide a great harness for that. Tracked informally until the
+  Go/bubbletea rewrite (PR #12) replaces this view entirely, at which
+  point the question is moot.
 - Terminal resize handling should be tested manually on the next layout
   pass.

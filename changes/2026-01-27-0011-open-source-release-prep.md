@@ -30,7 +30,9 @@ this is just a string match against the commit subject/body.
 
 Runs on `macos-15`. Sets up Swift 6.0 (the newest version GitHub offered at
 the time), then compares the installed `swift --version` against the
-`swift-tools-version` declared in `Package.swift`. Exports
+`swift-tools-version` declared in the then-root `Package.swift` (the repo
+was still a single Swift package at this point — the daemon split that
+moved the manifest to `daemon/Package.swift` lands much later). Exports
 `swift_version_ok=true|false`. If `version_ok` is true, it actually runs
 `swift build -v` and `swift test -v`; otherwise both steps are skipped via
 `if:` guards so the job doesn't fail spuriously on a known-incompatible

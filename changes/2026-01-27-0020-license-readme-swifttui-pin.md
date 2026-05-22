@@ -3,7 +3,7 @@
 ## Why
 
 Immediately on the heels of PR #5's CI fallback, the repo still wasn't
-ready to be public: no license file (so technically all-rights-reserved
+ready to be public: no license file (so technically all rights reserved
 under default copyright), no README explaining what Steno does or how to
 build it, and an unpinned SwiftTUI dependency that could re-resolve to a
 different commit on any clean checkout.
