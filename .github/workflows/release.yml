@@ -7,48 +7,78 @@ on:
 
 jobs:
   build:
-    name: Build Release Binary
+    name: Build Release Tarball
     runs-on: macos-15
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # GitHub macOS-15 runners ship Swift 6.0 by default. Steno's
+      # `daemon/Package.swift` declares swift-tools-version: 6.2 and
+      # the daemon imports `SpeechAnalyzer` from the macOS 26 SDK, so
+      # the runner will refuse to build until macOS 26 + Xcode 26
+      # land on the hosted images. Until then the build step here
+      # surfaces a loud failure — preferable to silently producing a
+      # non-functional artifact built against a stale SDK.
       - name: Setup Swift
         uses: swift-actions/setup-swift@v3
         with:
-          swift-version: "6.0"
+          swift-version: "6.2"
 
-      - name: Build release binary
-        run: swift build -c release
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
 
-      - name: Sign binary (ad-hoc)
+      - name: Print toolchain versions
         run: |
-          codesign --force --sign - \
-            --entitlements Resources/Steno.entitlements \
-            .build/release/steno
+          swift --version
+          go version
 
-      - name: Create archive
+      - name: Build daemon + steno (release)
+        run: make build
+
+      - name: Ad-hoc sign daemon
+        run: make sign-daemon
+
+      - name: Package release tarball
+        id: package
         run: |
-          cd .build/release
-          tar -czf steno-${{ github.ref_name }}-macos.tar.gz steno
-          shasum -a 256 steno-${{ github.ref_name }}-macos.tar.gz > steno-${{ github.ref_name }}-macos.tar.gz.sha256
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          STAGE="dist/steno-${TAG}-macos-arm64"
+          mkdir -p "${STAGE}/bin"
+          # Both binaries land side-by-side under `bin/`. The Homebrew
+          # formula's `bin.install` step picks them up the same way.
+          cp daemon/.build/release/steno-daemon "${STAGE}/bin/steno-daemon"
+          cp cmd/steno/steno "${STAGE}/bin/steno"
+          # Include README + LICENSE so users untarring outside brew
+          # have the basics on hand.
+          cp README.md "${STAGE}/"
+          if [ -f LICENSE ]; then cp LICENSE "${STAGE}/"; fi
+          cd dist
+          tar -czf "steno-${TAG}-macos-arm64.tar.gz" "steno-${TAG}-macos-arm64"
+          shasum -a 256 "steno-${TAG}-macos-arm64.tar.gz" \
+            | tee "steno-${TAG}-macos-arm64.tar.gz.sha256"
+          echo "tarball=dist/steno-${TAG}-macos-arm64.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "sha256_file=dist/steno-${TAG}-macos-arm64.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload artifact
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
-          name: steno-${{ github.ref_name }}-macos
+          name: steno-${{ github.ref_name }}-macos-arm64
           path: |
-            .build/release/steno-${{ github.ref_name }}-macos.tar.gz
-            .build/release/steno-${{ github.ref_name }}-macos.tar.gz.sha256
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.sha256_file }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            .build/release/steno-${{ github.ref_name }}-macos.tar.gz
-            .build/release/steno-${{ github.ref_name }}-macos.tar.gz.sha256
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.sha256_file }}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
