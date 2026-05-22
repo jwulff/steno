@@ -104,6 +104,21 @@ type TranscriptEntry struct {
 	Timestamp  time.Time
 	SeqNum     int
 	IsBoundary bool
+
+	// SessionID stamped at receipt time so a late `dedup` event can be
+	// matched on the composite `(SessionID, SeqNum)` key. m.entries is
+	// not cleared on session change (entries from prior sessions stay in
+	// the timeline), and sequenceNumber is unique only within a session
+	// (`UNIQUE(sessionId, sequenceNumber)` per the schema), so a SeqNum-
+	// only match would risk cross-session collisions for the always-on
+	// flow. Boundary markers don't have a session — leave empty.
+	SessionID string
+
+	// Duplicate is set when a `dedup` event marks this entry as a
+	// duplicate of a sys segment. DuplicateOfSeq carries the canonical
+	// sys segment's sequence number for the inline `↪ dup of #N` hint.
+	Duplicate      bool
+	DuplicateOfSeq int
 }
 
 // TopicDisplay holds a topic for display in the topic panel.
@@ -874,6 +889,20 @@ func (m *Model) appendErrorHistory(message string) {
 	m.errorHistory = append(m.errorHistory, entry)
 }
 
+// markEntryDuplicate flags the entry matching (sessionID, seqNum) as a
+// duplicate of dupOfSeq. Silently no-ops if no entry matches — the
+// `dedup` event is late-arrival (~5s after segment) and the entry may
+// have left memory or never arrived (R4 / AE2 in the brainstorm).
+func (m *Model) markEntryDuplicate(sessionID string, seqNum, dupOfSeq int) {
+	for i := range m.entries {
+		if m.entries[i].SessionID == sessionID && m.entries[i].SeqNum == seqNum {
+			m.entries[i].Duplicate = true
+			m.entries[i].DuplicateOfSeq = dupOfSeq
+			return
+		}
+	}
+}
+
 // handleEvent processes a daemon event and returns any resulting command.
 //
 // Event types (mirrored from EventBroadcaster.swift):
@@ -905,6 +934,7 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			Text:      ev.Text,
 			Source:    ev.Source,
 			Timestamp: ts,
+			SessionID: ev.SessionID,
 		}
 		if ev.SequenceNumber != nil {
 			entry.SeqNum = *ev.SequenceNumber
@@ -955,6 +985,19 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		// U10's dedicated pause-state event — applyPauseFields handles
 		// the indefinite / finite split and the resume transition.
 		m.applyPauseFields(ev.Paused, ev.PausedIndefinitely, ev.PauseExpiresAt)
+
+	case "dedup":
+		// Late-arrival event (~5s after the matching `segment`) marking
+		// a mic entry as a duplicate of a sys entry. Composite key on
+		// (SessionID, SeqNum) — m.entries persists across session
+		// boundaries, and sequenceNumber is only unique per session.
+		// Silently drop on miss (R4 / AE2): entry may have scrolled off
+		// in a long session, been replaced by a fresh launch, or this
+		// could be an event for a session not represented in memory.
+		if ev.SequenceNumber == nil || ev.DuplicateOfSequence == nil {
+			return nil
+		}
+		m.markEntryDuplicate(ev.SessionID, *ev.SequenceNumber, *ev.DuplicateOfSequence)
 
 	case "model_processing":
 		if ev.ModelProcessing != nil {

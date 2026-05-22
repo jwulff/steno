@@ -127,6 +127,131 @@ func TestSegmentEvent(t *testing.T) {
 	}
 }
 
+func TestSegmentStampsSessionID(t *testing.T) {
+	// SessionID is required to disambiguate dedup events across
+	// session boundaries — m.entries is not cleared on demarcate.
+	m := New()
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "Hello",
+		Source:         "microphone",
+		SessionID:      "session-A",
+		SequenceNumber: &seq,
+	})
+
+	if m.entries[0].SessionID != "session-A" {
+		t.Errorf("SessionID = %q, want session-A", m.entries[0].SessionID)
+	}
+}
+
+func TestDedupEventMarksMatchingEntry(t *testing.T) {
+	// AE1: dedup event arrives → matching entry becomes Duplicate=true
+	// with DuplicateOfSeq set.
+	m := New()
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+
+	if !m.entries[0].Duplicate {
+		t.Error("entry should be marked Duplicate")
+	}
+	if m.entries[0].DuplicateOfSeq != 12 {
+		t.Errorf("DuplicateOfSeq = %d, want 12", m.entries[0].DuplicateOfSeq)
+	}
+}
+
+func TestDedupEventSilentlyDropsOnUnknownSeq(t *testing.T) {
+	// AE2: dedup event for a seqNum not in m.entries is a no-op.
+	m := New()
+	knownSeq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &knownSeq,
+	})
+
+	unknownSeq := 99
+	dupOf := 50
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &unknownSeq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "exact",
+	})
+
+	if m.entries[0].Duplicate {
+		t.Error("existing entry should not be marked when seq doesn't match")
+	}
+}
+
+func TestDedupEventDropsOnWrongSession(t *testing.T) {
+	// Composite-key correctness: a dedup event for sess-2 must not
+	// mark an entry from sess-1 even if SeqNum happens to collide.
+	// SeqNum is only unique per session (UNIQUE(sessionId,seqNum)),
+	// so cross-session collision is the failure mode the composite
+	// key exists to prevent.
+	m := New()
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "old session",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-2",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "exact",
+	})
+
+	if m.entries[0].Duplicate {
+		t.Error("sess-1 entry must not be marked by sess-2 dedup event")
+	}
+}
+
+func TestDedupEventNoopWhenSequenceNumbersMissing(t *testing.T) {
+	// Defensive: a malformed dedup event with missing SequenceNumber
+	// or DuplicateOfSequence should not panic or scan entries.
+	m := New()
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	m.handleEvent(daemon.Event{Event: "dedup", SessionID: "sess-1"})
+
+	if m.entries[0].Duplicate {
+		t.Error("entry must not be marked when seq fields are nil")
+	}
+}
+
 func TestPartialEvent(t *testing.T) {
 	m := New()
 	m.connected = true
