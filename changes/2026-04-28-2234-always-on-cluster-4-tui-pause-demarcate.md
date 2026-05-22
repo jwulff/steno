@@ -17,10 +17,23 @@ clean about what it stores:
 What's missing is the *user-facing* part of always-on. The TUI still
 shows binary `● REC` / `IDLE`. Spacebar still toggles recording (which
 makes no sense once recording is always on). There's no way to pause for
-privacy. There's no way to mark a session boundary atomically. The
-seven engine states the supervisor can produce (recording / paused /
-recovering / failed / mic-or-screen permission revoked / disconnected /
-stopping) are all collapsed onto two indicators.
+privacy. There's no way to mark a session boundary atomically. And the
+TUI collapses the full health surface onto two indicators, even though
+two distinct sources of state already exist below it:
+
+- The daemon's `EngineStatus` enum
+  (`daemon/Sources/StenoDaemon/Engine/RecordingEngineDelegate.swift`):
+  `idle`, `starting`, `recording`, `stopping`, `error`, `recovering`,
+  `paused` — the actual engine state machine.
+- Derived health signals layered on top of `EngineStatus` by the TUI:
+  permission revoked (mic or screen-recording grant withdrawn — surfaced
+  via the daemon's `recoveryExhausted` token `MIC_OR_SCREEN_PERMISSION_REVOKED`),
+  and disconnected (the Unix-socket-level loss, which the daemon cannot
+  itself report).
+
+Cluster 4 is where the TUI starts honoring that distinction — a 7-state
+status bar that reflects `EngineStatus` AND the two derived states above,
+with a clear priority order between them.
 
 This PR is the user-facing payoff. After it merges, **all 12 implementation
 units of `docs/plans/2026-04-25-001-feat-always-on-recording-plan.md` are

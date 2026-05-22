@@ -127,8 +127,14 @@ This is units **U11/U12** of the plan.
 - **NULL `mic_peak_db` skips the guard.** Pre-Cluster-2 segments don't
   have peak data, and we shouldn't refuse to dedup them just because
   they predate the column. Skipping the guard for NULL means the worst
-  case is "we marked content the user spoke as a duplicate" — which the
-  TUI's raw view (toggleable in U9) can recover.
+  case is "we marked content the user spoke as a duplicate" — which is
+  recoverable: `duplicate_of` is a column, not a destructive write, so
+  any SQLite client (or the MCP surface against the read-only WAL) can
+  query the unfiltered rows directly. Cluster 4's plan originally
+  included a `d` keybind to toggle the duplicate-inclusive view in the
+  TUI; that keybind was deliberately cut as YAGNI (see the Cluster 4
+  changes file), so the recovery path is "read the column" rather than
+  "press a key".
 - **Per-mic-seq cursor, not pass-max.** Documented above — closes the
   interleaved-seq trap. The plan called this out explicitly; the
   implementation matches.

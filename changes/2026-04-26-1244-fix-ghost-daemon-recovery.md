@@ -41,11 +41,11 @@ public signature is unchanged.
 
 The initial heal (commit `fda1afc`) introduced a regression risk that
 review caught before merge: a stale PID file plus macOS PID recycling
-could point at an unrelated user process. Pre-PR-#34 behaviour was an
+could point at an unrelated user process. Pre-PR-#34 behavior was an
 annoying 30s timeout; the new auto-heal would have SIGTERM+SIGKILL'd a
 process that isn't ours.
 
-The fix verifies daemon identity before signalling:
+The fix verifies daemon identity before signaling:
 
 - `processIdentifier` is a function field on `Manager` (so tests can inject
   a mock). The default implementation shells out to `ps -p <pid> -o comm=`
@@ -78,7 +78,7 @@ because the daemon binary lives at `~/.local/bin/steno-daemon`,
   not going to happen. Bounded so the TUI's first-run experience can't
   be held hostage by a hung process.
 - **Identity check by basename, not by checksum or path.** A
-  `${STENO_DAEMON_PATH}`-aware solution would have demanded canonicalising
+  `${STENO_DAEMON_PATH}`-aware solution would have demanded canonicalizing
   the path and handling all the symlink edge cases. Basename-equals
   catches the recycled-PID case without that complexity. The only
   collision is another binary on the system literally named
