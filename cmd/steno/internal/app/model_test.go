@@ -232,6 +232,61 @@ func TestDedupEventDropsOnWrongSession(t *testing.T) {
 	}
 }
 
+func TestDuplicateEntryRendersWithSuffix(t *testing.T) {
+	// AE1 visual: marked entry renders with the `↪ dup of #N` suffix.
+	// View output is the easiest place to assert this contractually.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+
+	view := m.View()
+	if !strings.Contains(view, "↪ dup of #12") {
+		t.Errorf("rendered view missing dup suffix:\n%s", view)
+	}
+	if !strings.Contains(view, "hello world") {
+		t.Error("entry text should still appear (dim+strike, not hidden)")
+	}
+}
+
+func TestUnmarkedEntryRendersWithoutSuffix(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	view := m.View()
+	if strings.Contains(view, "↪ dup of") {
+		t.Errorf("unmarked entry should not render dup suffix:\n%s", view)
+	}
+}
+
 func TestDedupEventNoopWhenSequenceNumbersMissing(t *testing.T) {
 	// Defensive: a malformed dedup event with missing SequenceNumber
 	// or DuplicateOfSequence should not panic or scan entries.
