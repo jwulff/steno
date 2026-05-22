@@ -89,6 +89,15 @@ type Event struct {
 	Component string `json:"component,omitempty"`
 	State     string `json:"state,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+
+	// Dedup-event payload. The daemon emits an `event:"dedup"` after
+	// DedupCoordinator marks a mic segment as a duplicate of a sys
+	// segment. SequenceNumber above carries the mic side; the new
+	// DuplicateOfSequence carries the canonical sys side. Method is
+	// the lowercased DedupMethod raw value (`exact` | `normalized` |
+	// `fuzzy`).
+	DuplicateOfSequence *int   `json:"duplicateOfSequence,omitempty"`
+	Method              string `json:"method,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.
