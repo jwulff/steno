@@ -82,7 +82,7 @@ test-daemon:
 	# we don't rely on a fixed /tmp path that's vulnerable to
 	# symlink attacks on shared machines. `trap` cleans up on exit.
 	@cd $(DAEMON_DIR) && \
-		log_file=$$(mktemp "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX.log"); \
+		log_file=$$(mktemp "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX"); \
 		trap 'rm -f "$$log_file"' EXIT; \
 		( swift test 2>&1; echo "swift_exit=$$?" ) | tee "$$log_file" >/dev/null; \
 		passed=$$(grep -cE "^✔ Test " "$$log_file" || true); \
