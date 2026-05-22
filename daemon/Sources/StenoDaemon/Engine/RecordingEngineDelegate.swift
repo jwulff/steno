@@ -47,6 +47,14 @@ public enum EngineEvent: Sendable {
     /// - `expiresAt`: wall-clock instant the auto-resume timer will fire.
     ///   `nil` for indefinite pauses and on resume.
     case pauseStateChanged(paused: Bool, indefinite: Bool, expiresAt: Date?)
+    /// Ephemeral: a mic segment was just marked as a duplicate of a sys
+    /// segment by `DedupCoordinator`. Carries the session and sequence
+    /// numbers for both sides so subscribed clients (TUI) can locate the
+    /// matching entry in their in-memory transcript list and mark it.
+    /// One event per `markDuplicate`; debounced background pass triggers
+    /// the emission, so events typically arrive ~5s after the original
+    /// `segmentFinalized`.
+    case duplicateMarked(sessionId: UUID, micSequence: Int, sysSequence: Int, method: DedupMethod)
 }
 
 /// Status of the recording engine.

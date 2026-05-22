@@ -74,6 +74,15 @@ type Event struct {
 	Paused             *bool    `json:"paused,omitempty"`
 	PausedIndefinitely *bool    `json:"pausedIndefinitely,omitempty"`
 	PauseExpiresAt     *float64 `json:"pauseExpiresAt,omitempty"`
+
+	// Dedup-event payload. The daemon emits an `event:"dedup"` after
+	// DedupCoordinator marks a mic segment as a duplicate of a sys
+	// segment. SequenceNumber above carries the mic side; the new
+	// DuplicateOfSequence carries the canonical sys side. Method is
+	// the lowercased DedupMethod raw value (`exact` | `normalized` |
+	// `fuzzy`).
+	DuplicateOfSequence *int   `json:"duplicateOfSequence,omitempty"`
+	Method              string `json:"method,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.

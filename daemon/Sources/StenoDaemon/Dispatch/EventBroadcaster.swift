@@ -9,6 +9,7 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     case status
     case modelProcessing
     case error
+    case dedup
 }
 
 /// Broadcasts engine events to subscribed socket clients.
@@ -153,6 +154,19 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 paused: paused,
                 pausedIndefinitely: indefinite,
                 pauseExpiresAt: expiresAt?.timeIntervalSince1970
+            ))
+
+        // The TUI keys the match by `(sessionId, sequenceNumber)` — the
+        // mic side. `duplicateOfSequence` carries the sys segment's
+        // sequence number for the inline `↪ dup of #N` hint. Method is
+        // serialized as the lowercased `DedupMethod` raw value.
+        case .duplicateMarked(let sessionId, let micSequence, let sysSequence, let method):
+            return (.dedup, DaemonEvent(
+                event: "dedup",
+                sessionId: sessionId.uuidString,
+                sequenceNumber: micSequence,
+                duplicateOfSequence: sysSequence,
+                method: method.rawValue
             ))
         }
     }

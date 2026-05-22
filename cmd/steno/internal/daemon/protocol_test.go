@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -369,5 +370,72 @@ func TestEventPauseStateIndefinite(t *testing.T) {
 	}
 	if ev.PauseExpiresAt != nil {
 		t.Errorf("PauseExpiresAt should be nil for indefinite pause")
+	}
+}
+
+func TestEventDedup(t *testing.T) {
+	j := `{"event":"dedup","sessionId":"00000000-0000-0000-0000-000000000001","sequenceNumber":17,"duplicateOfSequence":12,"method":"fuzzy"}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if ev.Event != "dedup" {
+		t.Errorf("event = %q, want dedup", ev.Event)
+	}
+	if ev.SessionID != "00000000-0000-0000-0000-000000000001" {
+		t.Errorf("SessionID = %q", ev.SessionID)
+	}
+	if ev.SequenceNumber == nil || *ev.SequenceNumber != 17 {
+		t.Errorf("SequenceNumber = %v, want 17", ev.SequenceNumber)
+	}
+	if ev.DuplicateOfSequence == nil || *ev.DuplicateOfSequence != 12 {
+		t.Errorf("DuplicateOfSequence = %v, want 12", ev.DuplicateOfSequence)
+	}
+	if ev.Method != "fuzzy" {
+		t.Errorf("Method = %q, want fuzzy", ev.Method)
+	}
+}
+
+func TestEventDedupMethodVariants(t *testing.T) {
+	// Each DedupMethod RawValue should decode without error.
+	for _, m := range []string{"exact", "normalized", "fuzzy"} {
+		j := `{"event":"dedup","sequenceNumber":1,"duplicateOfSequence":2,"method":"` + m + `"}`
+		var ev Event
+		if err := json.Unmarshal([]byte(j), &ev); err != nil {
+			t.Fatalf("unmarshal %q: %v", m, err)
+		}
+		if ev.Method != m {
+			t.Errorf("Method = %q, want %q", ev.Method, m)
+		}
+	}
+}
+
+func TestEventDedupOmitsNilFieldsOnEncode(t *testing.T) {
+	// Encode an Event with only the dedup fields set; ensure unrelated
+	// optional fields don't surface in the JSON output.
+	dupOf := 12
+	seq := 17
+	ev := Event{
+		Event:               "dedup",
+		SessionID:           "abc",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "exact",
+	}
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(data)
+	for _, must := range []string{`"event":"dedup"`, `"sessionId":"abc"`, `"sequenceNumber":17`, `"duplicateOfSequence":12`, `"method":"exact"`} {
+		if !strings.Contains(s, must) {
+			t.Errorf("encoded JSON missing %q: %s", must, s)
+		}
+	}
+	for _, mustNot := range []string{`"text"`, `"source"`, `"mic"`, `"sys"`, `"paused"`} {
+		if strings.Contains(s, mustNot) {
+			t.Errorf("encoded JSON unexpectedly contains %q: %s", mustNot, s)
+		}
 	}
 }
