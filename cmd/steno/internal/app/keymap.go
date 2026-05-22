@@ -46,4 +46,7 @@ const (
 	KeyErrorHistory    = "e"
 	KeyErrorHistoryUp  = "E"
 	KeyEsc             = "esc"
+	// Toggle visibility of dedup-marked entries between dimmed-visible
+	// (default) and hidden. Per-TUI-session, not persisted.
+	KeyToggleDuplicates = "d"
 )
