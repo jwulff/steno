@@ -15,6 +15,7 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     /// #62 — an on-device model pipeline changed readiness (transcription /
     /// diarization preparing / ready / unavailable).
     case modelStatus
+    case dedup
 }
 
 /// Broadcasts engine events to subscribed socket clients.
@@ -220,6 +221,19 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 component: component.rawValue,
                 state: readiness.wireState,
                 reason: readiness.reason
+            ))
+
+        // The TUI keys the match by `(sessionId, sequenceNumber)` — the
+        // mic side. `duplicateOfSequence` carries the sys segment's
+        // sequence number for the inline `↪ dup of #N` hint. Method is
+        // serialized as the lowercased `DedupMethod` raw value.
+        case .duplicateMarked(let sessionId, let micSequence, let sysSequence, let method):
+            return (.dedup, DaemonEvent(
+                event: "dedup",
+                sessionId: sessionId.uuidString,
+                sequenceNumber: micSequence,
+                duplicateOfSequence: sysSequence,
+                method: method.rawValue
             ))
         }
     }

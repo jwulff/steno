@@ -137,6 +137,82 @@ struct DedupCoordinatorTests {
         #expect(updatedMic?.dedupMethod == .exact)
     }
 
+    // MARK: - Pass: markedPairs return value (U1)
+
+    @Test func runPassReturnsMarkedPairsForEachMark() async throws {
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t,
+            micText: "hello world", sysText: "hello world",
+            micSeq: 1, sysSeq: 2
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.count == 1)
+        let pair = outcome.markedPairs[0]
+        #expect(pair.micSequence == 1)
+        #expect(pair.sysSequence == 2)
+        #expect(pair.method == .exact)
+    }
+
+    @Test func runPassMarkedPairsEmptyWhenNothingMatched() async throws {
+        // Mic and sys segments exist but are outside the overlap window —
+        // nothing marked, markedPairs is empty (not nil).
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        let mic = StoredSegment(
+            sessionId: session.id,
+            text: "hello world",
+            startedAt: t,
+            endedAt: t.addingTimeInterval(1),
+            sequenceNumber: 1,
+            source: .microphone
+        )
+        let sys = StoredSegment(
+            sessionId: session.id,
+            text: "hello world",
+            startedAt: t.addingTimeInterval(10),
+            endedAt: t.addingTimeInterval(11),
+            sequenceNumber: 2,
+            source: .systemAudio
+        )
+        try await repo.saveSegment(mic)
+        try await repo.saveSegment(sys)
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.isEmpty)
+    }
+
+    @Test func runPassMarkedPairsAccumulateAcrossMultipleMatches() async throws {
+        // Two mic+sys pairs that should both match. Both pairs should
+        // appear in markedPairs in mic-sequence order.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t,
+            micText: "first utterance",
+            sysText: "first utterance",
+            micSeq: 1, sysSeq: 2
+        )
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(30),
+            micText: "second utterance",
+            sysText: "second utterance",
+            micSeq: 3, sysSeq: 4
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.count == 2)
+        #expect(outcome.markedPairs[0].micSequence == 1)
+        #expect(outcome.markedPairs[0].sysSequence == 2)
+        #expect(outcome.markedPairs[1].micSequence == 3)
+        #expect(outcome.markedPairs[1].sysSequence == 4)
+    }
+
     @Test func happyNormalizedMatchMarksDuplicate() async throws {
         let (coord, repo, session) = try await setup()
         let t = Date()

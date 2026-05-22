@@ -2598,10 +2598,11 @@ public actor RecordingEngine {
             // The coordinator owns its own reentrance — multiple cross-session
             // passes can run in parallel; same-session collapse is the
             // coordinator's responsibility.
-            await coordinator.runPass(
+            let outcome = await coordinator.runPass(
                 sessionId: sessionId,
                 holdForSystemAudio: holdForSystemAudio
             )
+            await self.emitDuplicateMarkedEvents(sessionId: sessionId, pairs: outcome.markedPairs)
         }
         pendingDedupTriggers[sessionId] = task
     }
@@ -2611,6 +2612,21 @@ public actor RecordingEngine {
     /// AFTER the pass starts schedules a new task rather than racing).
     private func clearPendingDedupTrigger(sessionId: UUID) {
         pendingDedupTriggers[sessionId] = nil
+    }
+
+    /// Emit one `EngineEvent.duplicateMarked` per `MarkedPair` returned by
+    /// a dedup pass. Called from both the debounced trigger path and the
+    /// synchronous close-path `dedupAndMaybePrune`. Per-mark cadence (R3
+    /// in the brainstorm) — the TUI marks one entry per event.
+    private func emitDuplicateMarkedEvents(sessionId: UUID, pairs: [MarkedPair]) async {
+        for pair in pairs {
+            await emit(.duplicateMarked(
+                sessionId: sessionId,
+                micSequence: pair.micSequence,
+                sysSequence: pair.sysSequence,
+                method: pair.method
+            ))
+        }
     }
 
     // MARK: - U12 Empty-Session Prune
@@ -2651,7 +2667,8 @@ public actor RecordingEngine {
         //    anything the live passes deferred waiting for a lagging sys
         //    worker has to be judged now or stay behind the cursor forever.
         if let coordinator = dedupCoordinator {
-            _ = await coordinator.runPass(sessionId: sessionId, holdForSystemAudio: false)
+            let outcome = await coordinator.runPass(sessionId: sessionId, holdForSystemAudio: false)
+            await emitDuplicateMarkedEvents(sessionId: sessionId, pairs: outcome.markedPairs)
         }
 
         // Pruner is "disabled" sentinel: both thresholds at 0 means tests
