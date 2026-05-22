@@ -1877,17 +1877,42 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			if marker, ok := m.healMarkers[e.SeqNum]; ok && marker != "" {
 				displayLines = append(displayLines, ui.HealMarkerStyle.Render("  ⚠ "+formatHealMarker(marker)))
 			}
-			ts := ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
-			var src string
-			if e.Source == "systemAudio" {
-				src = ui.SysLabelStyle.Render("[SYS] ")
+			var ts, src string
+			if e.Duplicate {
+				// Marked as duplicate of a sys segment — render the
+				// whole row dim + struck through. Inline `↪ dup of #N`
+				// suffix appended to the final wrapped line.
+				ts = ui.DuplicateStyle.Render(e.Timestamp.Format("[15:04:05]"))
+				srcLabel := "[MIC] "
+				if e.Source == "systemAudio" {
+					srcLabel = "[SYS] "
+				}
+				src = ui.DuplicateStyle.Render(srcLabel)
 			} else {
-				src = ui.MicLabelStyle.Render("[MIC] ")
+				ts = ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
+				if e.Source == "systemAudio" {
+					src = ui.SysLabelStyle.Render("[SYS] ")
+				} else {
+					src = ui.MicLabelStyle.Render("[MIC] ")
+				}
 			}
 			wrapped := wrapText(e.Text, textWidth)
-			displayLines = append(displayLines, ts+" "+src+wrapped[0])
-			for _, wl := range wrapped[1:] {
-				displayLines = append(displayLines, indentStr+wl)
+			if e.Duplicate {
+				suffix := fmt.Sprintf(" ↪ dup of #%d", e.DuplicateOfSeq)
+				styled := make([]string, len(wrapped))
+				for i, wl := range wrapped {
+					styled[i] = ui.DuplicateStyle.Render(wl)
+				}
+				styled[len(styled)-1] += ui.DuplicateStyle.Render(suffix)
+				displayLines = append(displayLines, ts+" "+src+styled[0])
+				for _, wl := range styled[1:] {
+					displayLines = append(displayLines, indentStr+wl)
+				}
+			} else {
+				displayLines = append(displayLines, ts+" "+src+wrapped[0])
+				for _, wl := range wrapped[1:] {
+					displayLines = append(displayLines, indentStr+wl)
+				}
 			}
 		}
 

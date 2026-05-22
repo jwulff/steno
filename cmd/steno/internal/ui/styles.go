@@ -134,6 +134,15 @@ var (
 			Foreground(ColorYellow).
 			Italic(true)
 
+	// DuplicateStyle: dim gray + strikethrough for mic segments marked
+	// as duplicates of a sys segment by DedupCoordinator. The same
+	// foreground as DimStyle, with Strikethrough to make the marker
+	// glanceable without removing the text. Used on the segment text,
+	// timestamp, source label, and the inline `↪ dup of #N` suffix.
+	DuplicateStyle = lipgloss.NewStyle().
+			Foreground(ColorGray).
+			Strikethrough(true)
+
 	// FirstLaunchBannerStyle: cyan banner for the consent disclosure on
 	// first launch.
 	FirstLaunchBannerStyle = lipgloss.NewStyle().
