@@ -148,6 +148,18 @@ struct RunCommand: ParsableCommand {
                     log.error("Audio device observer registration failed: \(error)")
                 }
 
+                // #42: register a display-reconfiguration observer so
+                // a parked sys pipeline (no-display state) re-arms
+                // when a display reappears. Same shape as the audio
+                // device observer above — non-fatal on failure.
+                let displayObserver = DisplayObserver()
+                do {
+                    try displayObserver.start(target: engine)
+                    log.info("Display observer registered (CGDisplayReconfiguration)")
+                } catch {
+                    log.error("Display observer registration failed: \(error)")
+                }
+
                 // 5b. Auto-start recording. R1/R9: the daemon must never
                 // sit in `idle` after launch. Failure is logged but does
                 // NOT crash the daemon — the engine surfaces the error
@@ -190,6 +202,7 @@ struct RunCommand: ParsableCommand {
                 // 8. Graceful shutdown
                 powerObserver.stop()
                 deviceObserver.stop()
+                displayObserver.stop()
                 await engine.stop()
                 await server.stop()
                 pidFile.release()

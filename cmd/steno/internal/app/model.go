@@ -61,6 +61,19 @@ const errorRingCapacity = 10
 // status when this token appears (R12 + Refinements consolidated states).
 const MicOrScreenPermissionRevoked = "MIC_OR_SCREEN_PERMISSION_REVOKED"
 
+// SystemAudioParkedNoDisplay is the load-bearing token the daemon emits
+// in transient `.error` events when the SCStream sys-audio pipeline has
+// been parked because no display is attached (#42). Unlike the
+// permission-revoked token, parking is recoverable — the daemon
+// re-arms the pipeline when a display reappears via the engine's
+// `DisplayObserver`. The TUI annotates the audio-mode chip in the
+// header while this state is active so the user can tell at a glance
+// that system audio is paused, while mic recording continues
+// uninterrupted. Treat this string as load-bearing: do not change the
+// wording without updating both this file and
+// `RecordingEngine.systemAudioParkedNoDisplayToken` in the daemon.
+const SystemAudioParkedNoDisplay = "SYSTEM_AUDIO_PARKED_NO_DISPLAY"
+
 // firstLaunchMarkerFile is the on-disk marker that suppresses the
 // always-on consent banner after first dismissal. Lives in the same
 // Application Support directory as the daemon socket and DB.
@@ -139,6 +152,15 @@ type Model struct {
 	// so the status bar can surface a distinct "grant in System Settings"
 	// state. Cleared on next pause/resume or successful recovery.
 	permissionRevoked bool
+
+	// #42: set when the daemon emits a transient `.error` carrying the
+	// SystemAudioParkedNoDisplay token. The audio-mode chip in the
+	// header annotates `[MIC + SYS — waiting for display]` while this
+	// is true. Cleared when the daemon successfully restarts the sys
+	// pipeline (next `.recovering` reason `display:available` + return
+	// to `.recording`), on pause/resume, or on stop. The mic pipeline
+	// is unaffected, so the REC indicator is unchanged.
+	systemAudioParked bool
 
 	// Last-segment indicator (R12). Tracks the wall-clock of the most
 	// recent finalized segment so the status bar can render
@@ -786,6 +808,9 @@ func (m *Model) applyPauseFields(paused, indefinite *bool, expiresAt *float64) {
 	}
 	if *paused {
 		m.engineStatus = StatusPaused
+		// Pausing tears down the sys pipeline, so any prior parked
+		// state is no longer meaningful. Clear the chip annotation.
+		m.systemAudioParked = false
 		if indefinite != nil && *indefinite {
 			m.pausedIndefinitely = true
 			m.pauseExpiresAt = nil
@@ -947,9 +972,24 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		// multiplexed onto the error wire channel. Sniff the message
 		// prefix to route to the right TUI state.
 		switch {
+		case strings.HasPrefix(ev.Message, SystemAudioParkedNoDisplay+":"):
+			// #42: sys-audio is parked waiting for a display. Mic
+			// keeps recording — engine status stays `.recording` —
+			// so the chip in the header is the only visible signal.
+			// Transient: don't add to the error-history ring buffer.
+			m.systemAudioParked = true
+			return nil
+
 		case strings.HasPrefix(ev.Message, "recovering:"):
 			m.engineStatus = StatusRecovering
 			m.recoveringStartedAt = time.Now()
+			// #42: `recovering:display:available` is the daemon's
+			// confirmation that a display reappeared and the sys
+			// pipeline is being re-armed. Clear the parked chip so
+			// the user sees the rebuild attempt instead.
+			if strings.Contains(ev.Message, "display:available") {
+				m.systemAudioParked = false
+			}
 			// Treat as non-persistent — we don't show this in the
 			// error bar, the status bar carries it.
 			return nil
@@ -975,6 +1015,9 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			if strings.Contains(ev.Message, MicOrScreenPermissionRevoked) {
 				m.permissionRevoked = true
 			}
+			// Surrender supersedes parking — clear the chip so the
+			// user sees the more serious failed-state surface.
+			m.systemAudioParked = false
 			return nil
 		}
 
@@ -1282,7 +1325,15 @@ func (m Model) renderHeader() string {
 
 	var audioMode string
 	if m.systemAudio {
-		audioMode = ui.DimStyle.Render(" [MIC + SYS]")
+		if m.systemAudioParked {
+			// #42: SCStream has been parked because no display is
+			// attached. Mic continues recording, but sys is paused
+			// until a display reappears — annotate the chip so the
+			// user can tell at a glance.
+			audioMode = ui.PausedStyle.Render(" [MIC + SYS — waiting for display]")
+		} else {
+			audioMode = ui.DimStyle.Render(" [MIC + SYS]")
+		}
 	}
 
 	return title + deviceInfo + audioMode
