@@ -246,10 +246,15 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamDelegate, @
 
         case .parkUntilDisplay:
             tearDownAfterDelegateError()
-            // No backoff key — parking intentionally bypasses U5.
-            // Carry the SCStream code in the reason so the engine + TUI
-            // can distinguish path-1 (live SCStream death, -3815) from
-            // path-2 (rebuild throw of SystemAudioError.noDisplaysAvailable).
+            // Parking intentionally bypasses U5: we do NOT record an
+            // error against the bounded backoff, do NOT schedule a
+            // retry timer, and do NOT surrender after N attempts. We
+            // still compute the domain#code key here purely so it can
+            // ride along inside the reason string, letting the engine
+            // and TUI distinguish path-1 (live SCStream death, -3815)
+            // from path-2 (rebuild throw of
+            // SystemAudioError.noDisplaysAvailable). The key is
+            // diagnostic only — it never reaches `BackoffPolicy`.
             let key = SystemAudioErrorClassifier.backoffKey(for: error)
             let reason = "scstream:\(key):\(error.localizedDescription)"
             let delegate = self.recoveryDelegate

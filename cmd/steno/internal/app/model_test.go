@@ -1390,3 +1390,132 @@ func TestTruncateToWidthPassthroughWhenWithin(t *testing.T) {
 		t.Errorf("truncateToWidth = %q, want passthrough %q", out, s)
 	}
 }
+
+// --- #42: SYSTEM_AUDIO_PARKED_NO_DISPLAY chip ---
+
+func TestSystemAudioParkedEventSetsFlag(t *testing.T) {
+	m := New()
+	transient := true
+	ev := daemon.Event{
+		Event:     "error",
+		Message:   SystemAudioParkedNoDisplay + ":scstream:com.apple.ScreenCaptureKit.SCStreamErrorDomain#-3815:Failed to find any display",
+		Transient: &transient,
+	}
+	m.handleEvent(ev)
+
+	if !m.systemAudioParked {
+		t.Error("systemAudioParked should be true after parked-no-display event")
+	}
+	// The chip is the user-visible surface; the event must NOT be
+	// stuffed into the error-history ring buffer (parking is recoverable).
+	if len(m.errorHistory) != 0 {
+		t.Errorf("errorHistory len = %d, want 0 (parking is transient)", len(m.errorHistory))
+	}
+	// Engine status is unaffected — mic keeps recording.
+	if m.engineStatus == StatusError {
+		t.Errorf("engineStatus = %q, want NOT error (mic continues)", m.engineStatus)
+	}
+}
+
+func TestSystemAudioParkedRenderedInHeader(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.systemAudio = true
+	m.systemAudioParked = true
+	m.deviceName = "MacBook Pro Microphone"
+
+	header := m.renderHeader()
+	if !strings.Contains(header, "waiting for display") {
+		t.Errorf("header missing 'waiting for display' annotation: %q", header)
+	}
+	if !strings.Contains(header, "MIC + SYS") {
+		t.Errorf("header missing 'MIC + SYS' chip text: %q", header)
+	}
+}
+
+func TestSystemAudioParkedNotRenderedWhenSysOff(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.systemAudio = false       // user disabled system audio
+	m.systemAudioParked = true  // stale flag (shouldn't happen, but be defensive)
+
+	header := m.renderHeader()
+	if strings.Contains(header, "waiting for display") {
+		t.Errorf("header should NOT show parked annotation when systemAudio=false: %q", header)
+	}
+	if strings.Contains(header, "MIC + SYS") {
+		t.Errorf("header should NOT show MIC + SYS chip when systemAudio=false: %q", header)
+	}
+}
+
+func TestDisplayAvailableRecoveringClearsParked(t *testing.T) {
+	m := New()
+	m.systemAudioParked = true
+	transient := true
+	ev := daemon.Event{
+		Event:     "error",
+		Message:   "recovering:display:available",
+		Transient: &transient,
+	}
+	m.handleEvent(ev)
+
+	if m.systemAudioParked {
+		t.Error("systemAudioParked should be cleared by 'recovering:display:available' event")
+	}
+	if m.engineStatus != StatusRecovering {
+		t.Errorf("engineStatus = %q, want recovering", m.engineStatus)
+	}
+}
+
+func TestUnrelatedRecoveringDoesNotClearParked(t *testing.T) {
+	// A recovering reason like `device-change:uid:BuiltInMic` for an
+	// AirPods swap must NOT clear the parked-display chip — sys-audio
+	// is still waiting for a display even though mic is restarting.
+	m := New()
+	m.systemAudioParked = true
+	transient := true
+	ev := daemon.Event{
+		Event:     "error",
+		Message:   "recovering:device-change:uid:BuiltInMic",
+		Transient: &transient,
+	}
+	m.handleEvent(ev)
+
+	if !m.systemAudioParked {
+		t.Error("systemAudioParked should NOT be cleared by an unrelated recovering reason")
+	}
+}
+
+func TestRecoveryExhaustedClearsParked(t *testing.T) {
+	// A more serious surrender supersedes the parked chip — the user
+	// should see the failed-state surface, not "still waiting".
+	m := New()
+	m.systemAudioParked = true
+	transient := false
+	ev := daemon.Event{
+		Event:     "error",
+		Message:   "recovery_exhausted: " + MicOrScreenPermissionRevoked,
+		Transient: &transient,
+	}
+	m.handleEvent(ev)
+
+	if m.systemAudioParked {
+		t.Error("systemAudioParked should be cleared by recovery_exhausted")
+	}
+	if !m.permissionRevoked {
+		t.Error("permissionRevoked should be set by recovery_exhausted with token")
+	}
+}
+
+func TestPauseClearsParked(t *testing.T) {
+	m := New()
+	m.systemAudioParked = true
+	paused := true
+	indefinite := false
+	expires := float64(time.Now().Add(30 * time.Minute).Unix())
+	m.applyPauseFields(&paused, &indefinite, &expires)
+
+	if m.systemAudioParked {
+		t.Error("systemAudioParked should be cleared on pause")
+	}
+}

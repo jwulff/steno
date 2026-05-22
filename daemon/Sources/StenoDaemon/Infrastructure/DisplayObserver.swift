@@ -40,18 +40,13 @@ public protocol DisplayChangeSubscribing: AnyObject, Sendable {
 
 // MARK: - Production CG callback bridge
 
-/// Holds the active `DisplayChangeHandler` so a top-level
-/// `@convention(c)` callback can find it. Required because
-/// `CGDisplayRegisterReconfigurationCallback` takes a C function
-/// pointer, which Swift can only synthesize from a non-capturing
-/// closure or top-level function.
-///
-/// The daemon only ever wires one `DisplayObserver`, so a single
-/// global handler slot is sufficient. Wrapped in `NSLock` so
-/// `subscribe()` / `unsubscribe()` are race-safe with concurrent
-/// Core Graphics callbacks.
-private final class _DisplayReconfigState: @unchecked Sendable {
-    static let shared = _DisplayReconfigState()
+/// Per-subscriber handler state. Lives behind an `Unmanaged` pointer
+/// passed as `userInfo` to `CGDisplayRegisterReconfigurationCallback`,
+/// so each `CGDisplayReconfigSubscriber` resolves its own handler from
+/// the C callback. Avoids the global singleton trap where a second
+/// subscriber would silently steal callbacks from the first (PR #43
+/// review).
+private final class _DisplayReconfigHandlerBox: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: DisplayChangeHandler?
 
@@ -69,20 +64,32 @@ private final class _DisplayReconfigState: @unchecked Sendable {
     }
 }
 
-/// Top-level C-callable bridge for
-/// `CGDisplayRegisterReconfigurationCallback`. Must be a top-level
-/// function (no capture) so Swift can convert it to
-/// `@convention(c)`.
+/// Top-level C-callable bridge. Must be a top-level function so Swift
+/// can synthesize the `@convention(c)` pointer.
+///
+/// Core Graphics fires this callback twice per reconfiguration — once
+/// with `.beginConfigurationFlag` set, once at completion. We forward
+/// both to the per-subscriber box; the trailing-edge debounce in
+/// `DisplayObserver` collapses the pair into a single fire.
 private func _displayReconfigCallback(
     _ display: CGDirectDisplayID,
     _ flags: CGDisplayChangeSummaryFlags,
     _ userInfo: UnsafeMutableRawPointer?
 ) {
-    // Core Graphics fires this callback twice per reconfiguration —
-    // once with `.beginConfigurationFlag` set, once at completion. We
-    // forward both to the debounce layer; the trailing-edge timer
-    // collapses the pair into a single fire.
-    _DisplayReconfigState.shared.fire()
+    guard let userInfo else { return }
+    let box = Unmanaged<_DisplayReconfigHandlerBox>.fromOpaque(userInfo).takeUnretainedValue()
+    box.fire()
+}
+
+/// Thrown by `CGDisplayReconfigSubscriber.subscribe(handler:)` when
+/// Core Graphics rejects the callback registration. Surfaces up to
+/// `DisplayObserver.start(target:)`, which can decide whether the
+/// daemon proceeds without display-reconfig observation.
+public struct CGDisplayReconfigSubscribeError: Error, Equatable, Sendable {
+    public let cgErrorRawValue: Int32
+    public init(_ cgError: CGError) {
+        self.cgErrorRawValue = cgError.rawValue
+    }
 }
 
 /// Production `DisplayChangeSubscribing` backed by
@@ -93,27 +100,94 @@ private func _displayReconfigCallback(
 public final class CGDisplayReconfigSubscriber: DisplayChangeSubscribing, @unchecked Sendable {
     private let lock = NSLock()
     private var registered: Bool = false
+    /// Per-instance box held strongly so the `Unmanaged.passUnretained`
+    /// pointer we pass to Core Graphics remains valid for the
+    /// subscription's lifetime. Released in `unsubscribe()` once Core
+    /// Graphics confirms the callback was removed.
+    private var handlerBox: _DisplayReconfigHandlerBox?
 
     public init() {}
 
-    deinit { unsubscribe() }
+    deinit {
+        // Best-effort: clear our registration so the daemon doesn't
+        // leak a callback into a freed box on shutdown. We swallow
+        // errors here because there's no caller to propagate to.
+        try? subscribeOrUnsubscribeLocked(handler: nil)
+    }
 
     public func subscribe(handler: @escaping DisplayChangeHandler) {
-        lock.lock(); defer { lock.unlock() }
-        _DisplayReconfigState.shared.setHandler(handler)
-        if !registered {
-            CGDisplayRegisterReconfigurationCallback(_displayReconfigCallback, nil)
-            registered = true
+        // The protocol method does not throw — callers that need to
+        // observe registration failures use `DisplayObserver.start`,
+        // which calls `subscribeThrowing` below. The non-throwing
+        // entry point is here to preserve the protocol contract; on
+        // CG registration failure it logs and leaves `registered`
+        // false so a future `subscribe` retry can attempt again.
+        do {
+            try subscribeThrowing(handler: handler)
+        } catch let err as CGDisplayReconfigSubscribeError {
+            // Best-effort log. The daemon's structured logger isn't
+            // wired into Infrastructure types, so use `FileHandle`.
+            let message = "DisplayObserver: CGDisplayRegisterReconfigurationCallback " +
+                "failed (CGError raw=\(err.cgErrorRawValue)); display-reconfig events will not fire"
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+        } catch {
+            // Future-proofing: no other error types today, but log so
+            // we don't silently regress.
+            let message = "DisplayObserver: subscribe failed: \(error)"
+            FileHandle.standardError.write(Data((message + "\n").utf8))
         }
     }
 
+    /// Throwing variant that surfaces `CGDisplayReconfigSubscribeError`
+    /// when Core Graphics rejects the callback registration. Used by
+    /// the throwing constructor path; the protocol's non-throwing
+    /// `subscribe(handler:)` wraps this and logs.
+    public func subscribeThrowing(handler: @escaping DisplayChangeHandler) throws {
+        try subscribeOrUnsubscribeLocked(handler: handler)
+    }
+
     public func unsubscribe() {
+        try? subscribeOrUnsubscribeLocked(handler: nil)
+    }
+
+    private func subscribeOrUnsubscribeLocked(handler: DisplayChangeHandler?) throws {
         lock.lock(); defer { lock.unlock() }
-        _DisplayReconfigState.shared.setHandler(nil)
-        if registered {
-            CGDisplayRemoveReconfigurationCallback(_displayReconfigCallback, nil)
-            registered = false
+
+        if let handler {
+            // Swap or install the handler.
+            if registered, let existing = handlerBox {
+                // Already registered with CG; just update the per-box
+                // handler. New events will route to the new closure.
+                existing.setHandler(handler)
+                return
+            }
+            // Fresh registration.
+            let box = _DisplayReconfigHandlerBox()
+            box.setHandler(handler)
+            let userInfo = Unmanaged.passUnretained(box).toOpaque()
+            let result = CGDisplayRegisterReconfigurationCallback(_displayReconfigCallback, userInfo)
+            if result != .success {
+                throw CGDisplayReconfigSubscribeError(result)
+            }
+            self.handlerBox = box
+            self.registered = true
+            return
         }
+
+        // Tear down.
+        guard registered, let existing = handlerBox else { return }
+        let userInfo = Unmanaged.passUnretained(existing).toOpaque()
+        existing.setHandler(nil)
+        let result = CGDisplayRemoveReconfigurationCallback(_displayReconfigCallback, userInfo)
+        // Even on a non-success teardown we drop our refs — there's
+        // nothing constructive to do with the error at process scope.
+        if result != .success {
+            let message = "DisplayObserver: CGDisplayRemoveReconfigurationCallback " +
+                "returned non-success (raw=\(result.rawValue)); proceeding anyway"
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+        }
+        self.handlerBox = nil
+        self.registered = false
     }
 }
 

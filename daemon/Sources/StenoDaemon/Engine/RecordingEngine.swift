@@ -170,11 +170,15 @@ public actor RecordingEngine {
     /// degraded state, not a surrender.
     private var sysParkedAwaitingDisplay: Bool = false
 
-    /// Load-bearing token the TUI matches on for the parked state.
-    /// Mirrors `MIC_OR_SCREEN_PERMISSION_REVOKED` in shape — surfaces in
-    /// the `.error` event's message so the TUI can render a distinct,
-    /// non-alarming "waiting for display" indicator instead of treating
-    /// the surrender path as authoritative.
+    /// Token the TUI matches on for the parked state. Mirrors
+    /// `MIC_OR_SCREEN_PERMISSION_REVOKED` in shape — surfaces in the
+    /// `.error` event's message (transient, isTransient=true) so the
+    /// TUI can render a distinct, non-alarming "waiting for display"
+    /// indicator instead of treating the surrender path as
+    /// authoritative. Treat this string as load-bearing: the Go TUI
+    /// matches it via a `strings.Contains` check in
+    /// `cmd/steno/internal/app/model.go`; do not change the wording
+    /// without updating both sides.
     public static let systemAudioParkedNoDisplayToken = "SYSTEM_AUDIO_PARKED_NO_DISPLAY"
 
     // MARK: - U6 sleep/wake state
