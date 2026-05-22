@@ -243,6 +243,19 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamDelegate, @
             Task {
                 await delegate?.systemAudioRequestsRetry(errorCode: key, reason: reason)
             }
+
+        case .parkUntilDisplay:
+            tearDownAfterDelegateError()
+            // No backoff key — parking intentionally bypasses U5.
+            // Carry the SCStream code in the reason so the engine + TUI
+            // can distinguish path-1 (live SCStream death, -3815) from
+            // path-2 (rebuild throw of SystemAudioError.noDisplaysAvailable).
+            let key = SystemAudioErrorClassifier.backoffKey(for: error)
+            let reason = "scstream:\(key):\(error.localizedDescription)"
+            let delegate = self.recoveryDelegate
+            Task {
+                await delegate?.systemAudioParkedUntilDisplay(reason: reason)
+            }
         }
     }
 }

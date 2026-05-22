@@ -33,4 +33,17 @@ public protocol SystemAudioRecoveryDelegate: AnyObject, Sendable {
     /// `MIC_OR_SCREEN_PERMISSION_REVOKED` token, transitions to
     /// `.error`, and does NOT retry.
     func systemAudioPermissionRevoked() async
+
+    /// The SCStream stopped because no display was available
+    /// (`noCaptureSource`, -3815). This is stimulus-driven, not
+    /// transient — the SCStream cannot recover until a display
+    /// reappears. The engine parks the sys pipeline (no backoff
+    /// advance, no rebuild timer), leaves mic running, and waits
+    /// for the `DisplayObserver` to fire `displayBecameAvailable()`
+    /// before rebuilding. See #42.
+    ///
+    /// - Parameter reason: Human-readable reason surfaced via a
+    ///   transient `.error` event carrying the
+    ///   `SYSTEM_AUDIO_PARKED_NO_DISPLAY` token.
+    func systemAudioParkedUntilDisplay(reason: String) async
 }

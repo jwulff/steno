@@ -4,7 +4,7 @@ import ScreenCaptureKit
 /// The recovery action `SystemAudioSource` should take in response to an
 /// `SCStreamDelegate.stream(_:didStopWithError:)` callback.
 ///
-/// Maps the SCStream error code to one of three orchestration outcomes
+/// Maps the SCStream error code to one of four orchestration outcomes
 /// the engine knows how to handle:
 ///
 ///   - `.ignore` — benign / self-inflicted state, no rebuild, no backoff
@@ -17,10 +17,18 @@ import ScreenCaptureKit
 ///     non-transient `recoveryExhausted` event with the load-bearing
 ///     `MIC_OR_SCREEN_PERMISSION_REVOKED` token so U9's TUI surface can
 ///     match on it.
+///   - `.parkUntilDisplay` — stimulus-driven failure (`noCaptureSource`,
+///     -3815: "Failed to find any display"). The SCStream cannot
+///     recover until a display reappears, so bounded backoff would
+///     just burn through five attempts and surrender. Engine parks
+///     the sys pipeline, leaves mic running, and waits for the
+///     `DisplayObserver` to fire `displayBecameAvailable()` before
+///     rebuilding. See #42.
 public enum SCStreamRecoveryAction: Sendable, Equatable {
     case ignore
     case retry
     case permissionRevoked
+    case parkUntilDisplay
 }
 
 /// The load-bearing token U9's TUI surface matches on. Used both in
@@ -44,7 +52,7 @@ public let micOrScreenPermissionRevokedToken = "MIC_OR_SCREEN_PERMISSION_REVOKED
 ///   | -3808 | `attemptToStopStreamState`                | `.ignore`           |
 ///   | -3804 | `failedApplicationConnectionInvalid`      | `.retry`            |
 ///   | -3805 | `failedApplicationConnectionInterrupted`  | `.retry`            |
-///   | -3815 | `noCaptureSource`                         | `.retry`            |
+///   | -3815 | `noCaptureSource`                         | `.parkUntilDisplay` |
 ///   | -3821 | `systemStoppedStream`                     | `.retry`            |
 ///   | other | (unknown / future code)                   | `.retry`            |
 ///
@@ -77,9 +85,16 @@ public enum SystemAudioErrorClassifier {
             return .permissionRevoked
         case SCStreamError.attemptToStopStreamState.rawValue:
             return .ignore
+        case SCStreamError.noCaptureSource.rawValue:
+            // #42: "Failed to find any display" is stimulus-driven, not
+            // transient. The bounded backoff would burn five attempts
+            // (1s/2s/4s/8s/30s) and surrender — meanwhile the display
+            // is still absent because the user closed the lid or
+            // unplugged the monitor. Park the sys pipeline instead;
+            // the DisplayObserver re-arms it when a display reappears.
+            return .parkUntilDisplay
         case SCStreamError.failedApplicationConnectionInvalid.rawValue,
              SCStreamError.failedApplicationConnectionInterrupted.rawValue,
-             SCStreamError.noCaptureSource.rawValue,
              SCStreamError.systemStoppedStream.rawValue:
             return .retry
         default:

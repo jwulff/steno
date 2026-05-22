@@ -156,6 +156,27 @@ public actor RecordingEngine {
     /// abort cleanly mid-backoff.
     private var isStopping: Bool = false
 
+    /// #42: system pipeline is parked waiting for a display to
+    /// reappear. Set by `parkSystemPipelineUntilDisplay(reason:)` when
+    /// either path-1 (live SCStream death with `-3815`) or path-2
+    /// (rebuild throw of `SystemAudioError.noDisplaysAvailable`) tells
+    /// us no display is attached. Cleared by `handleDisplayBecameAvailable()`
+    /// (the trailing-edge fire from `DisplayObserver`) and by every
+    /// teardown path (`start`, `stop`, `pause`, `cleanup`).
+    ///
+    /// While `true`, the sys pipeline is torn down but the engine stays
+    /// at `.recording` because the mic pipeline keeps capturing.
+    /// `recoveryExhausted` is NOT emitted — parking is a non-fatal
+    /// degraded state, not a surrender.
+    private var sysParkedAwaitingDisplay: Bool = false
+
+    /// Load-bearing token the TUI matches on for the parked state.
+    /// Mirrors `MIC_OR_SCREEN_PERMISSION_REVOKED` in shape — surfaces in
+    /// the `.error` event's message so the TUI can render a distinct,
+    /// non-alarming "waiting for display" indicator instead of treating
+    /// the surrender path as authoritative.
+    public static let systemAudioParkedNoDisplayToken = "SYSTEM_AUDIO_PARKED_NO_DISPLAY"
+
     // MARK: - U6 sleep/wake state
 
     /// Wall-clock moment the most recent `handleSystemWillSleep()` (or
@@ -309,6 +330,10 @@ public actor RecordingEngine {
         // PR #35 review (issue 2).
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
+        // #42: a fresh `start()` always begins unparked. If the daemon
+        // is being launched into a no-display environment, the next
+        // bring-up will park itself.
+        sysParkedAwaitingDisplay = false
 
         await setStatus(.starting)
 
@@ -515,6 +540,8 @@ public actor RecordingEngine {
         // PR #35 review (issue 2).
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
+        // #42: a fresh daemon-start always begins unparked.
+        sysParkedAwaitingDisplay = false
 
         // Step 0: U12 retention guard. Cascade-delete sessions whose
         // `endedAt` is older than the retention cap. Runs BEFORE the
@@ -732,6 +759,9 @@ public actor RecordingEngine {
         // Clear U5 restart bookkeeping for the next start.
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
+        // #42: clear parked-for-display flag — a fresh start() decides
+        // its own parked state.
+        sysParkedAwaitingDisplay = false
         pendingMicHealMarker = nil
         pendingSysHealMarker = nil
         pendingMicHealedGap = nil
@@ -1292,6 +1322,21 @@ public actor RecordingEngine {
             pendingSysHealMarker = "after_gap:\(gapSeconds)s"
             pendingSysHealedGap = gap
             sysBackoff.recordRestart()
+        } catch SystemAudioError.noDisplaysAvailable {
+            // #42 path-2: rebuild threw because `SCShareableContent`
+            // reported no displays. The bounded backoff would burn
+            // through the curve while the display is still gone and
+            // then surrender — instead, park the sys pipeline and let
+            // the `DisplayObserver` re-arm it when a display appears.
+            sysRestartTask = nil
+            sysRestartEntryTime = nil
+            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+                return
+            }
+            await parkSystemPipelineUntilDisplay(
+                reason: "rebuild:\(SystemAudioError.noDisplaysAvailable)"
+            )
+            return
         } catch {
             // Mirror of mic-side handling — see `restartMicPipeline`'s
             // catch block. Without an explicit reschedule, the system
@@ -1362,6 +1407,11 @@ public actor RecordingEngine {
     }
 
     private func startSystemAudio(locale: Locale) async {
+        // #42: a re-arm from `handleDisplayBecameAvailable()` lands here
+        // too. Clear the parked flag eagerly so a concurrent display
+        // event during the bring-up doesn't double-fire.
+        sysParkedAwaitingDisplay = false
+
         let source = audioSourceFactory.makeSystemAudioSource()
         systemAudioSource = source
         // U8: wire the SCStream recovery delegate so error-code-aware
@@ -1392,6 +1442,14 @@ public actor RecordingEngine {
                     await self?.handleRecognizerError(error, source: .systemAudio)
                 }
             }
+        } catch SystemAudioError.noDisplaysAvailable {
+            // #42 path-2: no display attached at first sys bring-up.
+            // Park the sys pipeline; the DisplayObserver re-arms it
+            // when a display reappears. Mic continues capturing.
+            systemAudioSource = nil
+            await parkSystemPipelineUntilDisplay(
+                reason: "startSystemAudio:\(SystemAudioError.noDisplaysAvailable)"
+            )
         } catch {
             await emit(.error("System audio failed: \(error)", isTransient: true))
         }
@@ -2349,6 +2407,10 @@ public actor RecordingEngine {
         currentSession = nil
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()
+        // #42: cleanup is also called from `pause()` and other teardown
+        // paths; always clear the parked flag so the next bring-up
+        // decides afresh.
+        sysParkedAwaitingDisplay = false
         pendingMicHealMarker = nil
         pendingSysHealMarker = nil
         pendingMicHealedGap = nil
@@ -2399,6 +2461,18 @@ extension RecordingEngine: AudioDeviceEventTarget {
     }
 }
 
+// MARK: - DisplayEventTarget conformance (#42)
+
+/// `RecordingEngine` is the `DisplayEventTarget` for `DisplayObserver`.
+/// Trampolines the trailing-edge "display became available" event into
+/// the actor's isolated `handleDisplayBecameAvailable()`, which re-arms
+/// a parked sys pipeline (if any) per #42.
+extension RecordingEngine: DisplayEventTarget {
+    public nonisolated func displayBecameAvailable() async {
+        await handleDisplayBecameAvailable()
+    }
+}
+
 // MARK: - SystemAudioRecoveryDelegate conformance (U8)
 
 /// `RecordingEngine` is the `SystemAudioRecoveryDelegate` for
@@ -2425,6 +2499,15 @@ extension RecordingEngine: SystemAudioRecoveryDelegate {
     /// transitions to `.error`, does NOT retry.
     public nonisolated func systemAudioPermissionRevoked() async {
         await handleSystemAudioPermissionRevoked()
+    }
+
+    /// #42: Called by `SystemAudioSource.stream(_:didStopWithError:)`
+    /// after classifying `-3815 noCaptureSource` (no display attached).
+    /// Stimulus-driven, not transient — park the sys pipeline and wait
+    /// for `DisplayObserver` to fire `displayBecameAvailable()`. Mic
+    /// pipeline is untouched.
+    public nonisolated func systemAudioParkedUntilDisplay(reason: String) async {
+        await parkSystemPipelineUntilDisplay(reason: reason)
     }
 }
 
@@ -2460,5 +2543,107 @@ extension RecordingEngine {
 
         await emit(.recoveryExhausted(reason: micOrScreenPermissionRevokedToken))
         await setStatus(.error)
+    }
+
+    /// #42: park the sys pipeline because no display is attached.
+    /// Tears down the sys pipeline, cancels any in-flight sys restart,
+    /// emits a transient `.error` carrying the load-bearing
+    /// `SYSTEM_AUDIO_PARKED_NO_DISPLAY` token, and resets the sys
+    /// backoff so the eventual re-arm has a fresh budget.
+    ///
+    /// Engine status stays at `.recording` (mic pipeline keeps
+    /// capturing). If we were mid-`.recovering` from an unrelated path,
+    /// `maybeRestoreRecordingStatus()` flips us back since the sys
+    /// restart task is now nil.
+    ///
+    /// Idempotent: a second call while already parked tears down again
+    /// (no-op on already-nil refs) and re-emits the token so the TUI
+    /// can re-surface the indicator after a `/clear`-style reconnect.
+    func parkSystemPipelineUntilDisplay(reason: String) async {
+        if isStopping || status == .stopping || status == .idle { return }
+
+        // Cancel any in-flight sys restart. We do NOT await its `.value`
+        // here because this method is itself frequently invoked from
+        // within the sys-restart task (`restartSystemPipeline` catch
+        // block) — awaiting our own task would deadlock. The task will
+        // observe `sysRestartTask == nil` and return cleanly.
+        sysRestartTask?.cancel()
+        sysRestartTask = nil
+        sysRestartEntryTime = nil
+
+        // Tear down whatever the sys pipeline left behind. All four are
+        // idempotent — nil refs are no-ops.
+        systemRecognizerTask?.cancel()
+        systemRecognizerTask = nil
+        await sysRecognizerHandle?.stop()
+        sysRecognizerHandle = nil
+        await systemAudioSource?.stop()
+        systemAudioSource = nil
+
+        // Fresh budget for the eventual re-arm — when the display
+        // reappears we want the rebuild to run immediately, not under
+        // the surrender threshold inherited from a prior burst.
+        sysBackoff = BackoffPolicy()
+        pendingSysHealMarker = nil
+        pendingSysHealedGap = nil
+
+        sysParkedAwaitingDisplay = true
+
+        // Surface a transient (non-fatal) error so the TUI can show a
+        // distinct "waiting for display" indicator. The token is
+        // load-bearing — the TUI matches on it the same way it does
+        // `MIC_OR_SCREEN_PERMISSION_REVOKED`.
+        await emit(.error(
+            "\(RecordingEngine.systemAudioParkedNoDisplayToken):\(reason)",
+            isTransient: true
+        ))
+
+        // If we were `.recovering` from this very path, restore
+        // `.recording` because the mic pipeline is still healthy and
+        // there is no longer a sys restart task to wait on.
+        await maybeRestoreRecordingStatus()
+    }
+
+    /// #42: invoked by `DisplayObserver` after the trailing-edge of a
+    /// screen-parameters burst when at least one display is present.
+    /// If the sys pipeline is parked and the engine is in a state that
+    /// can re-arm, rebuild it via `startSystemAudio(locale:)`. Otherwise
+    /// no-op (same gate shape as `handleAudioDeviceChange`).
+    func handleDisplayBecameAvailable() async {
+        // Not parked → nothing to do. Display reconfigurations during
+        // normal recording are uninteresting; the SCStream owns its
+        // own display attachment.
+        guard sysParkedAwaitingDisplay else { return }
+
+        // Engine is being torn down or has surrendered: leave the flag
+        // alone, the next `start()` will reset it.
+        if isStopping || status == .stopping || status == .idle || status == .paused || status == .error {
+            return
+        }
+
+        // Drop if a sys restart is already in flight — the in-flight
+        // task will rebuild against the now-available display. Mirrors
+        // `handleAudioDeviceChange`'s in-flight gate.
+        if sysRestartTask != nil { return }
+
+        // No session means there's no pipeline to attach the new sys
+        // capture to. The next `start()` / `resume()` will bring up sys
+        // fresh.
+        guard currentSession != nil else {
+            sysParkedAwaitingDisplay = false
+            return
+        }
+
+        // Only re-arm if the user originally requested system audio.
+        // The flag is reset at the top of `startSystemAudio` to handle
+        // the race where another event fires concurrently.
+        guard isSystemAudioEnabled else {
+            sysParkedAwaitingDisplay = false
+            return
+        }
+
+        await emit(.recovering(reason: "display:available"))
+        await startSystemAudio(locale: currentLocale)
+        await maybeRestoreRecordingStatus()
     }
 }

@@ -123,10 +123,14 @@ struct SystemAudioErrorClassifierTests {
         #expect(err.code == -3804)
     }
 
-    @Test("noCaptureSource (-3815) → .retry")
-    func noCaptureSourceClassifiesAsRetry() {
+    @Test("noCaptureSource (-3815) → .parkUntilDisplay (#42)")
+    func noCaptureSourceClassifiesAsParkUntilDisplay() {
+        // -3815 "Failed to find any display" is stimulus-driven — the
+        // SCStream cannot recover until a display reappears. Bounded
+        // backoff would just burn through five attempts and surrender;
+        // park instead and let the DisplayObserver re-arm. See #42.
         let err = Self.makeSCError(SCStreamError.noCaptureSource.rawValue)
-        #expect(SystemAudioErrorClassifier.classify(err) == .retry)
+        #expect(SystemAudioErrorClassifier.classify(err) == .parkUntilDisplay)
         #expect(err.code == -3815)
     }
 
@@ -234,6 +238,10 @@ actor RecordingRecoveryDelegate: SystemAudioRecoveryDelegate {
 
     private(set) var retryCalls: [RetryCall] = []
     private(set) var permissionRevokedCount: Int = 0
+    /// #42: park-until-display dispatch records the reason string the
+    /// source built from the SCStream error. No backoff key — parking
+    /// intentionally bypasses the bounded-backoff machinery.
+    private(set) var parkedReasons: [String] = []
 
     nonisolated func systemAudioRequestsRetry(errorCode: String, reason: String) async {
         await appendRetry(RetryCall(errorCode: errorCode, reason: reason))
@@ -243,12 +251,20 @@ actor RecordingRecoveryDelegate: SystemAudioRecoveryDelegate {
         await incrementPermissionRevoked()
     }
 
+    nonisolated func systemAudioParkedUntilDisplay(reason: String) async {
+        await appendParked(reason)
+    }
+
     private func appendRetry(_ call: RetryCall) {
         retryCalls.append(call)
     }
 
     private func incrementPermissionRevoked() {
         permissionRevokedCount += 1
+    }
+
+    private func appendParked(_ reason: String) {
+        parkedReasons.append(reason)
     }
 }
 
@@ -351,6 +367,30 @@ struct SystemAudioSourceDelegateDispatchTests {
         let calls = await recovery.retryCalls
         let revoked = await recovery.permissionRevokedCount
         #expect(calls.isEmpty)
+        #expect(revoked == 0)
+    }
+
+    @Test("noCaptureSource (-3815) → systemAudioParkedUntilDisplay, no retry / no exhaust (#42)")
+    func parkUntilDisplayDispatch() async throws {
+        let source = SystemAudioSource()
+        let recovery = RecordingRecoveryDelegate()
+        source.recoveryDelegate = recovery
+
+        let err = Self.makeSCError(SCStreamError.noCaptureSource.rawValue)
+        source.handleStreamStopForTesting(error: err)
+
+        let landed = await waitFor(timeout: .seconds(1)) {
+            await recovery.parkedReasons.count == 1
+        }
+        #expect(landed)
+        let reasons = await recovery.parkedReasons
+        // The reason carries the SCStream code so the engine + TUI can
+        // distinguish path-1 (live SCStream death) from path-2 (rebuild
+        // throw of SystemAudioError.noDisplaysAvailable).
+        #expect(reasons.first?.contains("-3815") == true)
+        let retries = await recovery.retryCalls
+        let revoked = await recovery.permissionRevokedCount
+        #expect(retries.isEmpty)
         #expect(revoked == 0)
     }
 
