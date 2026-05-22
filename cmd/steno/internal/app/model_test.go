@@ -287,6 +287,94 @@ func TestUnmarkedEntryRendersWithoutSuffix(t *testing.T) {
 	}
 }
 
+func TestToggleDuplicatesKeyHidesAndRestoresMarkedEntries(t *testing.T) {
+	// AE3: with marked entries visible, pressing `d` hides them; pressing
+	// again restores them in dim+strike.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	for i, seq := range []int{1, 2, 3} {
+		s := seq
+		ts := float64(1700000000 + i)
+		m.handleEvent(daemon.Event{
+			Event:          "segment",
+			Text:           "marked entry",
+			Source:         "microphone",
+			SessionID:      "sess-1",
+			SequenceNumber: &s,
+			StartedAt:      &ts,
+		})
+		dupOf := 100 + s
+		m.handleEvent(daemon.Event{
+			Event:               "dedup",
+			SessionID:           "sess-1",
+			SequenceNumber:      &s,
+			DuplicateOfSequence: &dupOf,
+			Method:              "exact",
+		})
+	}
+
+	visibleBefore := m.View()
+	if !strings.Contains(visibleBefore, "marked entry") {
+		t.Fatal("marked entries should be visible by default")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m2 := updated.(Model)
+	hidden := m2.View()
+	if strings.Contains(hidden, "marked entry") {
+		t.Errorf("entries should be hidden after `d`:\n%s", hidden)
+	}
+	if !strings.Contains(hidden, "d Show dups") {
+		t.Errorf("footer should reflect hide mode:\n%s", hidden)
+	}
+
+	updated2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m3 := updated2.(Model)
+	restored := m3.View()
+	if !strings.Contains(restored, "marked entry") {
+		t.Errorf("entries should be visible after second `d`:\n%s", restored)
+	}
+	if !strings.Contains(restored, "d Hide dups") {
+		t.Errorf("footer should reflect show mode:\n%s", restored)
+	}
+}
+
+func TestToggleDuplicatesPreservesUnmarkedEntries(t *testing.T) {
+	// Hide mode must not affect unmarked entries.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	markedSeq := 1
+	m.handleEvent(daemon.Event{
+		Event: "segment", Text: "this is marked", Source: "microphone",
+		SessionID: "sess-1", SequenceNumber: &markedSeq,
+	})
+	dupOf := 50
+	m.handleEvent(daemon.Event{
+		Event: "dedup", SessionID: "sess-1",
+		SequenceNumber: &markedSeq, DuplicateOfSequence: &dupOf, Method: "exact",
+	})
+	unmarkedSeq := 2
+	m.handleEvent(daemon.Event{
+		Event: "segment", Text: "this is fresh", Source: "microphone",
+		SessionID: "sess-1", SequenceNumber: &unmarkedSeq,
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	hidden := updated.(Model).View()
+	if strings.Contains(hidden, "this is marked") {
+		t.Errorf("marked entry should be hidden:\n%s", hidden)
+	}
+	if !strings.Contains(hidden, "this is fresh") {
+		t.Errorf("unmarked entry should remain visible:\n%s", hidden)
+	}
+}
+
 func TestDedupEventNoopWhenSequenceNumbersMissing(t *testing.T) {
 	// Defensive: a malformed dedup event with missing SequenceNumber
 	// or DuplicateOfSequence should not panic or scan entries.

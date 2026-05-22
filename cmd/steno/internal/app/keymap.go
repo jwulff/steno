@@ -46,4 +46,7 @@ const (
 	KeyEsc             = "esc"
 	// System-audio toggle (protocol-level reconfigure).
 	KeySystemAudio = "a"
+	// Toggle visibility of dedup-marked entries between dimmed-visible
+	// (default) and hidden. Per-TUI-session, not persisted.
+	KeyToggleDuplicates = "d"
 )

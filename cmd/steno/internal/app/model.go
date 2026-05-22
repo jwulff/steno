@@ -276,6 +276,11 @@ type Model struct {
 	errorHistory   []ErrorEntry
 	showErrorModal bool
 
+	// Duplicate-visibility toggle (`d` keybind). false = show marked
+	// entries dim + struck through (default); true = hide them from the
+	// timeline entirely. Per-TUI-session, not persisted across restarts.
+	hideDuplicates bool
+
 	// Pause-hint flash (U9): "press p to resume first" shown after a
 	// spacebar press while paused. Set by the key handler, cleared by
 	// ClearPauseHintMsg after ~2s.
@@ -1395,6 +1400,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, reconfigureCmd(m.client, !m.systemAudio)
 
+	case KeyToggleDuplicates:
+		// Toggle visibility of dedup-marked entries. The render loop
+		// `continue`s past marked entries when this is true. Operates
+		// purely on render state — m.entries is not mutated.
+		m.hideDuplicates = !m.hideDuplicates
+		return m, nil
+
 	case "tab":
 		if m.focusedPanel == FocusTopics {
 			m.focusedPanel = FocusTranscript
@@ -2171,6 +2183,12 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		// flush with segment text.
 		boundaryWidth := max(10, width-2)
 		for _, e := range m.entries {
+			// Hide-mode (d keybind): skip marked entries entirely. The
+			// dim+strike treatment is bypassed; m.entries is unchanged
+			// so re-toggling restores visibility instantly.
+			if m.hideDuplicates && e.Duplicate {
+				continue
+			}
 			// Synthetic session-boundary marker (UI-only, inserted on a
 			// successful DemarcateResponseMsg). Rendered as a horizontal
 			// rule with a timestamp. No source, no sequence number.
@@ -2311,6 +2329,14 @@ func (m Model) renderFooter() string {
 			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio Off"))
 		} else {
 			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio On"))
+		}
+		// Toggle reflects the current mode so the user sees what `d` will
+		// do next. Hint is always present (the toggle works whether or
+		// not duplicates are currently marked).
+		if m.hideDuplicates {
+			parts = append(parts, ui.FooterKeyStyle.Render("d")+ui.FooterDescStyle.Render(" Show dups"))
+		} else {
+			parts = append(parts, ui.FooterKeyStyle.Render("d")+ui.FooterDescStyle.Render(" Hide dups"))
 		}
 		parts = append(parts, ui.FooterKeyStyle.Render("Tab")+ui.FooterDescStyle.Render(" Focus"))
 		parts = append(parts, ui.FooterKeyStyle.Render("j/k")+ui.FooterDescStyle.Render(" Nav"))
