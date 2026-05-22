@@ -81,9 +81,16 @@ test-daemon:
 	# Use `mktemp` so concurrent runs don't clobber each other and so
 	# we don't rely on a fixed /tmp path that's vulnerable to
 	# symlink attacks on shared machines. `trap` cleans up on exit.
+	#
+	# BSD mktemp (macOS) only substitutes a *trailing* run of X's —
+	# Xs in the middle of the template are taken literally. A template
+	# ending in `.log` therefore produces the same filename every run
+	# and the second invocation fails with "File exists". Create a
+	# unique directory instead and put the log inside it.
 	@cd $(DAEMON_DIR) && \
-		log_file=$$(mktemp "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX.log"); \
-		trap 'rm -f "$$log_file"' EXIT; \
+		log_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/steno-daemon-test.XXXXXX"); \
+		log_file="$$log_dir/test.log"; \
+		trap 'rm -rf "$$log_dir"' EXIT; \
 		( swift test 2>&1; echo "swift_exit=$$?" ) | tee "$$log_file" >/dev/null; \
 		passed=$$(grep -cE "^✔ Test " "$$log_file" || true); \
 		failed=$$(grep -cE "^✘" "$$log_file" || true); \
