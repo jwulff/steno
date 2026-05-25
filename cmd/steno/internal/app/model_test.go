@@ -528,6 +528,29 @@ func TestShiftPSendsPauseIndefinite(t *testing.T) {
 	}
 }
 
+func TestStartResponseUpdatesSystemAudioFromResponse(t *testing.T) {
+	// Reconfigure flows through StartResponseMsg, so the handler must read
+	// the response's systemAudio and update local state — otherwise the
+	// footer label sticks at the old value and the toggle is invisible.
+	m := New()
+	m.systemAudio = false
+
+	updated, _ := m.Update(StartResponseMsg{Response: daemon.Response{
+		OK:          true,
+		Recording:   daemon.BoolPtr(true),
+		SystemAudio: daemon.BoolPtr(true),
+		SessionID:   "abc-123",
+	}})
+	got := updated.(Model)
+
+	if !got.systemAudio {
+		t.Error("expected m.systemAudio to be true after StartResponseMsg{systemAudio:true}")
+	}
+	if got.sessionID != "abc-123" {
+		t.Errorf("expected sessionID to update; got %q", got.sessionID)
+	}
+}
+
 func TestASendsReconfigureToggledOn(t *testing.T) {
 	m := New()
 	m.connected = true

@@ -643,6 +643,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if r.SessionID != "" {
 				m.sessionID = r.SessionID
 			}
+			// The response carries the canonical capture configuration
+			// (sourced from `engine.isSystemAudioEnabled`), so a reconfigure
+			// that flips system-audio updates the footer label correctly.
+			if r.SystemAudio != nil {
+				m.systemAudio = *r.SystemAudio
+			}
+			if r.Device != "" {
+				m.deviceName = r.Device
+			}
 			m.statusText = "Recording"
 		} else {
 			m.errorMessage = r.Error
