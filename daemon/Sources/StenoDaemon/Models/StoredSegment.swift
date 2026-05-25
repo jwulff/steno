@@ -67,6 +67,13 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// `nil` under the same conditions as `audioStart`.
     public let audioEnd: TimeInterval?
 
+    /// Global speaker this segment was attributed to by the diarization merge
+    /// (#61), as the raw UUID of a `SpeakerID`. `nil` until a diarization window
+    /// covering this segment finalizes (labels backfill, so this can transition
+    /// nil → set and may be revised). Display ("Speaker N" / a name) is derived
+    /// from this ID separately (#54), never stored here.
+    public let speakerId: UUID?
+
     public init(
         id: UUID = UUID(),
         sessionId: UUID,
@@ -82,7 +89,8 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         dedupMethod: DedupMethod? = nil,
         micPeakDb: Double? = nil,
         audioStart: TimeInterval? = nil,
-        audioEnd: TimeInterval? = nil
+        audioEnd: TimeInterval? = nil,
+        speakerId: UUID? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -99,6 +107,7 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.micPeakDb = micPeakDb
         self.audioStart = audioStart
         self.audioEnd = audioEnd
+        self.speakerId = speakerId
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.

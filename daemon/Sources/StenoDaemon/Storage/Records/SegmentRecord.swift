@@ -48,6 +48,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     var audioStart: Double?
     var audioEnd: Double?
 
+    /// #61: global speaker UUID assigned by the diarization merge. NULL until a
+    /// covering window finalizes (and may be revised).
+    var speakerId: String?
+
     enum CodingKeys: String, CodingKey {
         case id, sessionId, text, startedAt, endedAt, confidence
         case sequenceNumber, createdAt, source
@@ -57,6 +61,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
         case micPeakDb = "mic_peak_db"
         case audioStart = "audio_start"
         case audioEnd = "audio_end"
+        case speakerId = "speaker_id"
     }
 
     /// Convert to domain model.
@@ -86,7 +91,8 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             dedupMethod: method,
             micPeakDb: micPeakDb,
             audioStart: audioStart,
-            audioEnd: audioEnd
+            audioEnd: audioEnd,
+            speakerId: speakerId.flatMap { UUID(uuidString: $0) }
         )
     }
 
@@ -118,7 +124,8 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             healMarker: segment.healMarker,
             micPeakDb: segment.micPeakDb,
             audioStart: segment.audioStart,
-            audioEnd: segment.audioEnd
+            audioEnd: segment.audioEnd,
+            speakerId: segment.speakerId?.uuidString
         )
     }
 }

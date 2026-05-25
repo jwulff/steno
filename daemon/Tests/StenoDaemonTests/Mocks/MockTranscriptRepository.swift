@@ -283,13 +283,46 @@ actor MockTranscriptRepository: TranscriptRepository {
                     healMarker: old.healMarker,
                     duplicateOf: sysSegmentId,
                     dedupMethod: method,
-                    micPeakDb: old.micPeakDb
+                    micPeakDb: old.micPeakDb,
+                    audioStart: old.audioStart,
+                    audioEnd: old.audioEnd,
+                    speakerId: old.speakerId
                 )
                 var copy = segs
                 copy[idx] = updated
                 segments[sid] = copy
                 return
             }
+        }
+    }
+
+    func updateSpeaker(segmentId: UUID, speakerId: UUID?) async throws {
+        for (sid, segs) in segments {
+            guard let idx = segs.firstIndex(where: { $0.id == segmentId }) else {
+                continue
+            }
+            let old = segs[idx]
+            var copy = segs
+            copy[idx] = StoredSegment(
+                id: old.id,
+                sessionId: old.sessionId,
+                text: old.text,
+                startedAt: old.startedAt,
+                endedAt: old.endedAt,
+                confidence: old.confidence,
+                sequenceNumber: old.sequenceNumber,
+                createdAt: old.createdAt,
+                source: old.source,
+                healMarker: old.healMarker,
+                duplicateOf: old.duplicateOf,
+                dedupMethod: old.dedupMethod,
+                micPeakDb: old.micPeakDb,
+                audioStart: old.audioStart,
+                audioEnd: old.audioEnd,
+                speakerId: speakerId
+            )
+            segments[sid] = copy
+            return
         }
     }
 

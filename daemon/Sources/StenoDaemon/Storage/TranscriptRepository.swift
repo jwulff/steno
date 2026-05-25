@@ -198,6 +198,11 @@ public protocol TranscriptRepository: Sendable {
     /// cursor unchanged and the next pass re-evaluates from the same point.
     func advanceDedupCursor(sessionId: UUID, toSequence: Int) async throws
 
+    /// Attach (or clear) the global speaker on a segment. Written by the
+    /// diarization merge (#61) as windows finalize; a single targeted UPDATE
+    /// that leaves all other columns intact. Passing `nil` clears the label.
+    func updateSpeaker(segmentId: UUID, speakerId: UUID?) async throws
+
     // MARK: - Summaries
 
     /// Save a summary.

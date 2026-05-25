@@ -151,6 +151,30 @@ struct SQLiteTranscriptRepositoryTests {
         #expect(fetched[0].audioEnd == nil)
     }
 
+    @Test func updateSpeakerSetsAndClearsLabel() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let segment = StoredSegment(
+            sessionId: session.id,
+            text: "who said this",
+            startedAt: Date(),
+            endedAt: Date(),
+            sequenceNumber: 0
+        )
+        try await repo.saveSegment(segment)
+        #expect(try await repo.segments(for: session.id)[0].speakerId == nil)
+
+        let speaker = UUID()
+        try await repo.updateSpeaker(segmentId: segment.id, speakerId: speaker)
+        #expect(try await repo.segments(for: session.id)[0].speakerId == speaker)
+
+        // Labels are revisable — clearing back to nil works too.
+        try await repo.updateSpeaker(segmentId: segment.id, speakerId: nil)
+        #expect(try await repo.segments(for: session.id)[0].speakerId == nil)
+    }
+
     @Test func segmentsOrderedBySequenceNumber() async throws {
         let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
         let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
