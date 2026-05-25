@@ -152,3 +152,63 @@ struct SpeakerRegistryAssignTests {
         #expect(await seeded.speaker(id)?.state == .confirmed)
     }
 }
+
+@Suite("SpeakerRegistry.assignStableIndex")
+struct SpeakerRegistryStableIndexTests {
+
+    private let model = "sortformer"
+    private let version = "1.0"
+
+    @Test func sameSourceAndIndexReturnsSameID() async {
+        let registry = SpeakerRegistry()
+
+        let first = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        let again = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+
+        #expect(first == again)
+        #expect(await registry.count == 1)
+    }
+
+    @Test func differentIndicesMintDistinctIDs() async {
+        let registry = SpeakerRegistry()
+
+        let zero = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        let one = await registry.assignStableIndex(
+            speakerIndex: 1, sourceTag: "microphone", modelId: model, modelVersion: version)
+
+        #expect(zero != one)
+        #expect(await registry.count == 2)
+    }
+
+    @Test func sameIndexInDifferentSourcesMintsDistinctIDs() async {
+        // Cross-source unification is the §9 dedup gate's job, not the index
+        // aliasing's — two sources naming "speaker 0" are different people
+        // until dedup proves otherwise.
+        let registry = SpeakerRegistry()
+
+        let micZero = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        let sysZero = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "systemAudio", modelId: model, modelVersion: version)
+
+        #expect(micZero != sysZero)
+        #expect(await registry.count == 2)
+    }
+
+    @Test func mintedSpeakersAreConfirmedAndAppearInSnapshot() async throws {
+        let registry = SpeakerRegistry()
+
+        let id = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        let speaker = try #require(await registry.speaker(id))
+
+        #expect(speaker.state == .confirmed)
+        #expect(speaker.centroid.isEmpty)
+        #expect(speaker.modelId == model)
+        #expect(speaker.modelVersion == version)
+        #expect(await registry.snapshot().count == 1)
+    }
+}

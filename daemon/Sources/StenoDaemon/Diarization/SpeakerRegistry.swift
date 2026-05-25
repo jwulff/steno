@@ -83,6 +83,19 @@ public actor SpeakerRegistry {
     private let confirmAfterWindows: Int
     private var speakers: [SpeakerID: RegisteredSpeaker]
 
+    /// `(sourceTag, FluidAudio speakerIndex) → SpeakerID` cache for the
+    /// stable-index stitching path. FluidAudio's tier diarizers (Sortformer /
+    /// LS-EEND) maintain stable per-source speaker indices across streamed
+    /// chunks, so within-source stitching is identity-based, not cosine — we
+    /// just map the (source, index) pair to a stable global `SpeakerID`. The
+    /// cosine-embedding path stays available for future use (#54 voiceprints,
+    /// alternative diarizers that expose embeddings).
+    private struct SourceIndexKey: Hashable, Sendable {
+        let sourceTag: String
+        let speakerIndex: Int
+    }
+    private var stableIndexMap: [SourceIndexKey: SpeakerID] = [:]
+
     public init(
         similarityThreshold: Float = 0.7,
         confirmAfterWindows: Int = 2,
@@ -119,6 +132,44 @@ public actor SpeakerRegistry {
             modelId: modelId,
             modelVersion: modelVersion,
             name: name
+        )
+        return id
+    }
+
+    /// Map a diarizer's stable per-source speaker index to a global `SpeakerID`,
+    /// minting one the first time the `(sourceTag, speakerIndex)` pair is seen
+    /// and returning the same ID on every subsequent call. This is the
+    /// within-source stitching path used with FluidAudio's tier diarizers
+    /// (Sortformer / LS-EEND), which keep `speakerIndex` stable across streamed
+    /// chunks themselves. The cross-source unification still happens here: two
+    /// sources naming "speaker 1" map to different global IDs (different
+    /// `sourceTag`), exactly as intended — cross-source overlap is resolved by
+    /// the §9 dedup gate, not by index aliasing.
+    ///
+    /// Minted speakers are stamped `.confirmed` because the diarizer's own
+    /// across-chunk stability is the confirmation signal; the
+    /// `confirmAfterWindows` threshold belongs to the cosine path. No centroid
+    /// is recorded (`[]`) — embedding-based identity is a separate concern.
+    public func assignStableIndex(
+        speakerIndex: Int,
+        sourceTag: String,
+        modelId: String,
+        modelVersion: String
+    ) -> SpeakerID {
+        let key = SourceIndexKey(sourceTag: sourceTag, speakerIndex: speakerIndex)
+        if let existing = stableIndexMap[key] {
+            return existing
+        }
+        let id = SpeakerID()
+        stableIndexMap[key] = id
+        speakers[id] = RegisteredSpeaker(
+            id: id,
+            centroid: [],
+            sampleCount: 0,
+            windowsSeen: 1,
+            state: .confirmed,
+            modelId: modelId,
+            modelVersion: modelVersion
         )
         return id
     }
