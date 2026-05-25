@@ -1,16 +1,16 @@
-import AVFoundation
 import Foundation
 
 /// A fixed-duration slice of mono PCM audio, tagged with its position on a
 /// frame-counted capture clock (seconds since the audio stream started).
 ///
-/// Stores raw `Float` samples rather than an `AVAudioPCMBuffer` reference so
-/// the type is a `Sendable` value: safe to move across actor/task boundaries
-/// and trivially testable without AVFoundation buffers or audio hardware.
+/// Stores raw `Float` samples (a `Sendable` value) so it is safe to move
+/// across actor/task boundaries and trivially testable without AVFoundation
+/// buffers or audio hardware. Sample extraction from `AVAudioPCMBuffer` lives
+/// in the capture path (`RecordingEngine`), keeping this type framework-free.
 ///
-/// Mono only: we keep channel 0, matching `RecordingEngine.peakLevel`. The
-/// deferred diarization layer (epic #53) consumes mono samples; multichannel
-/// mixdown / resampling is the diarizer front-end's concern, not this buffer's.
+/// Mono only: channel 0, matching `RecordingEngine.peakLevel`. The deferred
+/// diarization layer (epic #53) consumes mono samples; multichannel mixdown /
+/// resampling is the diarizer front-end's concern, not this buffer's.
 public struct PCMChunk: Sendable, Equatable {
     /// Seconds since capture start (frame-counted, monotonic). This is the
     /// join axis the diarization windower and — once #64 lands — transcript
@@ -33,23 +33,6 @@ public struct PCMChunk: Sendable, Equatable {
     }
 
     public var endTime: TimeInterval { startTime + duration }
-
-    /// Extract channel 0 of an `AVAudioPCMBuffer` into a value-type chunk.
-    /// Returns `nil` for a non-float or empty buffer.
-    public static func from(
-        buffer: AVAudioPCMBuffer,
-        startTime: TimeInterval
-    ) -> PCMChunk? {
-        guard let channel = buffer.floatChannelData?[0] else { return nil }
-        let frames = Int(buffer.frameLength)
-        guard frames > 0 else { return nil }
-        let samples = Array(UnsafeBufferPointer(start: channel, count: frames))
-        return PCMChunk(
-            startTime: startTime,
-            sampleRate: buffer.format.sampleRate,
-            samples: samples
-        )
-    }
 }
 
 /// A bounded, time-indexed ring buffer of mono PCM audio for one capture
@@ -84,6 +67,28 @@ public actor AudioRingBuffer {
         chunks.append(chunk)
         latestEnd = max(latestEnd, chunk.endTime)
         prune()
+    }
+
+    /// Append raw mono samples at the buffer's current leading edge, assigning
+    /// their start time from the internal capture clock — the running end of
+    /// all audio appended since the last `reset`. This is the contiguous,
+    /// frame-counted clock the diarization windower keys off; it advances by
+    /// `samples.count / sampleRate` per call regardless of wall-clock gaps.
+    /// No-op (returns the unchanged leading edge) for empty samples or a
+    /// non-positive rate.
+    @discardableResult
+    public func append(samples: [Float], sampleRate: Double) -> TimeInterval {
+        let start = latestEnd
+        guard sampleRate > 0, !samples.isEmpty else { return start }
+        append(PCMChunk(startTime: start, sampleRate: sampleRate, samples: samples))
+        return start
+    }
+
+    /// Drop all retained audio and rewind the capture clock to 0. Called at
+    /// each pipeline bring-up so the buffer's timeline is per-session.
+    public func reset() {
+        chunks.removeAll(keepingCapacity: true)
+        latestEnd = 0
     }
 
     /// Chunks overlapping `[from, to)`, in arrival order. Boundary-straddling

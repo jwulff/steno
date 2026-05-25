@@ -103,6 +103,15 @@ public actor RecordingEngine {
     /// avoid `log10(0) = -inf`.
     private var currentMicSegmentPeak: Float = 0
 
+    // MARK: - Diarization audio tee (#56)
+
+    /// Per-source rolling PCM history feeding the deferred diarization layer
+    /// (epic #53). The tee appends captured audio here in parallel with the
+    /// transcriber; the rolling-window scheduler (#58) reads windows back out.
+    /// Reset at each pipeline bring-up so each is a per-session timeline.
+    private let micRingBuffer = AudioRingBuffer()
+    private let sysRingBuffer = AudioRingBuffer()
+
     // MARK: - U11 dedup-trigger debounce state
 
     /// Per-session trailing-edge debounce tasks. A fresh `saveSegment`
@@ -427,6 +436,12 @@ public actor RecordingEngine {
         let resumeFrom = (try? await repository.maxSegmentSequence(for: session.id)) ?? 0
         currentSequenceNumber = resumeFrom
         segmentCount = resumeFrom
+        // Diarization (#56): the audio streams are (re)created on each
+        // bring-up, so rewind the per-source PCM history + capture clock.
+        // Any pre-restart audio is non-contiguous with what follows and is
+        // intentionally discarded.
+        await micRingBuffer.reset()
+        await sysRingBuffer.reset()
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
         lastDeviceUID = deviceUIDProvider()
@@ -1470,12 +1485,22 @@ public actor RecordingEngine {
         struct Box: @unchecked Sendable {
             let source: AsyncStream<AVAudioPCMBuffer>
             let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+            let ringBuffer: AudioRingBuffer
         }
         let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-        let box = Box(source: source, continuation: cont)
+        let box = Box(
+            source: source,
+            continuation: cont,
+            ringBuffer: isMic ? micRingBuffer : sysRingBuffer
+        )
         Task.detached { [weak self] in
             for await buffer in box.source {
                 let peak = RecordingEngine.peakLevel(buffer)
+                // Copy mono samples for diarization before handing the buffer
+                // downstream, so we never read it concurrently with the
+                // transcriber feed.
+                let samples = RecordingEngine.monoSamples(buffer)
+                let sampleRate = buffer.format.sampleRate
                 if isMic {
                     await self?.updateMicLevel(peak)
                 } else {
@@ -1483,10 +1508,33 @@ public actor RecordingEngine {
                 }
                 nonisolated(unsafe) let b = buffer
                 box.continuation.yield(b)
+                // Append after yielding so diarization buffering never adds
+                // latency to the live transcript. The ring buffer is its own
+                // actor — this does not touch RecordingEngine's isolation.
+                await box.ringBuffer.append(samples: samples, sampleRate: sampleRate)
             }
             box.continuation.finish()
         }
         return stream
+    }
+
+    /// Extract channel 0 of a float PCM buffer as a value-type sample array
+    /// for the diarization ring buffer. Empty for a non-float / empty buffer.
+    private static func monoSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let channelData = buffer.floatChannelData?[0] else { return [] }
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: channelData, count: frameLength))
+    }
+
+    /// A window of buffered audio for one source, on the frame-counted capture
+    /// clock. Consumed by the rolling-window diarization scheduler (#58).
+    func diarizationWindow(
+        isMic: Bool,
+        from: TimeInterval,
+        to: TimeInterval
+    ) async -> [PCMChunk] {
+        await (isMic ? micRingBuffer : sysRingBuffer).window(from: from, to: to)
     }
 
     private func updateMicLevel(_ peak: Float) {

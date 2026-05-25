@@ -105,4 +105,46 @@ struct AudioRingBufferTests {
         #expect(await buffer.earliestTime() == 0)
         #expect(await buffer.window(from: 0, to: 60).count == 60)
     }
+
+    @Test func appendSamplesChainsOnTheCaptureClock() async {
+        let buffer = AudioRingBuffer()
+        let half = [Float](repeating: 0, count: 8000)  // 0.5s @ 16kHz
+        let full = [Float](repeating: 0, count: 16000)  // 1.0s @ 16kHz
+
+        let start0 = await buffer.append(samples: half, sampleRate: 16000)
+        let start1 = await buffer.append(samples: full, sampleRate: 16000)
+
+        #expect(start0 == 0)
+        #expect(start1 == 0.5)
+        #expect(await buffer.latestTime() == 1.5)
+        #expect(await buffer.window(from: 0, to: 2).map(\.startTime) == [0, 0.5])
+    }
+
+    @Test func appendSamplesIgnoresEmptyOrInvalidInput() async {
+        let buffer = AudioRingBuffer()
+
+        #expect(await buffer.append(samples: [], sampleRate: 16000) == 0)
+        #expect(await buffer.append(samples: [1, 2, 3], sampleRate: 0) == 0)
+        #expect(await buffer.isEmpty())
+    }
+
+    @Test func resetClearsAudioAndRewindsClock() async {
+        let buffer = AudioRingBuffer()
+        _ = await buffer.append(
+            samples: [Float](repeating: 0, count: 16000),
+            sampleRate: 16000
+        )
+
+        await buffer.reset()
+
+        #expect(await buffer.isEmpty())
+        #expect(await buffer.earliestTime() == nil)
+        #expect(await buffer.latestTime() == 0)
+        // Clock rewound: the next append starts at 0 again.
+        let restart = await buffer.append(
+            samples: [Float](repeating: 0, count: 8000),
+            sampleRate: 16000
+        )
+        #expect(restart == 0)
+    }
 }
