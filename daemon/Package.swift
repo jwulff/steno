@@ -13,14 +13,16 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
-        .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0")
+        .package(url: "https://github.com/groue/GRDB.swift", from: "7.0.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio", from: "0.4.0")
     ],
     targets: [
         .executableTarget(
             name: "StenoDaemon",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "GRDB", package: "GRDB.swift")
+                .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "FluidAudio", package: "FluidAudio")
             ],
             path: "Sources/StenoDaemon"
         ),
