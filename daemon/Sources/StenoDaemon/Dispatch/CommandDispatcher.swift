@@ -48,6 +48,9 @@ public actor CommandDispatcher {
         case "demarcate":
             response = await handleDemarcate()
 
+        case "reconfigure":
+            response = await handleReconfigure(command)
+
         default:
             response = DaemonResponse.failure("Unknown command: \(command.cmd)")
         }
@@ -87,6 +90,53 @@ public actor CommandDispatcher {
     private func handleStop() async -> DaemonResponse {
         await engine.stop()
         return DaemonResponse(ok: true, recording: false)
+    }
+
+    /// Reconfigure capture sources on the live session. Today the only
+    /// reconfigurable axis is `systemAudio` — the TUI uses this for the `a`
+    /// keybind that toggles system-audio capture without requiring the user
+    /// to edit `settings.json` and restart the daemon. The session's existing
+    /// locale and device are preserved unless the command overrides them.
+    ///
+    /// Implemented as stop + start so the daemon doesn't have to grow a
+    /// mid-flight capture-graph mutation path. The brief stop is tolerable
+    /// for an explicit user action; `start` persists `lastSystemAudioEnabled`
+    /// so every subsequent auto-start picks up the new value.
+    private func handleReconfigure(_ command: DaemonCommand) async -> DaemonResponse {
+        guard let newSystemAudio = command.systemAudio else {
+            return DaemonResponse.failure(
+                "reconfigure requires a systemAudio flag"
+            )
+        }
+
+        let currentSession = await engine.currentSession
+        let currentDevice = await engine.currentDevice
+        let locale: Locale
+        if let localeId = command.locale {
+            locale = Locale(identifier: localeId)
+        } else if let sessionLocale = currentSession?.locale {
+            locale = sessionLocale
+        } else {
+            locale = .current
+        }
+
+        await engine.stop()
+        do {
+            let session = try await engine.start(
+                locale: locale,
+                device: command.device ?? currentDevice,
+                systemAudio: newSystemAudio
+            )
+            return DaemonResponse(
+                ok: true,
+                sessionId: session.id.uuidString,
+                recording: true,
+                device: command.device ?? currentDevice,
+                systemAudio: newSystemAudio
+            )
+        } catch {
+            return DaemonResponse.failure(error.localizedDescription)
+        }
     }
 
     private func handleStatus() async -> DaemonResponse {

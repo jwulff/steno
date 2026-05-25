@@ -528,6 +528,58 @@ func TestShiftPSendsPauseIndefinite(t *testing.T) {
 	}
 }
 
+func TestASendsReconfigureToggledOn(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusRecording
+	m.systemAudio = false
+	m.width, m.height = 80, 24
+
+	data := captureCommand(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	s := string(data)
+	if !strings.Contains(s, `"cmd":"reconfigure"`) {
+		t.Errorf("expected reconfigure cmd; got %q", s)
+	}
+	if !strings.Contains(s, `"systemAudio":true`) {
+		t.Errorf("expected systemAudio=true (toggled from off); got %q", s)
+	}
+}
+
+func TestASendsReconfigureToggledOff(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusRecording
+	m.systemAudio = true
+	m.width, m.height = 80, 24
+
+	data := captureCommand(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	s := string(data)
+	if !strings.Contains(s, `"cmd":"reconfigure"`) {
+		t.Errorf("expected reconfigure cmd; got %q", s)
+	}
+	if !strings.Contains(s, `"systemAudio":false`) {
+		t.Errorf("expected systemAudio=false (toggled from on); got %q", s)
+	}
+}
+
+func TestAWhilePausedFlashesHint(t *testing.T) {
+	// Toggling capture sources while paused is rejected — same UX as
+	// spacebar-demarcate: flash a hint instead of letting the daemon error.
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusPaused
+	m.width, m.height = 80, 24
+	m.client = &daemon.Client{} // non-nil; won't be invoked on the paused branch
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if cmd == nil {
+		t.Fatal("expected a PauseHintMsg Cmd while paused")
+	}
+	if _, ok := cmd().(PauseHintMsg); !ok {
+		t.Errorf("expected PauseHintMsg while paused; got %T", cmd())
+	}
+}
+
 func TestPWhilePausedSendsResume(t *testing.T) {
 	m := New()
 	m.connected = true

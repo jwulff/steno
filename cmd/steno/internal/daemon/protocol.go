@@ -107,3 +107,11 @@ func ResumeCmd() Command {
 func DemarcateCmd() Command {
 	return Command{Cmd: "demarcate"}
 }
+
+// ReconfigureCmd builds a `reconfigure` command that toggles system-audio
+// capture on the active session. The daemon performs an internal stop + start
+// to apply the new capture-source configuration and persists
+// `lastSystemAudioEnabled` so future auto-starts inherit the new value.
+func ReconfigureCmd(systemAudio bool) Command {
+	return Command{Cmd: "reconfigure", SystemAudio: BoolPtr(systemAudio)}
+}

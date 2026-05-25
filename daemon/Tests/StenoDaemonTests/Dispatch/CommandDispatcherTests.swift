@@ -119,6 +119,64 @@ struct CommandDispatcherTests {
         #expect(events.count == 1)
     }
 
+    @Test @MainActor func reconfigureWithoutSystemAudioReturnsError() async throws {
+        let (dispatcher, _, _) = makeDispatcher()
+        let client = MockClientConnection()
+
+        let command = DaemonCommand(cmd: "reconfigure")
+        await dispatcher.handle(command, from: client)
+
+        let responses = await client.sentResponses
+        #expect(responses.count == 1)
+        #expect(responses[0].ok == false)
+        #expect(responses[0].error?.contains("systemAudio") == true)
+    }
+
+    @Test @MainActor func reconfigureStartsRecordingWithNewSystemAudio() async throws {
+        let (dispatcher, engine, _) = makeDispatcher()
+        let client = MockClientConnection()
+
+        let command = DaemonCommand(cmd: "reconfigure", systemAudio: true)
+        await dispatcher.handle(command, from: client)
+
+        let status = await engine.status
+        #expect(status == .recording)
+        let systemAudio = await engine.isSystemAudioEnabled
+        #expect(systemAudio == true)
+
+        let responses = await client.sentResponses
+        #expect(responses.count == 1)
+        #expect(responses[0].ok == true)
+        #expect(responses[0].recording == true)
+        #expect(responses[0].systemAudio == true)
+        #expect(responses[0].sessionId != nil)
+
+        await engine.stop()
+    }
+
+    @Test @MainActor func reconfigureFromRecordingFlipsSystemAudio() async throws {
+        let (dispatcher, engine, _) = makeDispatcher()
+        let client = MockClientConnection()
+
+        // Start with systemAudio off.
+        _ = try await engine.start(systemAudio: false)
+        #expect(await engine.isSystemAudioEnabled == false)
+
+        // Reconfigure to on — should stop + start under the hood.
+        let command = DaemonCommand(cmd: "reconfigure", systemAudio: true)
+        await dispatcher.handle(command, from: client)
+
+        #expect(await engine.status == .recording)
+        #expect(await engine.isSystemAudioEnabled == true)
+
+        let responses = await client.sentResponses
+        #expect(responses.count == 1)
+        #expect(responses[0].ok == true)
+        #expect(responses[0].systemAudio == true)
+
+        await engine.stop()
+    }
+
     @Test @MainActor func unknownCommandReturnsError() async throws {
         let (dispatcher, _, _) = makeDispatcher()
         let client = MockClientConnection()

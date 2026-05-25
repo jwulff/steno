@@ -428,6 +428,20 @@ func pauseIndefiniteCmd(client *daemon.Client) tea.Cmd {
 	}
 }
 
+// reconfigureCmd asks the daemon to apply a new capture configuration
+// (currently only `systemAudio`). The daemon performs an internal stop +
+// start; the response carries the new sessionId and systemAudio flag, which
+// is handled like any other start (reusing StartResponseMsg).
+func reconfigureCmd(client *daemon.Client, systemAudio bool) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := client.SendCommand(daemon.ReconfigureCmd(systemAudio))
+		if err != nil {
+			return DaemonEventErrorMsg{Err: err}
+		}
+		return StartResponseMsg{Response: resp}
+	}
+}
+
 // resumeCmd sends a `resume` command. (U9)
 func resumeCmd(client *daemon.Client) tea.Cmd {
 	return func() tea.Msg {
@@ -1128,6 +1142,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// U9: toggle error-history modal.
 		m.showErrorModal = !m.showErrorModal
 		return m, nil
+
+	case KeySystemAudio:
+		// Toggle system-audio capture via the daemon's `reconfigure`
+		// command. Refuse while paused — the daemon would reject the
+		// implicit start anyway, and the flash hint is friendlier than a
+		// transient error.
+		if !m.connected || m.client == nil {
+			return m, nil
+		}
+		if m.engineStatus == StatusPaused {
+			return m, func() tea.Msg { return PauseHintMsg{} }
+		}
+		return m, reconfigureCmd(m.client, !m.systemAudio)
 
 	case "tab":
 		if m.focusedPanel == FocusTopics {
@@ -1919,6 +1946,13 @@ func (m Model) renderFooter() string {
 			parts = append(parts, ui.FooterKeyStyle.Render("P")+ui.FooterDescStyle.Render(" Pause"))
 		}
 		parts = append(parts, ui.FooterKeyStyle.Render("e")+ui.FooterDescStyle.Render(" Errors"))
+		// Sys-audio toggle. Label shows the action the keypress will perform
+		// (the opposite of the current state) so it doubles as a status hint.
+		if m.systemAudio {
+			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio Off"))
+		} else {
+			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio On"))
+		}
 		parts = append(parts, ui.FooterKeyStyle.Render("Tab")+ui.FooterDescStyle.Render(" Focus"))
 		parts = append(parts, ui.FooterKeyStyle.Render("j/k")+ui.FooterDescStyle.Render(" Nav"))
 		parts = append(parts, ui.FooterKeyStyle.Render("↑↓")+ui.FooterDescStyle.Render(" Scroll"))

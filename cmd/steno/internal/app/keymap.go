@@ -21,14 +21,12 @@ package app
 // surface that issues a daemon-side pause/resume cycle with the new
 // device.
 //
-// The legacy `a` / `A` (toggle system-audio capture) keybind was removed
-// for the same reason: it only flipped a local boolean without sending
-// any daemon command. The daemon's capture configuration is set at
-// startup from `StenoSettings.lastSystemAudioEnabled` and is not
-// toggleable mid-flight via the current protocol. Users who want to
-// change the system-audio mode should edit
-// `~/Library/Application Support/Steno/settings.json` and restart the
-// daemon, or wait for a future protocol-level reconfigure command.
+// `a` toggles system-audio capture by sending the daemon a `reconfigure`
+// command. The previous incarnation of this keybind was removed because it
+// only flipped a local boolean; the daemon now exposes
+// `{"cmd":"reconfigure","systemAudio":<bool>}` which performs an internal
+// stop + start with the requested capture configuration and persists
+// `lastSystemAudioEnabled` so future auto-starts inherit the new value.
 const (
 	KeyQuit      = "q"
 	KeyQuitUpper = "Q"
@@ -46,4 +44,6 @@ const (
 	KeyErrorHistory    = "e"
 	KeyErrorHistoryUp  = "E"
 	KeyEsc             = "esc"
+	// System-audio toggle (protocol-level reconfigure).
+	KeySystemAudio = "a"
 )
