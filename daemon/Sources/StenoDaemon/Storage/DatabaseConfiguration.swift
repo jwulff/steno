@@ -182,6 +182,15 @@ public enum DatabaseConfiguration {
             """)
         }
 
+        // #64: audio-frame start/end (seconds, source capture clock) so
+        // transcript segments can be joined to diarization windows on the
+        // frame-accurate axis. Nullable — prior rows and results without a
+        // valid range migrate cleanly as NULL.
+        migrator.registerMigration("20260525_001_segment_audio_time") { db in
+            try db.execute(sql: "ALTER TABLE segments ADD COLUMN audio_start REAL")
+            try db.execute(sql: "ALTER TABLE segments ADD COLUMN audio_end REAL")
+        }
+
         return migrator
     }
 }

@@ -55,6 +55,18 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// per-segment metering landed.
     public let micPeakDb: Double?
 
+    /// Audio-frame start of this segment in seconds on the source's per-bring-up
+    /// capture clock — the frame-accurate axis shared with the diarization ring
+    /// buffer (#56), used by the diarization merge (#61) to attach speaker
+    /// labels. Distinct from `startedAt` (wall-clock, for dedup / demarcation /
+    /// display). `nil` when the recognizer didn't report a valid range, or for
+    /// rows persisted before #64.
+    public let audioStart: TimeInterval?
+
+    /// Audio-frame end (`audioStart + duration`) in capture-clock seconds.
+    /// `nil` under the same conditions as `audioStart`.
+    public let audioEnd: TimeInterval?
+
     public init(
         id: UUID = UUID(),
         sessionId: UUID,
@@ -68,7 +80,9 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         healMarker: String? = nil,
         duplicateOf: UUID? = nil,
         dedupMethod: DedupMethod? = nil,
-        micPeakDb: Double? = nil
+        micPeakDb: Double? = nil,
+        audioStart: TimeInterval? = nil,
+        audioEnd: TimeInterval? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -83,6 +97,8 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.duplicateOf = duplicateOf
         self.dedupMethod = dedupMethod
         self.micPeakDb = micPeakDb
+        self.audioStart = audioStart
+        self.audioEnd = audioEnd
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.

@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreMedia
 import Foundation
 import Speech
 
@@ -134,10 +135,19 @@ private struct Pipeline: @unchecked Sendable {
                 group.addTask {
                     for try await result in self.transcriber.results {
                         let text = String(result.text.characters)
+                        // #64: carry the result's audio time range (analyzer
+                        // input timeline) so segments can be joined to
+                        // diarization windows on the frame-accurate capture
+                        // clock. CMTimeGetSeconds yields NaN for an invalid
+                        // range → treated as unavailable (nil).
+                        let startSeconds = CMTimeGetSeconds(result.range.start)
+                        let durationSeconds = CMTimeGetSeconds(result.range.duration)
                         continuation.yield(RecognizerResult(
                             text: text,
                             isFinal: result.isFinal,
-                            source: self.source
+                            source: self.source,
+                            audioStartSeconds: startSeconds.isFinite ? startSeconds : nil,
+                            audioDurationSeconds: durationSeconds.isFinite ? durationSeconds : nil
                         ))
                     }
                 }

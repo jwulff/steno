@@ -110,6 +110,47 @@ struct SQLiteTranscriptRepositoryTests {
         #expect(segments[0].confidence == 0.95)
     }
 
+    @Test func saveAndFetchSegmentWithAudioTime() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let segment = StoredSegment(
+            sessionId: session.id,
+            text: "diarization join axis",
+            startedAt: Date(),
+            endedAt: Date(),
+            sequenceNumber: 0,
+            audioStart: 12.5,
+            audioEnd: 15.25
+        )
+        try await repo.saveSegment(segment)
+
+        let fetched = try await repo.segments(for: session.id)
+        #expect(fetched.count == 1)
+        #expect(fetched[0].audioStart == 12.5)
+        #expect(fetched[0].audioEnd == 15.25)
+    }
+
+    @Test func segmentAudioTimeDefaultsToNil() async throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let segment = StoredSegment(
+            sessionId: session.id,
+            text: "no audio time",
+            startedAt: Date(),
+            endedAt: Date(),
+            sequenceNumber: 0
+        )
+        try await repo.saveSegment(segment)
+
+        let fetched = try await repo.segments(for: session.id)
+        #expect(fetched[0].audioStart == nil)
+        #expect(fetched[0].audioEnd == nil)
+    }
+
     @Test func segmentsOrderedBySequenceNumber() async throws {
         let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
         let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)

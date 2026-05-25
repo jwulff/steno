@@ -941,6 +941,13 @@ public actor RecordingEngine {
                 segmentSequence = currentSequenceNumber
             }
 
+            // #64: carry the recognizer's audio-frame time (capture clock) for
+            // the diarization merge, independent of the wall-clock startedAt/
+            // endedAt that dedup, demarcation, and the TUI rely on.
+            let audioEnd = result.audioStartSeconds.map {
+                $0 + (result.audioDurationSeconds ?? 0)
+            }
+
             let segment = StoredSegment(
                 sessionId: routingSessionId,
                 text: result.text,
@@ -950,7 +957,9 @@ public actor RecordingEngine {
                 sequenceNumber: segmentSequence,
                 source: result.source,
                 healMarker: healMarker,
-                micPeakDb: micPeakDb
+                micPeakDb: micPeakDb,
+                audioStart: result.audioStartSeconds,
+                audioEnd: audioEnd
             )
 
             // Persist

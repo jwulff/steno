@@ -48,6 +48,8 @@ explicitly via `PRAGMA journal_mode = WAL` in `DatabaseConfiguration.prepareData
 | dedup_method   | TEXT    | YES      | NULL          | One of `'exact'` / `'normalized'` / `'fuzzy'` when `duplicate_of` is set; NULL otherwise. |
 | heal_marker    | TEXT    | YES      | NULL          | Free-text annotation written by U5/U6 when an in-place pipeline restart preserves the session across a gap (e.g. `'after_gap:12s'`). |
 | mic_peak_db    | REAL    | YES      | NULL          | Peak dBFS observed during this mic segment. Used by U11's audio-level heuristic to avoid dropping actively-spoken mic content. NULL for non-mic segments and pre-migration rows. |
+| audio_start    | REAL    | YES      | NULL          | Audio-frame start in seconds on the source's capture clock (#64). Frame-accurate join axis for diarization, distinct from the wall-clock `startedAt`. NULL when the recognizer reported no valid range or for pre-migration rows. |
+| audio_end      | REAL    | YES      | NULL          | Audio-frame end (`audio_start + duration`) in capture-clock seconds (#64). NULL under the same conditions as `audio_start`. |
 
 **Indexes:**
 - `idx_segments_session(sessionId)`
@@ -97,3 +99,4 @@ Migrations are managed by GRDB in the daemon. Other components should treat the 
 2. `20260207_001_add_segment_source` — adds `source` column to segments
 3. `20260207_002_create_topics_table` — topics table
 4. `20260425_001_dedup_and_heal` — adds dedup pointer (`duplicate_of`, `dedup_method`), in-place heal marker (`heal_marker`), mic peak dBFS (`mic_peak_db`) to segments; adds dedup cursor (`last_deduped_segment_seq`) and pause-state-survives-restart fields (`pause_expires_at`, `paused_indefinitely`) to sessions; adds the `idx_segments_dedup` partial index. All additions are nullable or have safe defaults.
+5. `20260525_001_segment_audio_time` — adds audio-frame time (`audio_start`, `audio_end`) to segments for the diarization join axis (#64). Both nullable.
