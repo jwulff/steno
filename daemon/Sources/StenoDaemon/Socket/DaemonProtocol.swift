@@ -123,6 +123,11 @@ public struct DaemonEvent: Codable, Sendable {
     public var pausedIndefinitely: Bool?
     public var pauseExpiresAt: Double?
 
+    /// #61 — global speaker UUID assigned by the diarization merge. Carried on
+    /// the dedicated `speaker_label` event (and tolerated on any other event,
+    /// e.g. a future enriched `segment`). `nil` for un-diarized events.
+    public var speakerId: String?
+
     public init(
         event: String,
         text: String? = nil,
@@ -139,7 +144,8 @@ public struct DaemonEvent: Codable, Sendable {
         startedAt: Double? = nil,
         paused: Bool? = nil,
         pausedIndefinitely: Bool? = nil,
-        pauseExpiresAt: Double? = nil
+        pauseExpiresAt: Double? = nil,
+        speakerId: String? = nil
     ) {
         self.event = event
         self.text = text
@@ -157,5 +163,6 @@ public struct DaemonEvent: Codable, Sendable {
         self.paused = paused
         self.pausedIndefinitely = pausedIndefinitely
         self.pauseExpiresAt = pauseExpiresAt
+        self.speakerId = speakerId
     }
 }

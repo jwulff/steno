@@ -112,6 +112,36 @@ public actor RecordingEngine {
     private let micRingBuffer = AudioRingBuffer()
     private let sysRingBuffer = AudioRingBuffer()
 
+    // MARK: - Diarization pipeline (#61 wiring)
+
+    /// Shared across sources — a physical speaker resolves to one `SpeakerID`
+    /// regardless of stream.
+    private let speakerRegistry = SpeakerRegistry()
+    /// Per-source `DiarizationService` (FluidAudio-backed). Each owns its own
+    /// long-lived `SortformerDiarizer` / `LSEENDDiarizer`; within-source
+    /// speaker identity is stable across streamed chunks via the diarizer's
+    /// own tracking.
+    private let micDiarizer = DefaultDiarizationService()
+    private let sysDiarizer = DefaultDiarizationService()
+    /// Per-source sticky Sortformer → LS-EEND tier ladder (#60).
+    private let micTierController = DiarizationTierController()
+    private let sysTierController = DiarizationTierController()
+    private var micDiarizationScheduler: DiarizationScheduler?
+    private var sysDiarizationScheduler: DiarizationScheduler?
+    /// `true` once `prepareDiarization()` has finished loading both tier
+    /// models. Until then the tick is a no-op and the pipeline continues
+    /// without speaker labels.
+    private var diarizationModelsReady = false
+    /// 10 Hz tick that drains ready windows from both schedulers. Mirrors
+    /// `levelThrottleTask`'s lifecycle.
+    private var diarizationTickTask: Task<Void, Never>?
+    /// Rolling per-source buffer of recently-finalized segments so the merger
+    /// can match diarized window segments by audio time without hitting the
+    /// DB. Capacity is well above the diarization horizon (60s windows + slack).
+    private var recentMicSegments: [StoredSegment] = []
+    private var recentSysSegments: [StoredSegment] = []
+    private static let recentSegmentCapacity = 200
+
     // MARK: - U11 dedup-trigger debounce state
 
     /// Per-session trailing-edge debounce tasks. A fresh `saveSegment`
@@ -442,6 +472,10 @@ public actor RecordingEngine {
         // intentionally discarded.
         await micRingBuffer.reset()
         await sysRingBuffer.reset()
+        // Diarization (#61): the recent-segments rollover follows the same
+        // per-bring-up reset since labels relate to the new capture timeline.
+        recentMicSegments.removeAll(keepingCapacity: true)
+        recentSysSegments.removeAll(keepingCapacity: true)
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
         lastDeviceUID = deviceUIDProvider()
@@ -460,6 +494,9 @@ public actor RecordingEngine {
 
             // Start level throttle (emits audioLevel events at 10Hz)
             startLevelThrottle()
+            // Build/refresh diarization schedulers wired to the just-reset
+            // ring buffers; the tick task is created on the first bring-up.
+            startDiarizationScheduler()
 
             let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .microphone)
             micRecognizerHandle = recognizer
@@ -764,6 +801,12 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
 
+        // Stop diarization tick (#61). The DefaultDiarizationService and
+        // SpeakerRegistry are kept on the engine — a future restart picks up
+        // where we left off in the next bring-up.
+        diarizationTickTask?.cancel()
+        diarizationTickTask = nil
+
         // End session, then run dedup + empty-session prune (U12). The
         // prune runs unconditionally on close; sessions that don't meet
         // any empty-criterion remain. Future U10 pause/demarcate close
@@ -971,6 +1014,10 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
+            // Diarization (#61): keep a rolling per-source view of recent
+            // segments so the merger can join them against window results
+            // without going back to the DB.
+            recordRecentSegment(segment)
 
             // U11: schedule a debounced dedup pass for the session this
             // segment landed on (routing-aware — a demarcate-routed
@@ -1596,6 +1643,139 @@ public actor RecordingEngine {
         guard p > 0 else { return -90.0 }
         let db = 20.0 * log10(min(p, 1.0))
         return max(-90.0, db)
+    }
+
+    // MARK: - Diarization pipeline (#61 wiring)
+
+    /// Download (cached) FluidAudio models for both tier diarizers in parallel.
+    /// Until this returns successfully, the tick is a no-op and recording
+    /// continues without speaker labels. Idempotent — safe to call repeatedly.
+    /// Errors are surfaced as a transient `.error` event; the engine keeps
+    /// running mic-only diarization-less.
+    public func prepareDiarization() async {
+        guard !diarizationModelsReady else { return }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await self.micDiarizer.prepareModels() }
+                group.addTask { try await self.sysDiarizer.prepareModels() }
+                try await group.waitForAll()
+            }
+            diarizationModelsReady = true
+        } catch {
+            await emit(.error(
+                "Diarization models failed to load: \(error.localizedDescription)",
+                isTransient: true
+            ))
+        }
+    }
+
+    /// Build per-source schedulers and start the 10 Hz drain task. Called from
+    /// `bringUpPipelines` on every bring-up. The schedulers are rebuilt each
+    /// time so their cursor restarts at 0 alongside the ring buffers (which
+    /// reset together); the diarizer instances persist so within-source
+    /// speaker identity carries across pipeline restarts. The tick task is
+    /// idempotent — only created on first bring-up.
+    private func startDiarizationScheduler() {
+        let micTier = micTierController
+        let sysTier = sysTierController
+
+        micDiarizationScheduler = DiarizationScheduler(
+            ringBuffer: micRingBuffer,
+            diarizer: micDiarizer,
+            registry: speakerRegistry,
+            sourceTag: AudioSourceType.microphone.rawValue,
+            modelProvider: { [micTier] in await micTier.currentModel() }
+        )
+        sysDiarizationScheduler = DiarizationScheduler(
+            ringBuffer: sysRingBuffer,
+            diarizer: sysDiarizer,
+            registry: speakerRegistry,
+            sourceTag: AudioSourceType.systemAudio.rawValue,
+            modelProvider: { [sysTier] in await sysTier.currentModel() }
+        )
+
+        if diarizationTickTask == nil {
+            diarizationTickTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    await self?.tickDiarization()
+                }
+            }
+        }
+    }
+
+    /// One drain iteration. Skipped entirely until models are ready so the
+    /// scheduler doesn't attempt to call into an uninitialised diarizer.
+    private func tickDiarization() async {
+        guard diarizationModelsReady else { return }
+        if let micScheduler = micDiarizationScheduler {
+            for result in await micScheduler.processReadyWindows() {
+                await applyDiarizationResult(result, isMic: true)
+            }
+        }
+        if let sysScheduler = sysDiarizationScheduler {
+            for result in await sysScheduler.processReadyWindows() {
+                await applyDiarizationResult(result, isMic: false)
+            }
+        }
+    }
+
+    /// Apply a window's results to the per-source recent-segments buffer:
+    /// run the timestamp merge, persist any new labels via `updateSpeaker`,
+    /// and emit a `speakerLabel` event so live clients can update without
+    /// re-fetching from the DB. Also feeds the tier controller the
+    /// distinct-speaker count for its escalation decision.
+    private func applyDiarizationResult(_ result: DiarizationWindowResult, isMic: Bool) async {
+        let distinct = Set(result.segments.map(\.speaker.raw)).count
+        if isMic {
+            await micTierController.observe(speakerCount: distinct)
+        } else {
+            await sysTierController.observe(speakerCount: distinct)
+        }
+
+        let recent = isMic ? recentMicSegments : recentSysSegments
+        let assignments = SpeakerLabelMerger.assign(window: result, segments: recent)
+        for (segmentId, speakerUUID) in assignments {
+            guard let segment = recent.first(where: { $0.id == segmentId }) else { continue }
+            do {
+                try await repository.updateSpeaker(
+                    segmentId: segmentId,
+                    speakerId: speakerUUID
+                )
+                await emit(.speakerLabel(
+                    sessionId: segment.sessionId,
+                    sequenceNumber: segment.sequenceNumber,
+                    speakerId: speakerUUID
+                ))
+            } catch {
+                await emit(.error(
+                    "Failed to persist speaker label: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
+    }
+
+    /// Append a freshly-finalized segment to the right per-source rolling
+    /// buffer. Called from `handleRecognizerResult` after the segment lands
+    /// in the DB.
+    private func recordRecentSegment(_ segment: StoredSegment) {
+        switch segment.source {
+        case .microphone:
+            recentMicSegments.append(segment)
+            if recentMicSegments.count > Self.recentSegmentCapacity {
+                recentMicSegments.removeFirst(
+                    recentMicSegments.count - Self.recentSegmentCapacity
+                )
+            }
+        case .systemAudio:
+            recentSysSegments.append(segment)
+            if recentSysSegments.count > Self.recentSegmentCapacity {
+                recentSysSegments.removeFirst(
+                    recentSysSegments.count - Self.recentSegmentCapacity
+                )
+            }
+        }
     }
 
     // MARK: - U11 Dedup-Trigger Debounce
@@ -2465,6 +2645,8 @@ public actor RecordingEngine {
         systemAudioSource = nil
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
+        diarizationTickTask?.cancel()
+        diarizationTickTask = nil
         currentSession = nil
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()

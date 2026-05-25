@@ -47,6 +47,12 @@ public enum EngineEvent: Sendable {
     /// - `expiresAt`: wall-clock instant the auto-resume timer will fire.
     ///   `nil` for indefinite pauses and on resume.
     case pauseStateChanged(paused: Bool, indefinite: Bool, expiresAt: Date?)
+
+    /// Persisted-side-effect + ephemeral: the diarization merge (#61) attached
+    /// (or revised) a global speaker for a transcript segment. The persistence
+    /// already happened via `repository.updateSpeaker`; this event lets the
+    /// TUI update the in-memory segment without re-fetching from the DB.
+    case speakerLabel(sessionId: UUID, sequenceNumber: Int, speakerId: UUID)
 }
 
 /// Status of the recording engine.

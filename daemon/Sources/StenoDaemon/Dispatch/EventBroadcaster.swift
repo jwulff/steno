@@ -9,6 +9,9 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     case status
     case modelProcessing
     case error
+    /// #61 — a transcript segment had a speaker assigned (or revised) by the
+    /// diarization merge. Carries `sessionId`, `sequenceNumber`, `speakerId`.
+    case speakerLabel
 }
 
 /// Broadcasts engine events to subscribed socket clients.
@@ -153,6 +156,14 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 paused: paused,
                 pausedIndefinitely: indefinite,
                 pauseExpiresAt: expiresAt?.timeIntervalSince1970
+            ))
+
+        case .speakerLabel(let sessionId, let sequenceNumber, let speakerId):
+            return (.speakerLabel, DaemonEvent(
+                event: "speaker_label",
+                sessionId: sessionId.uuidString,
+                sequenceNumber: sequenceNumber,
+                speakerId: speakerId.uuidString
             ))
         }
     }
