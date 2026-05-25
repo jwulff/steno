@@ -44,6 +44,7 @@ func createTestDB(t *testing.T) *sql.DB {
 			dedup_method TEXT,
 			heal_marker TEXT,
 			mic_peak_db REAL,
+			speaker_id TEXT,
 			UNIQUE(sessionId, sequenceNumber)
 		);
 

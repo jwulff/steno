@@ -1594,3 +1594,234 @@ func TestPauseClearsParked(t *testing.T) {
 		t.Error("systemAudioParked should be cleared on pause")
 	}
 }
+
+// --- Diarization: per-session speaker labels ---
+
+// TestSpeakerLabelAssignsFirstSeenOrdinal exercises the core mapping:
+// the first distinct UUID noted gets "Speaker 1", the second gets
+// "Speaker 2", and repeats of the first stay at "Speaker 1".
+func TestSpeakerLabelAssignsFirstSeenOrdinal(t *testing.T) {
+	m := New()
+
+	// First UUID -> Speaker 1.
+	m.noteSpeaker("uuid1")
+	if got := m.speakerLabel("uuid1"); got != "Speaker 1" {
+		t.Errorf("first uuid label = %q, want %q", got, "Speaker 1")
+	}
+
+	// Second distinct UUID -> Speaker 2.
+	m.noteSpeaker("uuid2")
+	if got := m.speakerLabel("uuid2"); got != "Speaker 2" {
+		t.Errorf("second uuid label = %q, want %q", got, "Speaker 2")
+	}
+
+	// Repeat of uuid1 -> still Speaker 1 (idempotent ordering).
+	m.noteSpeaker("uuid1")
+	if got := m.speakerLabel("uuid1"); got != "Speaker 1" {
+		t.Errorf("repeat uuid1 label = %q, want stable %q", got, "Speaker 1")
+	}
+	if got := m.speakerLabel("uuid2"); got != "Speaker 2" {
+		t.Errorf("uuid2 label after repeat = %q, want stable %q", got, "Speaker 2")
+	}
+
+	// Sanity: order list should still contain exactly two entries.
+	if len(m.speakerOrder) != 2 {
+		t.Errorf("speakerOrder len = %d, want 2 (no duplicate inserts)", len(m.speakerOrder))
+	}
+}
+
+// TestSpeakerLabelEmptyIDReturnsEmpty confirms the unassigned-segment
+// path: an empty UUID has no label, and the renderer treats this as
+// "render without a speaker prefix".
+func TestSpeakerLabelEmptyIDReturnsEmpty(t *testing.T) {
+	m := New()
+	if got := m.speakerLabel(""); got != "" {
+		t.Errorf("empty id label = %q, want empty string", got)
+	}
+	// noteSpeaker with "" must not pollute the order list.
+	m.noteSpeaker("")
+	if len(m.speakerOrder) != 0 {
+		t.Errorf("noteSpeaker(\"\") inserted into order: len=%d, want 0", len(m.speakerOrder))
+	}
+}
+
+// TestSpeakerLabelUnknownIDReturnsEmpty confirms that asking for a UUID
+// that was never noted returns empty — the renderer falls back to no
+// prefix instead of inventing a "Speaker N".
+func TestSpeakerLabelUnknownIDReturnsEmpty(t *testing.T) {
+	m := New()
+	m.noteSpeaker("uuid1")
+
+	if got := m.speakerLabel("never-seen"); got != "" {
+		t.Errorf("unknown id label = %q, want empty", got)
+	}
+}
+
+// TestSpeakerOrderResetOnSessionChangeViaStartResponse confirms that a
+// StartResponseMsg carrying a new sessionID clears the per-session
+// speaker order. This is the "new session = new Speaker 1" guarantee.
+func TestSpeakerOrderResetOnSessionChangeViaStartResponse(t *testing.T) {
+	m := New()
+	m.sessionID = "session-a"
+	m.noteSpeaker("uuid1")
+	m.noteSpeaker("uuid2")
+	if len(m.speakerOrder) != 2 {
+		t.Fatalf("setup: speakerOrder len = %d, want 2", len(m.speakerOrder))
+	}
+
+	// New session arrives via StartResponseMsg.
+	updated, _ := m.Update(StartResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-b",
+		Recording: daemon.BoolPtr(true),
+	}})
+	got := updated.(Model)
+
+	if len(got.speakerOrder) != 0 {
+		t.Errorf("speakerOrder len = %d after session switch, want 0", len(got.speakerOrder))
+	}
+	// And a fresh noteSpeaker starts back at Speaker 1.
+	got.noteSpeaker("uuid3")
+	if label := got.speakerLabel("uuid3"); label != "Speaker 1" {
+		t.Errorf("post-reset label = %q, want Speaker 1", label)
+	}
+	// The previous-session UUID should no longer resolve.
+	if label := got.speakerLabel("uuid1"); label != "" {
+		t.Errorf("stale-session uuid1 label = %q, want empty (cleared)", label)
+	}
+}
+
+// TestSpeakerOrderResetOnSessionChangeViaDemarcate confirms the demarcate
+// handler (spacebar -> new session) also resets the speaker order.
+func TestSpeakerOrderResetOnSessionChangeViaDemarcate(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "session-a"
+	m.noteSpeaker("uuid1")
+	if len(m.speakerOrder) != 1 {
+		t.Fatalf("setup: speakerOrder len = %d, want 1", len(m.speakerOrder))
+	}
+
+	resp := DemarcateResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-b",
+	}}
+	updated, _ := m.Update(resp)
+	got := updated.(Model)
+
+	if len(got.speakerOrder) != 0 {
+		t.Errorf("speakerOrder len = %d after demarcate, want 0", len(got.speakerOrder))
+	}
+}
+
+// TestSpeakerOrderResetOnSessionChangeViaStatus confirms a status response
+// reporting a new sessionID also resets the order.
+func TestSpeakerOrderResetOnSessionChangeViaStatus(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "session-a"
+	m.noteSpeaker("uuid1")
+
+	recording := true
+	updated, _ := m.Update(StatusResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-b",
+		Recording: &recording,
+	}})
+	got := updated.(Model)
+
+	if len(got.speakerOrder) != 0 {
+		t.Errorf("speakerOrder len = %d after status switch, want 0", len(got.speakerOrder))
+	}
+}
+
+// TestSpeakerOrderPersistsAcrossSameSession confirms repeated status
+// responses for the SAME sessionID do not nuke an established order
+// — would defeat the cross-update label stability.
+func TestSpeakerOrderPersistsAcrossSameSession(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.sessionID = "session-a"
+	m.noteSpeaker("uuid1")
+	m.noteSpeaker("uuid2")
+
+	recording := true
+	updated, _ := m.Update(StatusResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-a", // same session
+		Recording: &recording,
+	}})
+	got := updated.(Model)
+
+	if len(got.speakerOrder) != 2 {
+		t.Errorf("speakerOrder len = %d after same-session status, want 2 (no reset)", len(got.speakerOrder))
+	}
+	if got.speakerLabel("uuid1") != "Speaker 1" || got.speakerLabel("uuid2") != "Speaker 2" {
+		t.Errorf("labels unstable across same-session status update: %q / %q",
+			got.speakerLabel("uuid1"), got.speakerLabel("uuid2"))
+	}
+}
+
+// TestTranscriptRendersSpeakerPrefix exercises the renderer: when a
+// TranscriptEntry has a known SpeakerID, the segment text is prefixed
+// with "Speaker N: " in the rendered transcript panel.
+func TestTranscriptRendersSpeakerPrefix(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 120
+	m.height = 30
+
+	m.noteSpeaker("alice-uuid")
+	m.noteSpeaker("bob-uuid")
+	m.entries = []TranscriptEntry{
+		{Text: "Hello there", Source: "microphone", Timestamp: time.Now(), SeqNum: 1, SpeakerID: "alice-uuid"},
+		{Text: "Hi yourself", Source: "microphone", Timestamp: time.Now(), SeqNum: 2, SpeakerID: "bob-uuid"},
+		{Text: "Anonymous line", Source: "microphone", Timestamp: time.Now(), SeqNum: 3},
+	}
+
+	view := m.View()
+	if !strings.Contains(view, "Speaker 1: Hello there") {
+		t.Errorf("view missing 'Speaker 1: Hello there'; got:\n%s", view)
+	}
+	if !strings.Contains(view, "Speaker 2: Hi yourself") {
+		t.Errorf("view missing 'Speaker 2: Hi yourself'; got:\n%s", view)
+	}
+	// Anonymous (empty SpeakerID) entry must NOT get a "Speaker " prefix.
+	if strings.Contains(view, "Speaker : Anonymous line") || strings.Contains(view, "Speaker 0") {
+		t.Errorf("view added spurious speaker prefix to unassigned segment; got:\n%s", view)
+	}
+	if !strings.Contains(view, "Anonymous line") {
+		t.Errorf("view missing the unassigned segment text; got:\n%s", view)
+	}
+}
+
+// TestTopicSegmentsLoadedFoldsSpeakerOrder exercises the DB-loaded
+// path: when topic-segment expansion brings back segments with
+// speaker_ids, they get folded into speakerOrder so subsequent live
+// segments referencing the same UUID get the right label.
+func TestTopicSegmentsLoadedFoldsSpeakerOrder(t *testing.T) {
+	m := New()
+	m.topics = []TopicDisplay{{ID: "t1", Title: "Topic A"}}
+
+	msg := TopicSegmentsLoadedMsg{
+		TopicID: "t1",
+		Segments: []TopicSegment{
+			{Text: "first", Source: "microphone", SeqNum: 1, SpeakerID: "uuid-x"},
+			{Text: "second", Source: "microphone", SeqNum: 2, SpeakerID: "uuid-y"},
+			{Text: "third", Source: "microphone", SeqNum: 3, SpeakerID: "uuid-x"},
+			{Text: "unassigned", Source: "microphone", SeqNum: 4},
+		},
+	}
+	updated, _ := m.Update(msg)
+	got := updated.(Model)
+
+	if got.speakerLabel("uuid-x") != "Speaker 1" {
+		t.Errorf("uuid-x label = %q, want Speaker 1", got.speakerLabel("uuid-x"))
+	}
+	if got.speakerLabel("uuid-y") != "Speaker 2" {
+		t.Errorf("uuid-y label = %q, want Speaker 2", got.speakerLabel("uuid-y"))
+	}
+	if len(got.speakerOrder) != 2 {
+		t.Errorf("speakerOrder len = %d, want 2 (uuid-x deduped, empty skipped)", len(got.speakerOrder))
+	}
+}

@@ -57,6 +57,14 @@ type Segment struct {
 	// the daemon's audio-level heuristic for dedup. Nil for non-mic
 	// segments and pre-migration rows.
 	MicPeakDB *float64
+
+	// SpeakerID is the diarization UUID assigned to this segment by the
+	// daemon's speaker-clustering pipeline. Empty when the segment was
+	// recorded before diarization shipped, when the segment is too short
+	// to cluster, or when speaker assignment has not yet been backfilled
+	// by the daemon's `updateSpeaker` repository writer. The TUI maps
+	// the UUID to a per-session "Speaker N" label via first-seen order.
+	SpeakerID string
 }
 
 // Topic represents an extracted topic.

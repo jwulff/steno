@@ -74,6 +74,11 @@ type Event struct {
 	Paused             *bool    `json:"paused,omitempty"`
 	PausedIndefinitely *bool    `json:"pausedIndefinitely,omitempty"`
 	PauseExpiresAt     *float64 `json:"pauseExpiresAt,omitempty"`
+
+	// #61 — diarization speaker assignment. Carried on `speaker_label` events
+	// (and tolerated on any event that wants to include it). Empty for
+	// un-diarized events.
+	SpeakerID string `json:"speakerId,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.

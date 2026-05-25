@@ -207,6 +207,77 @@ func TestSegmentsForRangeExcludesDuplicates(t *testing.T) {
 	}
 }
 
+// TestSegmentSpeakerIDRoundTrip confirms the Go reader pulls speaker_id
+// values out of the segments table (the column the daemon's
+// `updateSpeaker` repository writer fills in). A NULL speaker_id maps
+// to an empty Go string, matching the "unassigned segment" semantics
+// the TUI relies on to skip the "Speaker N: " prefix.
+func TestSegmentSpeakerIDRoundTrip(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+
+	now := float64(time.Now().Unix())
+
+	rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-1', 'en_US', ?, 'active', ?)`, now, now)
+
+	// seg-1: speaker assigned.
+	rawDB.Exec(`INSERT INTO segments
+		(id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source, speaker_id)
+		VALUES ('seg-1', 'sess-1', 'hello from alice', ?, ?, 1, ?, 'microphone', 'speaker-alice-uuid')`,
+		now, now+1, now)
+	// seg-2: speaker NOT assigned (NULL); must round-trip to empty string.
+	rawDB.Exec(`INSERT INTO segments
+		(id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+		VALUES ('seg-2', 'sess-1', 'unassigned', ?, ?, 2, ?, 'microphone')`,
+		now, now+1, now)
+	// seg-3: a second distinct speaker.
+	rawDB.Exec(`INSERT INTO segments
+		(id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source, speaker_id)
+		VALUES ('seg-3', 'sess-1', 'hello from bob', ?, ?, 3, ?, 'microphone', 'speaker-bob-uuid')`,
+		now, now+1, now)
+
+	store := &Store{db: rawDB}
+
+	segments, err := store.SegmentsForSession("sess-1", 100, 0)
+	if err != nil {
+		t.Fatalf("SegmentsForSession: %v", err)
+	}
+	if len(segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segments))
+	}
+
+	if segments[0].SpeakerID != "speaker-alice-uuid" {
+		t.Errorf("segments[0].SpeakerID = %q, want %q",
+			segments[0].SpeakerID, "speaker-alice-uuid")
+	}
+	if segments[1].SpeakerID != "" {
+		t.Errorf("segments[1].SpeakerID = %q, want empty (NULL row)",
+			segments[1].SpeakerID)
+	}
+	if segments[2].SpeakerID != "speaker-bob-uuid" {
+		t.Errorf("segments[2].SpeakerID = %q, want %q",
+			segments[2].SpeakerID, "speaker-bob-uuid")
+	}
+
+	// Also exercise the range query path — the TUI uses it for topic
+	// expansion, so we want the same column read behavior there.
+	ranged, err := store.SegmentsForRange("sess-1", 1, 3)
+	if err != nil {
+		t.Fatalf("SegmentsForRange: %v", err)
+	}
+	if len(ranged) != 3 {
+		t.Fatalf("range: got %d segments, want 3", len(ranged))
+	}
+	if ranged[0].SpeakerID != "speaker-alice-uuid" || ranged[2].SpeakerID != "speaker-bob-uuid" {
+		t.Errorf("range query did not surface speaker_id: %+v",
+			[]string{ranged[0].SpeakerID, ranged[1].SpeakerID, ranged[2].SpeakerID})
+	}
+	if ranged[1].SpeakerID != "" {
+		t.Errorf("range NULL row SpeakerID = %q, want empty", ranged[1].SpeakerID)
+	}
+}
+
 func TestLatestSession(t *testing.T) {
 	rawDB := createTestDB(t)
 	defer rawDB.Close()

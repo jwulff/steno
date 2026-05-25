@@ -104,6 +104,13 @@ type TranscriptEntry struct {
 	Timestamp  time.Time
 	SeqNum     int
 	IsBoundary bool
+
+	// SpeakerID is the diarization UUID assigned by the daemon. Empty
+	// when the segment is unassigned (too short to cluster, written by a
+	// pre-diarization daemon, or not yet backfilled). When set, the
+	// renderer prefixes the segment text with "Speaker N: " where N is
+	// the per-session first-seen ordinal kept in Model.speakerOrder.
+	SpeakerID string
 }
 
 // TopicDisplay holds a topic for display in the topic panel.
@@ -170,6 +177,15 @@ type Model struct {
 	// Transcript
 	entries  []TranscriptEntry
 	partials map[string]string // source -> partial text
+
+	// speakerOrder is the ordered list of distinct speaker UUIDs the
+	// model has observed in the CURRENT session, in first-seen order.
+	// The index + 1 of a UUID is its "Speaker N" label (1-based) used
+	// in the transcript renderer. Reset whenever sessionID changes —
+	// labels are per-session by design (the daemon clusters per session
+	// and reuses the same UUID for the same speaker within a session,
+	// but cross-session continuity is not guaranteed).
+	speakerOrder []string
 
 	// Heal markers keyed by sequenceNumber (U9). The Swift
 	// EventBroadcaster's `event:"segment"` payload doesn't currently
@@ -529,9 +545,10 @@ func loadTopicSegmentsCmd(store *db.Store, sessionID, topicID string, start, end
 		loaded := make([]TopicSegment, 0, len(segments))
 		for _, s := range segments {
 			loaded = append(loaded, TopicSegment{
-				Text:   s.Text,
-				Source: s.Source,
-				SeqNum: s.SequenceNumber,
+				Text:      s.Text,
+				Source:    s.Source,
+				SeqNum:    s.SequenceNumber,
+				SpeakerID: s.SpeakerID,
 			})
 		}
 		return TopicSegmentsLoadedMsg{TopicID: topicID, Segments: loaded}
@@ -613,6 +630,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.recording = *r.Recording
 		}
 		if r.SessionID != "" {
+			if r.SessionID != m.sessionID {
+				// Per-session speaker labels — drop the prior session's
+				// first-seen order when the daemon reports a new sessionID.
+				m.resetSpeakerOrder()
+			}
 			m.sessionID = r.SessionID
 		}
 		if r.Device != "" {
@@ -641,6 +663,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if r.OK {
 			m.recording = true
 			if r.SessionID != "" {
+				if r.SessionID != m.sessionID {
+					// Per-session speaker labels — fresh session = fresh order.
+					m.resetSpeakerOrder()
+				}
 				m.sessionID = r.SessionID
 			}
 			// The response carries the canonical capture configuration
@@ -722,6 +748,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		// Fold any speakers carried on the DB-loaded segments into the
+		// per-session first-seen order. This keeps the labels stable
+		// when a user expands a historical topic before any live
+		// `speaker_label` events have arrived for the current session
+		// — the topic-segment panel and the main transcript share the
+		// same speaker-N numbering.
+		for _, seg := range msg.Segments {
+			m.noteSpeaker(seg.SpeakerID)
+		}
 		return m, nil
 
 	case SummaryLoadedMsg:
@@ -793,6 +828,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// the LLM finishes the first extraction.
 			m.topics = m.topics[:0]
 			m.selectedTopic = 0
+			// Speaker labels are per-session — the new session starts at
+			// "Speaker 1" again even if the same physical person is
+			// speaking.
+			m.resetSpeakerOrder()
 			if m.store != nil {
 				cmds = append(cmds, loadTopicsCmd(m.store, m.sessionID))
 				if m.showSummary {
@@ -897,6 +936,48 @@ func (m *Model) appendErrorHistory(message string) {
 	m.errorHistory = append(m.errorHistory, entry)
 }
 
+// noteSpeaker folds a non-empty speaker UUID into the per-session
+// first-seen order. Idempotent — repeat UUIDs are no-ops. Empty IDs
+// are ignored.
+func (m *Model) noteSpeaker(speakerID string) {
+	if speakerID == "" {
+		return
+	}
+	for _, existing := range m.speakerOrder {
+		if existing == speakerID {
+			return
+		}
+	}
+	m.speakerOrder = append(m.speakerOrder, speakerID)
+}
+
+// speakerLabel returns the user-facing "Speaker N" label for a UUID,
+// where N is the 1-based index of the UUID in the per-session first-seen
+// order. Returns "" when the UUID is empty or hasn't been recorded —
+// callers treat "" as "render without a speaker prefix".
+//
+// Lookup is linear over speakerOrder; in practice the list is tiny
+// (handful of speakers per session) so a map index would be wasted
+// allocation.
+func (m *Model) speakerLabel(speakerID string) string {
+	if speakerID == "" {
+		return ""
+	}
+	for i, existing := range m.speakerOrder {
+		if existing == speakerID {
+			return fmt.Sprintf("Speaker %d", i+1)
+		}
+	}
+	return ""
+}
+
+// resetSpeakerOrder clears the per-session speaker tracking. Called
+// whenever the model switches to a new sessionID — labels are
+// session-scoped (see Model.speakerOrder doc).
+func (m *Model) resetSpeakerOrder() {
+	m.speakerOrder = nil
+}
+
 // handleEvent processes a daemon event and returns any resulting command.
 //
 // Event types (mirrored from EventBroadcaster.swift):
@@ -928,10 +1009,17 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			Text:      ev.Text,
 			Source:    ev.Source,
 			Timestamp: ts,
+			SpeakerID: ev.SpeakerID,
 		}
 		if ev.SequenceNumber != nil {
 			entry.SeqNum = *ev.SequenceNumber
 		}
+		// If the segment carries a speaker UUID (live diarization path
+		// once the daemon is wired up), fold it into the per-session
+		// first-seen order so the renderer can resolve the "Speaker N"
+		// label. Empty IDs are skipped by noteSpeaker — pre-diarization
+		// segments stay label-less.
+		m.noteSpeaker(entry.SpeakerID)
 		// Insert in chronological order — segments may arrive out of speech order
 		// when dual sources are active
 		i := sort.Search(len(m.entries), func(j int) bool {
@@ -983,6 +1071,31 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		if ev.ModelProcessing != nil {
 			m.modelProcessing = *ev.ModelProcessing
 		}
+
+	case "speaker_label":
+		// #61: the diarization merge assigned (or revised) a speaker for a
+		// segment we already have in the live view. Find it by sequenceNumber
+		// + (when present) sessionId, update its SpeakerID, and fold the UUID
+		// into the per-session order so the renderer can resolve "Speaker N".
+		if ev.SequenceNumber == nil || ev.SpeakerID == "" {
+			return nil
+		}
+		seq := *ev.SequenceNumber
+		for i := range m.entries {
+			if m.entries[i].IsBoundary {
+				continue
+			}
+			if m.entries[i].SeqNum != seq {
+				continue
+			}
+			if ev.SessionID != "" && m.sessionID != "" && ev.SessionID != m.sessionID {
+				continue
+			}
+			m.entries[i].SpeakerID = ev.SpeakerID
+			break
+		}
+		m.noteSpeaker(ev.SpeakerID)
+		return nil
 
 	case "topics":
 		if m.store != nil && m.sessionID != "" {
@@ -1738,7 +1851,14 @@ func (m Model) renderTopicPanel(width, height int) string {
 							srcLabel = "SYS"
 						}
 						prefix := fmt.Sprintf("      [%s] ", srcLabel)
-						segWrapped := wrapText(seg.Text, max(10, width-len(prefix)-2))
+						// Speaker-N prefix in the topic-expand panel
+						// mirrors the main transcript renderer; empty
+						// label = no prefix.
+						segText := seg.Text
+						if label := m.speakerLabel(seg.SpeakerID); label != "" {
+							segText = label + ": " + segText
+						}
+						segWrapped := wrapText(segText, max(10, width-len(prefix)-2))
 						for j, sl := range segWrapped {
 							if j == 0 {
 								lines = append(lines, ui.DimStyle.Render(prefix+sl))
@@ -1877,7 +1997,16 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			} else {
 				src = ui.MicLabelStyle.Render("[MIC] ")
 			}
-			wrapped := wrapText(e.Text, textWidth)
+			// Prefix the segment text with "Speaker N: " when the daemon
+			// has assigned this segment to a diarization cluster. The
+			// label is per-session and 1-based by first-seen order; an
+			// unassigned segment renders without a prefix so users of
+			// pre-diarization sessions see no behaviour change.
+			segText := e.Text
+			if label := m.speakerLabel(e.SpeakerID); label != "" {
+				segText = label + ": " + segText
+			}
+			wrapped := wrapText(segText, textWidth)
 			displayLines = append(displayLines, ts+" "+src+wrapped[0])
 			for _, wl := range wrapped[1:] {
 				displayLines = append(displayLines, indentStr+wl)
