@@ -211,4 +211,55 @@ struct SpeakerRegistryStableIndexTests {
         #expect(speaker.modelVersion == version)
         #expect(await registry.snapshot().count == 1)
     }
+
+    // Bug 1: tier-escalation speaker aliasing. When a source escalates
+    // Sortformer → LS-EEND (or the model version changes), both diarizers can
+    // emit speakerIndex 0 for *unrelated* speakers. Keying only by
+    // (sourceTag, speakerIndex) would alias them into one global ID. The key
+    // must also reflect model identity so they stay distinct.
+    @Test func sameSourceAndIndexDifferentModelMintsDistinctIDs() async {
+        let registry = SpeakerRegistry()
+
+        let sortformer = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone",
+            modelId: "sortformer", modelVersion: version)
+        let lsEEND = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone",
+            modelId: "lsEEND", modelVersion: version)
+
+        #expect(sortformer != lsEEND)
+        #expect(await registry.count == 2)
+    }
+
+    @Test func sameSourceAndIndexDifferentModelVersionMintsDistinctIDs() async {
+        let registry = SpeakerRegistry()
+
+        let v1 = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone",
+            modelId: model, modelVersion: "1.0")
+        let v2 = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone",
+            modelId: model, modelVersion: "2.0")
+
+        #expect(v1 != v2)
+        #expect(await registry.count == 2)
+    }
+
+    // Bug 2: windowsSeen must reflect recurrence on stable-index hits, just
+    // like the cosine path. A stable index observed N times → windowsSeen == N.
+    @Test func windowsSeenIncrementsOnStableIndexRecurrence() async throws {
+        let registry = SpeakerRegistry()
+
+        let id = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        #expect(await registry.speaker(id)?.windowsSeen == 1)
+
+        _ = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+        _ = await registry.assignStableIndex(
+            speakerIndex: 0, sourceTag: "microphone", modelId: model, modelVersion: version)
+
+        #expect(await registry.speaker(id)?.windowsSeen == 3)
+        #expect(await registry.count == 1)  // still one speaker, not re-minted
+    }
 }

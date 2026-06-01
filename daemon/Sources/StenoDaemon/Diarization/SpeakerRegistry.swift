@@ -83,15 +83,23 @@ public actor SpeakerRegistry {
     private let confirmAfterWindows: Int
     private var speakers: [SpeakerID: RegisteredSpeaker]
 
-    /// `(sourceTag, FluidAudio speakerIndex) → SpeakerID` cache for the
-    /// stable-index stitching path. FluidAudio's tier diarizers (Sortformer /
-    /// LS-EEND) maintain stable per-source speaker indices across streamed
-    /// chunks, so within-source stitching is identity-based, not cosine — we
-    /// just map the (source, index) pair to a stable global `SpeakerID`. The
-    /// cosine-embedding path stays available for future use (#54 voiceprints,
-    /// alternative diarizers that expose embeddings).
+    /// `(sourceTag, modelId, modelVersion, FluidAudio speakerIndex) → SpeakerID`
+    /// cache for the stable-index stitching path. FluidAudio's tier diarizers
+    /// (Sortformer / LS-EEND) maintain stable per-source speaker indices across
+    /// streamed chunks, so within-source stitching is identity-based, not
+    /// cosine — we just map the (source, model, index) tuple to a stable global
+    /// `SpeakerID`. The cosine-embedding path stays available for future use
+    /// (#54 voiceprints, alternative diarizers that expose embeddings).
+    ///
+    /// The model identity is part of the key because `speakerIndex` namespaces
+    /// are diarizer-instance/model-specific: when a source escalates Sortformer
+    /// → LS-EEND (or the model version changes), both diarizers can emit
+    /// `speakerIndex == 0` for unrelated speakers. Keying by model identity
+    /// keeps those distinct instead of aliasing them into one global ID.
     private struct SourceIndexKey: Hashable, Sendable {
         let sourceTag: String
+        let modelId: String
+        let modelVersion: String
         let speakerIndex: Int
     }
     private var stableIndexMap: [SourceIndexKey: SpeakerID] = [:]
@@ -156,8 +164,20 @@ public actor SpeakerRegistry {
         modelId: String,
         modelVersion: String
     ) -> SpeakerID {
-        let key = SourceIndexKey(sourceTag: sourceTag, speakerIndex: speakerIndex)
+        let key = SourceIndexKey(
+            sourceTag: sourceTag,
+            modelId: modelId,
+            modelVersion: modelVersion,
+            speakerIndex: speakerIndex
+        )
         if let existing = stableIndexMap[key] {
+            // Recurrence: this stable index has been observed again. Mirror the
+            // cosine path's bookkeeping so `windowsSeen` reflects how many
+            // windows the speaker appeared in (snapshots, promotion logic, #54).
+            if var speaker = speakers[existing] {
+                speaker.windowsSeen += 1
+                speakers[existing] = speaker
+            }
             return existing
         }
         let id = SpeakerID()
