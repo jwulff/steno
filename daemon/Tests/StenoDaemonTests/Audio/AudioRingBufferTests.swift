@@ -128,6 +128,73 @@ struct AudioRingBufferTests {
         #expect(await buffer.isEmpty())
     }
 
+    /// A ramp chunk where sample `i` holds value `Float(i)` — lets a test assert
+    /// exactly which frames a sample-exact window returned, by value.
+    private func rampChunk(start: Double, count: Int, sampleRate: Double = 16000) -> PCMChunk {
+        PCMChunk(
+            startTime: start,
+            sampleRate: sampleRate,
+            samples: (0..<count).map { Float($0) }
+        )
+    }
+
+    @Test func samplesReturnsExactlyTheRequestedSpan() async {
+        // One 1s @ 16 kHz ramp chunk [0,1). Request [0.25, 0.75) → frames
+        // [4000, 12000), i.e. values 4000..<12000.
+        let buffer = AudioRingBuffer()
+        await buffer.append(rampChunk(start: 0, count: 16000))
+
+        let span = await buffer.samples(from: 0.25, to: 0.75)
+        #expect(span.count == 8000)
+        #expect(span.first == 4000)
+        #expect(span.last == 11999)
+    }
+
+    @Test func samplesTrimsBothStraddlingBoundaryChunks() async {
+        // Two abutting 1s ramp chunks: [0,1) and [1,2). Request [0.5, 1.5)
+        // straddles both — must trim the tail of chunk 0 and the head of
+        // chunk 1, yielding exactly 16000 samples (8000 from each).
+        let buffer = AudioRingBuffer()
+        await buffer.append(rampChunk(start: 0, count: 16000))
+        await buffer.append(rampChunk(start: 1, count: 16000))
+
+        let span = await buffer.samples(from: 0.5, to: 1.5)
+        #expect(span.count == 16000)
+        // Last 8000 of chunk 0 are values 8000..<16000, then first 8000 of
+        // chunk 1 are values 0..<8000.
+        #expect(span.first == 8000)
+        #expect(span[7999] == 15999)
+        #expect(span[8000] == 0)
+        #expect(span.last == 7999)
+    }
+
+    @Test func samplesCoversFullWidthWhenWindowSpansManyChunks() async {
+        // 1s-per-chunk @ 1 Hz so frame count == seconds. 90 chunks; a 45s
+        // window must return exactly 45 samples with no double-counting.
+        let buffer = AudioRingBuffer(retention: 100_000)
+        for _ in 0..<90 { await buffer.append(samples: [0], sampleRate: 1) }
+
+        let span = await buffer.samples(from: 0, to: 45)
+        #expect(span.count == 45)
+        let span2 = await buffer.samples(from: 45, to: 90)
+        #expect(span2.count == 45)
+    }
+
+    @Test func samplesEmptyForInvertedOrEmptyRange() async {
+        let buffer = AudioRingBuffer()
+        await buffer.append(rampChunk(start: 0, count: 16000))
+
+        #expect(await buffer.samples(from: 5, to: 5).isEmpty)
+        #expect(await buffer.samples(from: 8, to: 2).isEmpty)
+    }
+
+    @Test func samplesEmptyWhenSpanFullyOutsideRetainedAudio() async {
+        let buffer = AudioRingBuffer()
+        await buffer.append(rampChunk(start: 0, count: 16000))
+
+        #expect(await buffer.samples(from: 2, to: 3).isEmpty)
+    }
+
     @Test func resetClearsAudioAndRewindsClock() async {
         let buffer = AudioRingBuffer()
         _ = await buffer.append(

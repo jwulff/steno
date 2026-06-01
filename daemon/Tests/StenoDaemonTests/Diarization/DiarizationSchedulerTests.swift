@@ -132,6 +132,58 @@ struct DiarizationSchedulerTests {
         #expect(await registry.count == 1)
     }
 
+    @Test func feedsExactlyWindowLengthSamplesToTheDiarizer() async {
+        // 1s @ 16 kHz chunks. A 45s window must hand the diarizer exactly
+        // 45 * 16000 = 720000 frames — no straddle double-count, no slop.
+        let ring = AudioRingBuffer(retention: 100_000)
+        for _ in 0..<90 {
+            await ring.append(
+                samples: [Float](repeating: 0, count: 16000),
+                sampleRate: 16000
+            )
+        }
+        let mock = MockDiarizationService()
+        let scheduler = DiarizationScheduler(
+            ringBuffer: ring,
+            diarizer: mock,
+            registry: SpeakerRegistry(),
+            sourceTag: "microphone"
+        )
+
+        _ = await scheduler.processReadyWindows()
+        #expect(mock.calls.map(\.sampleCount) == [45 * 16000, 45 * 16000])
+    }
+
+    @Test func skipsWindowWhoseStartWasPrunedAfterAStall() async {
+        // Models still downloading on first run: the tick stalls, retention
+        // advances earliestTime() past nextWindowStart, so [0,45) is only
+        // partially resident. The scheduler must NOT diarize the partial span;
+        // it fast-forwards past the missing audio.
+        let ring = AudioRingBuffer(retention: 50)  // ~50s history kept
+        // Append 90s of 1 Hz audio; retention drops the oldest ~40s.
+        for _ in 0..<90 { await ring.append(samples: [0], sampleRate: 1) }
+        // earliestTime() is now 40 (latestEnd 90 - retention 50).
+        #expect(await ring.earliestTime() == 40)
+
+        let mock = MockDiarizationService()
+        let scheduler = DiarizationScheduler(
+            ringBuffer: ring,
+            diarizer: mock,
+            registry: SpeakerRegistry(),
+            sourceTag: "microphone"
+        )
+
+        let results = await scheduler.processReadyWindows()
+        // The naive [0,45) window starts before the earliest retained time (40),
+        // so it must be dropped. The cursor fast-forwards to the earliest
+        // retained time (40) rather than the 45s grid, and the next fully
+        // resident window is [40,85) — diarized over exactly the 45 retained
+        // samples, with no partial [0,45) ever fed to the diarizer.
+        #expect(results.map(\.windowStart) == [40])
+        #expect(mock.calls.count == 1)
+        #expect(mock.calls.first?.sampleCount == 45)
+    }
+
     @Test func separatesSpeakersBySourceTag() async {
         // Two sources naming "speaker 0" are different people — cross-source
         // unification is the §9 dedup gate's job, not index aliasing.

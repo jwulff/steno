@@ -100,6 +100,39 @@ public actor AudioRingBuffer {
         return chunks.filter { $0.endTime > from && $0.startTime < to }
     }
 
+    /// Exactly the samples falling in the half-open span `[from, to)`,
+    /// concatenated in capture order. Unlike `window(from:to:)`, the first and
+    /// last boundary-straddling chunks are **trimmed to sample boundaries**, so
+    /// every returned frame lies in `[from, to)` and adjacent calls on abutting
+    /// spans never re-emit a frame. This sample-exactness is what keeps a
+    /// streaming diarizer's time base correct and its frame counter from being
+    /// double-fed (each frame is handed to the diarizer exactly once).
+    ///
+    /// Returns `[]` for an empty/inverted range or when no retained audio falls
+    /// in the span. The returned count is the number of frames actually present
+    /// in `[from, to)`; a caller wanting a *fully resident* span must compare it
+    /// against the expected width itself (the buffer cannot synthesize missing,
+    /// pruned, or not-yet-captured frames).
+    ///
+    /// Trimming uses each chunk's own `sampleRate` for the time→frame
+    /// conversion, rounding to the nearest frame so a boundary that lands
+    /// mid-sample is resolved consistently on both sides.
+    public func samples(from: TimeInterval, to: TimeInterval) -> [Float] {
+        guard to > from else { return [] }
+        var out: [Float] = []
+        for chunk in chunks where chunk.endTime > from && chunk.startTime < to {
+            let rate = chunk.sampleRate
+            guard rate > 0 else { continue }
+            let count = chunk.samples.count
+            // Frame offsets of [from, to) within this chunk, clamped to it.
+            let lo = max(0, Int(((from - chunk.startTime) * rate).rounded()))
+            let hi = min(count, Int(((to - chunk.startTime) * rate).rounded()))
+            guard lo < hi else { continue }
+            out.append(contentsOf: chunk.samples[lo..<hi])
+        }
+        return out
+    }
+
     /// Earliest retained sample time, or `nil` when empty. The scheduler uses
     /// this to know whether a window it wants is still fully resident.
     public func earliestTime() -> TimeInterval? { chunks.first?.startTime }

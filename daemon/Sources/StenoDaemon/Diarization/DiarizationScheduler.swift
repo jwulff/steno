@@ -92,12 +92,35 @@ public actor DiarizationScheduler {
     /// Close and diarize every chunk now fully captured, advancing the cursor
     /// past each. Returns the results produced (possibly empty). Safe to call
     /// repeatedly on a tick — only fully-resident chunks are closed.
+    ///
+    /// Before diarizing a `[from, to)` window the scheduler verifies the **full
+    /// span is still resident**. If the tick stalled long enough for retention
+    /// to prune past `from` (notably while the diarization models are still
+    /// downloading on first run), the window can no longer be reconstructed
+    /// faithfully; diarizing the truncated remainder as if it were `[from, to)`
+    /// would mislabel every segment's timestamp. In that case the cursor is
+    /// fast-forwarded to the earliest still-retained time (dropping the partial
+    /// audio, logged) rather than feeding partial audio to the diarizer.
     @discardableResult
     public func processReadyWindows() async -> [DiarizationWindowResult] {
         var results: [DiarizationWindowResult] = []
         while await ringBuffer.latestTime() >= nextWindowStart + windowLength {
             let from = nextWindowStart
             let to = from + windowLength
+
+            // Residency gate: the window's start must still be retained. If
+            // retention has advanced past `from`, fast-forward the cursor to the
+            // earliest retained time and drop the partial window. (`earliestTime`
+            // is nil only if the buffer emptied out from under us, which the
+            // latestTime() loop guard already precludes here, but handle it.)
+            if let earliest = await ringBuffer.earliestTime(), earliest > from {
+                DaemonLogger.diarization.warning(
+                    "Dropping partial diarization window [\(from, privacy: .public), \(to, privacy: .public)) for source \(self.sourceTag, privacy: .public): start pruned by retention (earliest=\(earliest, privacy: .public)); fast-forwarding cursor."
+                )
+                nextWindowStart = earliest
+                continue
+            }
+
             nextWindowStart = to
             if let result = await processWindow(from: from, to: to) {
                 results.append(result)
@@ -110,11 +133,15 @@ public actor DiarizationScheduler {
         from: TimeInterval,
         to: TimeInterval
     ) async -> DiarizationWindowResult? {
+        // Sample-rate provenance comes from the chunks overlapping the span;
+        // the actual audio is pulled sample-exact (boundary chunks trimmed) so
+        // each frame is fed to the streaming diarizer exactly once and the
+        // window's time base starts precisely at `from`.
         let chunks = await ringBuffer.window(from: from, to: to)
         guard let sampleRate = chunks.first?.sampleRate, sampleRate > 0 else {
             return nil
         }
-        let samples = chunks.flatMap(\.samples)
+        let samples = await ringBuffer.samples(from: from, to: to)
         guard !samples.isEmpty else { return nil }
 
         let model = await modelProvider()
