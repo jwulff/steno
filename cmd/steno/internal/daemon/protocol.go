@@ -74,6 +74,11 @@ type Event struct {
 	Paused             *bool    `json:"paused,omitempty"`
 	PausedIndefinitely *bool    `json:"pausedIndefinitely,omitempty"`
 	PauseExpiresAt     *float64 `json:"pauseExpiresAt,omitempty"`
+
+	// #61 — diarization speaker assignment. Carried on `speaker_label` events
+	// (and tolerated on any event that wants to include it). Empty for
+	// un-diarized events.
+	SpeakerID string `json:"speakerId,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.
@@ -106,4 +111,12 @@ func ResumeCmd() Command {
 // DemarcateCmd builds a `demarcate` command (atomic session boundary).
 func DemarcateCmd() Command {
 	return Command{Cmd: "demarcate"}
+}
+
+// ReconfigureCmd builds a `reconfigure` command that toggles system-audio
+// capture on the active session. The daemon performs an internal stop + start
+// to apply the new capture-source configuration and persists
+// `lastSystemAudioEnabled` so future auto-starts inherit the new value.
+func ReconfigureCmd(systemAudio bool) Command {
+	return Command{Cmd: "reconfigure", SystemAudio: BoolPtr(systemAudio)}
 }

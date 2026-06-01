@@ -111,6 +111,11 @@ type TopicSegment struct {
 	Text   string
 	Source string
 	SeqNum int
+
+	// SpeakerID is the diarization UUID assigned to this segment.
+	// Empty when the daemon has not clustered this row (pre-diarization
+	// session or short / unassigned segment).
+	SpeakerID string
 }
 
 // SummaryLoadedMsg carries the latest session summary.

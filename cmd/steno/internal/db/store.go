@@ -355,7 +355,7 @@ func (s *Store) SummariesForSession(sessionID string) ([]Summary, error) {
 // to all segments (including duplicates) is reserved for diagnostic SQL.
 func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND duplicate_of IS NULL
 		ORDER BY sequenceNumber ASC
@@ -373,7 +373,7 @@ func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segme
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
 		  AND duplicate_of IS NULL
@@ -390,7 +390,7 @@ func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, e
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time) ([]Segment, error) {
-	query := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+	query := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments WHERE sessionId = ? AND duplicate_of IS NULL`
 	args := []any{sessionID}
 
@@ -417,7 +417,7 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, error) {
-	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source
+	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments WHERE text LIKE ? ESCAPE '\' AND duplicate_of IS NULL`
 	args := []any{"%" + escapeLike(query) + "%"}
 
@@ -547,14 +547,23 @@ func scanSession(rows *sql.Rows) (Session, error) {
 }
 
 // scanSegments scans all segment rows.
+//
+// The SELECT list must match: id, sessionId, text, startedAt, endedAt,
+// confidence, sequenceNumber, createdAt, source, speaker_id.
+//
+// speaker_id arrived via the diarization track — it is NULL on rows that
+// predate the pipeline and on segments the daemon hasn't yet folded into
+// a cluster, so we scan into a NullString and only assign the field
+// when present (matches the confidence pattern above).
 func scanSegments(rows *sql.Rows) ([]Segment, error) {
 	var segments []Segment
 	for rows.Next() {
 		var seg Segment
 		var startedAt, endedAt, createdAt float64
 		var confidence sql.NullFloat64
+		var speakerID sql.NullString
 		if err := rows.Scan(&seg.ID, &seg.SessionID, &seg.Text,
-			&startedAt, &endedAt, &confidence, &seg.SequenceNumber, &createdAt, &seg.Source); err != nil {
+			&startedAt, &endedAt, &confidence, &seg.SequenceNumber, &createdAt, &seg.Source, &speakerID); err != nil {
 			return nil, fmt.Errorf("scan segment: %w", err)
 		}
 		seg.StartedAt = timeFromUnix(startedAt)
@@ -563,6 +572,9 @@ func scanSegments(rows *sql.Rows) ([]Segment, error) {
 		if confidence.Valid {
 			c := confidence.Float64
 			seg.Confidence = &c
+		}
+		if speakerID.Valid {
+			seg.SpeakerID = speakerID.String
 		}
 		segments = append(segments, seg)
 	}

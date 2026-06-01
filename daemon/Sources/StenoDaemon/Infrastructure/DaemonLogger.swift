@@ -13,4 +13,7 @@ public enum DaemonLogger {
 
     /// Summarization events.
     public static let summary = Logger(subsystem: "com.steno.daemon", category: "summary")
+
+    /// Diarization scheduling / windowing events.
+    public static let diarization = Logger(subsystem: "com.steno.daemon", category: "diarization")
 }

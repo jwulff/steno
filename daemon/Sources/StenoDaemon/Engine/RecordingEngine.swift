@@ -103,6 +103,39 @@ public actor RecordingEngine {
     /// avoid `log10(0) = -inf`.
     private var currentMicSegmentPeak: Float = 0
 
+    // MARK: - Diarization audio tee (#56)
+
+    /// Per-source rolling PCM history feeding the deferred diarization layer
+    /// (epic #53). The tee appends captured audio here in parallel with the
+    /// transcriber; the rolling-window scheduler (#58) reads windows back out.
+    /// Reset at each pipeline bring-up so each is a per-session timeline.
+    private let micRingBuffer = AudioRingBuffer()
+    private let sysRingBuffer = AudioRingBuffer()
+
+    // MARK: - Diarization pipeline (#61 wiring)
+
+    /// Shared across sources — a physical speaker resolves to one `SpeakerID`
+    /// regardless of stream.
+    private let speakerRegistry = SpeakerRegistry()
+    /// Per-source `DiarizationService` (FluidAudio-backed). Each owns its own
+    /// long-lived `SortformerDiarizer` / `LSEENDDiarizer`; within-source
+    /// speaker identity is stable across streamed chunks via the diarizer's
+    /// own tracking.
+    private let micDiarizer = DefaultDiarizationService()
+    private let sysDiarizer = DefaultDiarizationService()
+    /// Per-source sticky Sortformer → LS-EEND tier ladder (#60).
+    private let micTierController = DiarizationTierController()
+    private let sysTierController = DiarizationTierController()
+    private var micDiarizationScheduler: DiarizationScheduler?
+    private var sysDiarizationScheduler: DiarizationScheduler?
+    /// `true` once `prepareDiarization()` has finished loading both tier
+    /// models. Until then the tick is a no-op and the pipeline continues
+    /// without speaker labels.
+    private var diarizationModelsReady = false
+    /// 10 Hz tick that drains ready windows from both schedulers. Mirrors
+    /// `levelThrottleTask`'s lifecycle.
+    private var diarizationTickTask: Task<Void, Never>?
+
     // MARK: - U11 dedup-trigger debounce state
 
     /// Per-session trailing-edge debounce tasks. A fresh `saveSegment`
@@ -427,6 +460,12 @@ public actor RecordingEngine {
         let resumeFrom = (try? await repository.maxSegmentSequence(for: session.id)) ?? 0
         currentSequenceNumber = resumeFrom
         segmentCount = resumeFrom
+        // Diarization (#56): the audio streams are (re)created on each
+        // bring-up, so rewind the per-source PCM history + capture clock.
+        // Any pre-restart audio is non-contiguous with what follows and is
+        // intentionally discarded.
+        await micRingBuffer.reset()
+        await sysRingBuffer.reset()
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
         lastDeviceUID = deviceUIDProvider()
@@ -445,6 +484,9 @@ public actor RecordingEngine {
 
             // Start level throttle (emits audioLevel events at 10Hz)
             startLevelThrottle()
+            // Build/refresh diarization schedulers wired to the just-reset
+            // ring buffers; the tick task is created on the first bring-up.
+            startDiarizationScheduler()
 
             let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .microphone)
             micRecognizerHandle = recognizer
@@ -749,6 +791,12 @@ public actor RecordingEngine {
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
 
+        // Stop diarization tick (#61). The DefaultDiarizationService and
+        // SpeakerRegistry are kept on the engine — a future restart picks up
+        // where we left off in the next bring-up.
+        diarizationTickTask?.cancel()
+        diarizationTickTask = nil
+
         // End session, then run dedup + empty-session prune (U12). The
         // prune runs unconditionally on close; sessions that don't meet
         // any empty-criterion remain. Future U10 pause/demarcate close
@@ -926,6 +974,29 @@ public actor RecordingEngine {
                 segmentSequence = currentSequenceNumber
             }
 
+            // #64: carry the recognizer's audio-frame time (capture clock) for
+            // the diarization merge, independent of the wall-clock startedAt/
+            // endedAt that dedup, demarcation, and the TUI rely on.
+            //
+            // Bug 1 fix: `audioStart` and `audioEnd` must be NULL together. Only
+            // populate them when BOTH a start AND a strictly-positive duration
+            // are reported. A present-start / absent-or-nonpositive-duration
+            // result previously persisted `audioEnd == audioStart`, a
+            // zero-length span the diarization merge silently skips (overlap is
+            // always 0 against an empty span). Leave both nil in that case so
+            // the segment is honestly "no valid audio range" per the model docs.
+            let audioStart: TimeInterval?
+            let audioEnd: TimeInterval?
+            if let start = result.audioStartSeconds,
+                let duration = result.audioDurationSeconds,
+                duration > 0 {
+                audioStart = start
+                audioEnd = start + duration
+            } else {
+                audioStart = nil
+                audioEnd = nil
+            }
+
             let segment = StoredSegment(
                 sessionId: routingSessionId,
                 text: result.text,
@@ -935,7 +1006,9 @@ public actor RecordingEngine {
                 sequenceNumber: segmentSequence,
                 source: result.source,
                 healMarker: healMarker,
-                micPeakDb: micPeakDb
+                micPeakDb: micPeakDb,
+                audioStart: audioStart,
+                audioEnd: audioEnd
             )
 
             // Persist
@@ -1470,12 +1543,22 @@ public actor RecordingEngine {
         struct Box: @unchecked Sendable {
             let source: AsyncStream<AVAudioPCMBuffer>
             let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+            let ringBuffer: AudioRingBuffer
         }
         let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
-        let box = Box(source: source, continuation: cont)
+        let box = Box(
+            source: source,
+            continuation: cont,
+            ringBuffer: isMic ? micRingBuffer : sysRingBuffer
+        )
         Task.detached { [weak self] in
             for await buffer in box.source {
                 let peak = RecordingEngine.peakLevel(buffer)
+                // Copy mono samples for diarization before handing the buffer
+                // downstream, so we never read it concurrently with the
+                // transcriber feed.
+                let samples = RecordingEngine.monoSamples(buffer)
+                let sampleRate = buffer.format.sampleRate
                 if isMic {
                     await self?.updateMicLevel(peak)
                 } else {
@@ -1483,10 +1566,56 @@ public actor RecordingEngine {
                 }
                 nonisolated(unsafe) let b = buffer
                 box.continuation.yield(b)
+                // Append after yielding so diarization buffering never adds
+                // latency to the live transcript. The ring buffer is its own
+                // actor — this does not touch RecordingEngine's isolation.
+                await box.ringBuffer.append(samples: samples, sampleRate: sampleRate)
             }
             box.continuation.finish()
         }
         return stream
+    }
+
+    /// Downmix a float PCM buffer to a single mono channel as a value-type
+    /// sample array for the diarization ring buffer. Empty for a non-float /
+    /// empty buffer.
+    ///
+    /// Bug 3 fix: system audio is captured 2-channel, so the previous
+    /// channel-0-only extraction discarded the entire right channel —
+    /// potentially half the speech energy — before diarization ever saw it.
+    /// We now average across ALL channels (channelCount divisor) so a stereo
+    /// source contributes both channels. The 1-channel case is a pass-through
+    /// (average of one channel == that channel) and stays allocation-cheap.
+    static func monoSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let floatChannelData = buffer.floatChannelData else { return [] }
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return [] }
+
+        let channelCount = Int(buffer.format.channelCount)
+        guard channelCount > 1 else {
+            // Single channel: direct copy, no averaging needed.
+            return Array(UnsafeBufferPointer(start: floatChannelData[0], count: frameLength))
+        }
+
+        let scale = 1.0 / Float(channelCount)
+        var mono = [Float](repeating: 0, count: frameLength)
+        for channel in 0..<channelCount {
+            let data = floatChannelData[channel]
+            for frame in 0..<frameLength {
+                mono[frame] += data[frame] * scale
+            }
+        }
+        return mono
+    }
+
+    /// A window of buffered audio for one source, on the frame-counted capture
+    /// clock. Consumed by the rolling-window diarization scheduler (#58).
+    func diarizationWindow(
+        isMic: Bool,
+        from: TimeInterval,
+        to: TimeInterval
+    ) async -> [PCMChunk] {
+        await (isMic ? micRingBuffer : sysRingBuffer).window(from: from, to: to)
     }
 
     private func updateMicLevel(_ peak: Float) {
@@ -1539,6 +1668,181 @@ public actor RecordingEngine {
         guard p > 0 else { return -90.0 }
         let db = 20.0 * log10(min(p, 1.0))
         return max(-90.0, db)
+    }
+
+    // MARK: - Diarization pipeline (#61 wiring)
+
+    /// Download (cached) FluidAudio models for both tier diarizers in parallel.
+    /// Until this returns successfully, the tick is a no-op and recording
+    /// continues without speaker labels. Idempotent — safe to call repeatedly.
+    /// Errors are surfaced as a transient `.error` event; the engine keeps
+    /// running mic-only diarization-less.
+    public func prepareDiarization() async {
+        guard !diarizationModelsReady else { return }
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { try await self.micDiarizer.prepareModels() }
+                group.addTask { try await self.sysDiarizer.prepareModels() }
+                try await group.waitForAll()
+            }
+            diarizationModelsReady = true
+        } catch {
+            await emit(.error(
+                "Diarization models failed to load: \(error.localizedDescription)",
+                isTransient: true
+            ))
+        }
+    }
+
+    /// Build per-source schedulers and start the 10 Hz drain task. Called from
+    /// `bringUpPipelines` on every bring-up. The schedulers are rebuilt each
+    /// time so their cursor restarts at 0 alongside the ring buffers (which
+    /// reset together); the diarizer instances persist so within-source
+    /// speaker identity carries across pipeline restarts. The tick task is
+    /// idempotent — only created on first bring-up.
+    private func startDiarizationScheduler() {
+        let micTier = micTierController
+        let sysTier = sysTierController
+
+        micDiarizationScheduler = DiarizationScheduler(
+            ringBuffer: micRingBuffer,
+            diarizer: micDiarizer,
+            registry: speakerRegistry,
+            sourceTag: AudioSourceType.microphone.rawValue,
+            modelProvider: { [micTier] in await micTier.currentModel() }
+        )
+        sysDiarizationScheduler = DiarizationScheduler(
+            ringBuffer: sysRingBuffer,
+            diarizer: sysDiarizer,
+            registry: speakerRegistry,
+            sourceTag: AudioSourceType.systemAudio.rawValue,
+            modelProvider: { [sysTier] in await sysTier.currentModel() }
+        )
+
+        if diarizationTickTask == nil {
+            diarizationTickTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(100))
+                    await self?.tickDiarization()
+                }
+            }
+        }
+    }
+
+    /// One drain iteration. Skipped entirely until models are ready so the
+    /// scheduler doesn't attempt to call into an uninitialised diarizer.
+    private func tickDiarization() async {
+        guard diarizationModelsReady else { return }
+        if let micScheduler = micDiarizationScheduler {
+            for result in await micScheduler.processReadyWindows() {
+                await applyDiarizationResult(result, isMic: true)
+            }
+        }
+        if let sysScheduler = sysDiarizationScheduler {
+            for result in await sysScheduler.processReadyWindows() {
+                await applyDiarizationResult(result, isMic: false)
+            }
+        }
+    }
+
+    /// Apply a closed window's diarization result to the session's stored
+    /// segments: run the timestamp merge, propagate the dedup-gate inheritance,
+    /// persist any new/changed labels via `updateSpeaker`, and emit a
+    /// `speakerLabel` event so live clients can update without re-fetching from
+    /// the DB. Also feeds the tier controller the distinct-speaker count for its
+    /// escalation decision.
+    ///
+    /// Bug 4 fix: the merge now sources its candidate segments from the DB
+    /// (`repository.segments(for:)`) rather than only the in-memory
+    /// `recent…Segments` snapshot. A transcript segment whose audio falls in
+    /// this window but which finalized *after* the window's diarization tick
+    /// (e.g. a 40–44s segment that lands just past the 45s boundary) was absent
+    /// from the in-memory snapshot at assign time and — because the *next*
+    /// window [45,90) has no temporal overlap with it — never got revisited,
+    /// leaving `speaker_id` permanently NULL. Re-querying stored segments per
+    /// window and re-assigning any not-yet-labeled segment that overlaps the
+    /// window range backfills these late finalizers. Idempotent: a segment
+    /// already carrying the same speaker is neither re-written nor re-emitted.
+    ///
+    /// Bug 2 fix: duplicates (`duplicateOf != nil`) are never diarized directly
+    /// (the §9 dedup gate); they inherit the canonical segment's speaker via
+    /// `SpeakerLabelMerger.inheritedLabels`. That inheritance was never wired,
+    /// so duplicate rows kept a NULL `speaker_id`. We now build the canonical
+    /// speaker map from both this window's fresh assignments AND any
+    /// already-persisted canonical labels, then propagate to the duplicates.
+    func applyDiarizationResult(_ result: DiarizationWindowResult, isMic: Bool) async {
+        let distinct = Set(result.segments.map(\.speaker.raw)).count
+        let source: AudioSourceType
+        if isMic {
+            await micTierController.observe(speakerCount: distinct)
+            source = .microphone
+        } else {
+            await sysTierController.observe(speakerCount: distinct)
+            source = .systemAudio
+        }
+
+        // Determine which session these segments belong to. During recording
+        // this is the live session; outside it (no active session) there is
+        // nothing to label.
+        guard let sessionId = currentSession?.id else { return }
+
+        // Bug 4: pull the freshest stored view rather than the in-memory
+        // snapshot so late-finalized segments covered by this window are seen.
+        let stored: [StoredSegment]
+        do {
+            stored = try await repository.segments(for: sessionId)
+                .filter { $0.source == source }
+        } catch {
+            await emit(.error(
+                "Failed to load segments for diarization merge: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            return
+        }
+
+        // Canonical (non-duplicate) assignments by max temporal overlap.
+        let assignments = SpeakerLabelMerger.assign(window: result, segments: stored)
+
+        // Bug 2: canonical map = this window's assignments unioned with any
+        // canonical label already persisted in a prior window. A duplicate may
+        // point at a canonical that was labeled earlier, so the persisted
+        // labels matter, not just the current batch.
+        var canonicalSpeaker = assignments
+        for segment in stored where segment.duplicateOf == nil {
+            if let existing = segment.speakerId, canonicalSpeaker[segment.id] == nil {
+                canonicalSpeaker[segment.id] = existing
+            }
+        }
+
+        let duplicates = stored.filter { $0.duplicateOf != nil }
+        let inherited = SpeakerLabelMerger.inheritedLabels(
+            duplicates: duplicates,
+            canonicalSpeaker: canonicalSpeaker
+        )
+
+        // Persist canonical + inherited labels. Skip no-op writes/events where
+        // the segment already carries the target speaker (idempotent re-merge).
+        let segmentsById = Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) })
+        for (segmentId, speakerUUID) in assignments.merging(inherited, uniquingKeysWith: { lhs, _ in lhs }) {
+            guard let segment = segmentsById[segmentId] else { continue }
+            if segment.speakerId == speakerUUID { continue }
+            do {
+                try await repository.updateSpeaker(
+                    segmentId: segmentId,
+                    speakerId: speakerUUID
+                )
+                await emit(.speakerLabel(
+                    sessionId: segment.sessionId,
+                    sequenceNumber: segment.sequenceNumber,
+                    speakerId: speakerUUID
+                ))
+            } catch {
+                await emit(.error(
+                    "Failed to persist speaker label: \(error.localizedDescription)",
+                    isTransient: true
+                ))
+            }
+        }
     }
 
     // MARK: - U11 Dedup-Trigger Debounce
@@ -2408,6 +2712,8 @@ public actor RecordingEngine {
         systemAudioSource = nil
         levelThrottleTask?.cancel()
         levelThrottleTask = nil
+        diarizationTickTask?.cancel()
+        diarizationTickTask = nil
         currentSession = nil
         micBackoff = BackoffPolicy()
         sysBackoff = BackoffPolicy()

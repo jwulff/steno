@@ -383,6 +383,15 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func updateSpeaker(segmentId: UUID, speakerId: UUID?) async throws {
+        try await dbQueue.write { db in
+            try db.execute(
+                sql: "UPDATE segments SET speaker_id = ? WHERE id = ?",
+                arguments: [speakerId?.uuidString, segmentId.uuidString]
+            )
+        }
+    }
+
     public func advanceDedupCursor(sessionId: UUID, toSequence: Int) async throws {
         try await dbQueue.write { db in
             // GREATEST-style guard: never let the cursor move backwards.

@@ -42,6 +42,16 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     /// NULL for non-mic segments and for older rows.
     var micPeakDb: Double?
 
+    /// #64: audio-frame start/end in seconds on the source's capture clock —
+    /// the diarization join axis. NULL when the recognizer reported no valid
+    /// range or for rows persisted before #64.
+    var audioStart: Double?
+    var audioEnd: Double?
+
+    /// #61: global speaker UUID assigned by the diarization merge. NULL until a
+    /// covering window finalizes (and may be revised).
+    var speakerId: String?
+
     enum CodingKeys: String, CodingKey {
         case id, sessionId, text, startedAt, endedAt, confidence
         case sequenceNumber, createdAt, source
@@ -49,6 +59,9 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
         case dedupMethod = "dedup_method"
         case healMarker = "heal_marker"
         case micPeakDb = "mic_peak_db"
+        case audioStart = "audio_start"
+        case audioEnd = "audio_end"
+        case speakerId = "speaker_id"
     }
 
     /// Convert to domain model.
@@ -76,7 +89,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             healMarker: healMarker,
             duplicateOf: dupUUID,
             dedupMethod: method,
-            micPeakDb: micPeakDb
+            micPeakDb: micPeakDb,
+            audioStart: audioStart,
+            audioEnd: audioEnd,
+            speakerId: speakerId.flatMap { UUID(uuidString: $0) }
         )
     }
 
@@ -106,7 +122,10 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             duplicateOf: segment.duplicateOf?.uuidString,
             dedupMethod: segment.dedupMethod?.rawValue,
             healMarker: segment.healMarker,
-            micPeakDb: segment.micPeakDb
+            micPeakDb: segment.micPeakDb,
+            audioStart: segment.audioStart,
+            audioEnd: segment.audioEnd,
+            speakerId: segment.speakerId?.uuidString
         )
     }
 }

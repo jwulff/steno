@@ -176,6 +176,17 @@ struct RunCommand: ParsableCommand {
                     log.error("Auto-start failed: \(error). Engine remains in error state; awaiting external resume.")
                 }
 
+                // 5c. Kick off FluidAudio diarization model load in the
+                // background. First run downloads from HuggingFace; subsequent
+                // runs use the cache. The tick task is already running
+                // (created in the auto-start above) and gates on
+                // `diarizationModelsReady`, so it stays a no-op until this
+                // completes. Recording proceeds mic-only / sys-only without
+                // speaker labels until then.
+                Task.detached {
+                    await engine.prepareDiarization()
+                }
+
                 // 6. Start socket server
                 let server = UnixSocketServer()
                 let sockPath = socketPath ?? DaemonPaths.socketPath
