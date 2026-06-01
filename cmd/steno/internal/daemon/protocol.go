@@ -79,6 +79,16 @@ type Event struct {
 	// (and tolerated on any event that wants to include it). Empty for
 	// un-diarized events.
 	SpeakerID string `json:"speakerId,omitempty"`
+
+	// #62 — model_status event payload. The daemon emits
+	// `event:"model_status"` whenever an on-device model pipeline changes
+	// readiness. `Component` is "transcription" (Layer A — the live
+	// transcript itself) or "diarization" (Layer B — speaker labels).
+	// `State` is "preparing", "ready", or "unavailable". `Reason` is
+	// present ONLY when State == "unavailable".
+	Component string `json:"component,omitempty"`
+	State     string `json:"state,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.

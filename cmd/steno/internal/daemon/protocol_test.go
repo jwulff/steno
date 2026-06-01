@@ -239,6 +239,47 @@ func TestEventTopics(t *testing.T) {
 	}
 }
 
+func TestEventModelStatusReady(t *testing.T) {
+	j := `{"event":"model_status","component":"transcription","state":"ready"}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if ev.Event != "model_status" {
+		t.Errorf("event = %q, want model_status", ev.Event)
+	}
+	if ev.Component != "transcription" {
+		t.Errorf("component = %q, want transcription", ev.Component)
+	}
+	if ev.State != "ready" {
+		t.Errorf("state = %q, want ready", ev.State)
+	}
+	if ev.Reason != "" {
+		t.Errorf("reason = %q, want empty (no reason on ready)", ev.Reason)
+	}
+}
+
+func TestEventModelStatusUnavailableWithReason(t *testing.T) {
+	j := `{"event":"model_status","component":"diarization","state":"unavailable","reason":"Speaker diarization isn't available on this Mac."}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if ev.Component != "diarization" {
+		t.Errorf("component = %q, want diarization", ev.Component)
+	}
+	if ev.State != "unavailable" {
+		t.Errorf("state = %q, want unavailable", ev.State)
+	}
+	if ev.Reason != "Speaker diarization isn't available on this Mac." {
+		t.Errorf("reason = %q", ev.Reason)
+	}
+}
+
 func TestBoolPtr(t *testing.T) {
 	p := BoolPtr(true)
 	if p == nil || !*p {

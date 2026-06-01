@@ -25,6 +25,20 @@ final class MockDiarizationService: DiarizationService, @unchecked Sendable {
     /// When set, `diarize` throws this instead of returning a result.
     var errorToThrow: Error?
 
+    /// When set, `prepareModels` throws this (#62 — drives the diarization
+    /// model-unavailable branch). Nil → preparation succeeds.
+    var prepareError: Error?
+
+    /// Number of times `prepareModels` was invoked.
+    private(set) var prepareCallCount = 0
+
+    func prepareModels() async throws {
+        prepareCallCount += 1
+        if let prepareError {
+            throw prepareError
+        }
+    }
+
     func diarize(
         samples: [Float],
         sampleRate: Double,

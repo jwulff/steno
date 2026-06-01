@@ -53,6 +53,11 @@ public enum EngineEvent: Sendable {
     /// already happened via `repository.updateSpeaker`; this event lets the
     /// TUI update the in-memory segment without re-fetching from the DB.
     case speakerLabel(sessionId: UUID, sequenceNumber: Int, speakerId: UUID)
+
+    /// Ephemeral: an on-device model pipeline changed readiness (#62). Lets the
+    /// TUI show "preparing model" / "unavailable" states for transcription
+    /// (Layer A) and diarization (Layer B) instead of failing silently.
+    case modelStatus(ModelComponent, ModelReadiness)
 }
 
 /// Status of the recording engine.
@@ -72,6 +77,14 @@ public enum EngineStatus: String, Sendable, Codable {
     /// `pause_expires_at` / `paused_indefinitely` columns so a daemon
     /// restart re-enters this state (R-F privacy invariant).
     case paused
+    /// On-device transcription can't run on this machine (#62): unsupported
+    /// hardware (no 16-core Neural Engine / Simulator), an unsupported locale,
+    /// or a failed ASR model download. Terminal-but-not-a-crash — distinct from
+    /// `.error` (which is recoverable). The daemon stays up; the paired
+    /// `model_status` event carries the human-readable reason. Not restartable
+    /// via `start()` (the condition is a property of the hardware/locale, not a
+    /// transient fault), so the `start` guards deliberately exclude it.
+    case unsupported
 }
 
 /// Delegate that receives events from the RecordingEngine.

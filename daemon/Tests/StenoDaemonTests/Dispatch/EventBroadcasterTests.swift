@@ -129,6 +129,32 @@ struct EventBroadcasterTests {
         #expect(events[0].modelProcessing == true)
     }
 
+    @Test func modelStatusEventMapped() async throws {
+        let broadcaster = EventBroadcaster()
+        let client = MockClientConnection()
+        await broadcaster.subscribe(client: client, events: [.modelStatus])
+
+        let engine = await makeTestEngine()
+        await broadcaster.engine(
+            engine,
+            didEmit: .modelStatus(.transcription, .preparing)
+        )
+        await broadcaster.engine(
+            engine,
+            didEmit: .modelStatus(.diarization, .unavailable(reason: "download failed"))
+        )
+
+        let events = await client.sentEvents
+        #expect(events.count == 2)
+        #expect(events[0].event == "model_status")
+        #expect(events[0].component == "transcription")
+        #expect(events[0].state == "preparing")
+        #expect(events[0].reason == nil)
+        #expect(events[1].component == "diarization")
+        #expect(events[1].state == "unavailable")
+        #expect(events[1].reason == "download failed")
+    }
+
     @Test func topicsEventMapped() async throws {
         let broadcaster = EventBroadcaster()
         let client = MockClientConnection()

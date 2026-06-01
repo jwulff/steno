@@ -12,6 +12,9 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     /// #61 — a transcript segment had a speaker assigned (or revised) by the
     /// diarization merge. Carries `sessionId`, `sequenceNumber`, `speakerId`.
     case speakerLabel
+    /// #62 — an on-device model pipeline changed readiness (transcription /
+    /// diarization preparing / ready / unavailable).
+    case modelStatus
 }
 
 /// Broadcasts engine events to subscribed socket clients.
@@ -164,6 +167,16 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 sessionId: sessionId.uuidString,
                 sequenceNumber: sequenceNumber,
                 speakerId: speakerId.uuidString
+            ))
+
+        // #62: model readiness for Layer A (transcription) / Layer B
+        // (diarization). `reason` is populated only for the unavailable state.
+        case .modelStatus(let component, let readiness):
+            return (.modelStatus, DaemonEvent(
+                event: "model_status",
+                component: component.rawValue,
+                state: readiness.wireState,
+                reason: readiness.reason
             ))
         }
     }

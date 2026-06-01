@@ -98,7 +98,10 @@ struct RunCommand: ParsableCommand {
                     dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
                     emptySessionMinChars: settings.emptySessionMinChars,
                     emptySessionMinDurationSeconds: settings.emptySessionMinDurationSeconds,
-                    retentionDays: settings.retentionDays
+                    retentionDays: settings.retentionDays,
+                    // #62: real Layer-A availability gate (hardware + ASR asset).
+                    // Tests default to the permissive `ReadyTranscriptionModelGate`.
+                    transcriptionGate: DefaultTranscriptionModelGate()
                 )
 
                 let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
