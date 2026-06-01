@@ -93,6 +93,16 @@ actor MockRecordingEngineDelegate: RecordingEngineDelegate {
         }
     }
 
+    /// All model-readiness events (#62) as (component, readiness) pairs.
+    var modelStatuses: [(ModelComponent, ModelReadiness)] {
+        events.compactMap {
+            if case .modelStatus(let component, let readiness) = $0 {
+                return (component, readiness)
+            }
+            return nil
+        }
+    }
+
     func reset() {
         events.removeAll()
     }

@@ -252,6 +252,19 @@ public actor CommandDispatcher {
         }
 
         await broadcaster.subscribe(client: client, events: eventTypes)
+
+        // #62: replay current model readiness to the just-subscribed client.
+        // Startup `model_status` events are emitted (during auto-start) before
+        // the socket accepts connections, so a TUI connecting afterward — e.g.
+        // to an already-`.unsupported` Mac — would otherwise never learn the
+        // state. `replay` filters by the client's subscription.
+        let readiness = await engine.currentModelReadiness().map {
+            EngineEvent.modelStatus($0.0, $0.1)
+        }
+        if !readiness.isEmpty {
+            await broadcaster.replay(readiness, toClient: client.id)
+        }
+
         return DaemonResponse.success()
     }
 }

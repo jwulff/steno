@@ -12,6 +12,9 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     /// #61 — a transcript segment had a speaker assigned (or revised) by the
     /// diarization merge. Carries `sessionId`, `sequenceNumber`, `speakerId`.
     case speakerLabel
+    /// #62 — an on-device model pipeline changed readiness (transcription /
+    /// diarization preparing / ready / unavailable).
+    case modelStatus
 }
 
 /// Broadcasts engine events to subscribed socket clients.
@@ -41,6 +44,25 @@ public actor EventBroadcaster: RecordingEngineDelegate {
 
     nonisolated public func engine(_ engine: RecordingEngine, didEmit event: EngineEvent) async {
         await broadcast(event)
+    }
+
+    /// Send specific events to a single already-subscribed client, honoring its
+    /// subscription filter (#62). Used to replay current model readiness to a
+    /// client that connected after the daemon first emitted it, so a late TUI
+    /// learns an `.unsupported` / preparing state it would otherwise miss.
+    public func replay(_ events: [EngineEvent], toClient clientId: UUID) async {
+        guard let sub = subscriptions[clientId] else { return }
+        for event in events {
+            let (eventType, daemonEvent) = mapEvent(event)
+            guard sub.events.contains(eventType) else { continue }
+            guard let data = try? encoder.encode(daemonEvent) else { continue }
+            do {
+                try await sub.client.send(data + Data("\n".utf8))
+            } catch {
+                subscriptions.removeValue(forKey: clientId)
+                return
+            }
+        }
     }
 
     private func broadcast(_ event: EngineEvent) async {
@@ -164,6 +186,16 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 sessionId: sessionId.uuidString,
                 sequenceNumber: sequenceNumber,
                 speakerId: speakerId.uuidString
+            ))
+
+        // #62: model readiness for Layer A (transcription) / Layer B
+        // (diarization). `reason` is populated only for the unavailable state.
+        case .modelStatus(let component, let readiness):
+            return (.modelStatus, DaemonEvent(
+                event: "model_status",
+                component: component.rawValue,
+                state: readiness.wireState,
+                reason: readiness.reason
             ))
         }
     }

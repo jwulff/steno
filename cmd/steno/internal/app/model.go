@@ -74,6 +74,21 @@ const MicOrScreenPermissionRevoked = "MIC_OR_SCREEN_PERMISSION_REVOKED"
 // `RecordingEngine.systemAudioParkedNoDisplayToken` in the daemon.
 const SystemAudioParkedNoDisplay = "SYSTEM_AUDIO_PARKED_NO_DISPLAY"
 
+// #62 — model_status wire vocabulary. These mirror the strings the
+// daemon emits on `event:"model_status"`. Treat them as load-bearing:
+// changing a value here without matching the Swift emitter silently
+// breaks the readiness surface.
+const (
+	// Components.
+	ModelComponentTranscription = "transcription" // Layer A — the transcript
+	ModelComponentDiarization   = "diarization"   // Layer B — speaker labels
+
+	// States.
+	ModelStatePreparing   = "preparing"
+	ModelStateReady       = "ready"
+	ModelStateUnavailable = "unavailable"
+)
+
 // firstLaunchMarkerFile is the on-disk marker that suppresses the
 // always-on consent banner after first dismissal. Lives in the same
 // Application Support directory as the daemon socket and DB.
@@ -138,12 +153,12 @@ type Model struct {
 	// but the U9 status bar reads `engineStatus` first. The Swift daemon
 	// only emits `recording: bool` on `event:"status"` today, so the
 	// translation lives in handleEvent.
-	recording   bool
+	recording    bool
 	engineStatus EngineStatus
-	sessionID   string
-	deviceName  string
-	systemAudio bool
-	devices     []string
+	sessionID    string
+	deviceName   string
+	systemAudio  bool
+	devices      []string
 
 	// Pause state (U9 / U10 wire)
 	pauseExpiresAt     *time.Time // nil for indefinite or not-paused
@@ -173,6 +188,28 @@ type Model struct {
 	// recent finalized segment so the status bar can render
 	// "last segment Ns ago" with a yellow escalation at >=60s.
 	lastSegmentAt time.Time
+
+	// #62: on-device model readiness, tracked separately per pipeline.
+	//
+	// `transcriptionState` reflects the Layer-A speech model — the live
+	// transcript itself. `unavailable` here is the SERIOUS case: this Mac
+	// physically can't transcribe (e.g. lacks the required Neural Engine),
+	// so it's surfaced as a prominent, persistent banner carrying
+	// `transcriptionReason`. `preparing` shows a subtle "⏳ Preparing
+	// transcription model…" indicator; `ready` (or "") clears both.
+	//
+	// `diarizationState` reflects the Layer-B speaker-labelling model. It
+	// is SOFT: the transcript works fine regardless, only speaker labels
+	// are affected, so `preparing` / `unavailable` are surfaced as quiet
+	// hints, never alarmingly. `unavailable` means "no speaker labels",
+	// not an error. `ready` (or "") clears the hint.
+	//
+	// All four are zero-valued ("") until the daemon emits a
+	// `model_status` event for the corresponding component.
+	transcriptionState  string
+	transcriptionReason string
+	diarizationState    string
+	diarizationReason   string
 
 	// Transcript
 	entries  []TranscriptEntry
@@ -1072,6 +1109,30 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			m.modelProcessing = *ev.ModelProcessing
 		}
 
+	case "model_status":
+		// #62: an on-device model pipeline changed readiness. Track
+		// transcription (Layer A) and diarization (Layer B) independently.
+		// `ready` clears any prior preparing / unavailable indicator for
+		// that component. `reason` is only meaningful for `unavailable`,
+		// so we clear it on every non-unavailable transition.
+		switch ev.Component {
+		case ModelComponentTranscription:
+			m.transcriptionState = ev.State
+			if ev.State == ModelStateUnavailable {
+				m.transcriptionReason = ev.Reason
+			} else {
+				m.transcriptionReason = ""
+			}
+		case ModelComponentDiarization:
+			m.diarizationState = ev.State
+			if ev.State == ModelStateUnavailable {
+				m.diarizationReason = ev.Reason
+			} else {
+				m.diarizationReason = ""
+			}
+		}
+		return nil
+
 	case "speaker_label":
 		// #61: the diarization merge assigned (or revised) a speaker for a
 		// segment we already have in the live view. Find it by sequenceNumber
@@ -1340,16 +1401,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	// `i` / `I` (cycle input device) was removed in the cluster-4 review
-	// pass — the keybind mutated `m.deviceIndex` / `m.deviceName` locally
-	// but never sent a daemon command, so the displayed device drifted
-	// from the active capture device. See `keymap.go` for rationale.
-	//
-	// `a` / `A` (toggle system-audio capture) was removed for the same
-	// reason: it only flipped `m.systemAudio` locally and sent no
-	// command. The daemon's capture configuration is set at startup
-	// from `StenoSettings.lastSystemAudioEnabled` and is not toggleable
-	// mid-flight. See `keymap.go` for rationale.
+		// `i` / `I` (cycle input device) was removed in the cluster-4 review
+		// pass — the keybind mutated `m.deviceIndex` / `m.deviceName` locally
+		// but never sent a daemon command, so the displayed device drifted
+		// from the active capture device. See `keymap.go` for rationale.
+		//
+		// `a` / `A` (toggle system-audio capture) was removed for the same
+		// reason: it only flipped `m.systemAudio` locally and sent no
+		// command. The daemon's capture configuration is set at startup
+		// from `StenoSettings.lastSystemAudioEnabled` and is not toggleable
+		// mid-flight. See `keymap.go` for rationale.
 	}
 
 	return m, nil
@@ -1414,6 +1475,13 @@ func (m Model) View() string {
 		sections = append(sections, m.renderFirstLaunchBanner())
 	}
 
+	// #62: persistent transcription-unavailable banner. This Mac can't
+	// transcribe at all, so surface it prominently above the timeline and
+	// keep it there until the daemon reports otherwise.
+	if m.transcriptionState == ModelStateUnavailable {
+		sections = append(sections, m.renderTranscriptionUnavailableBanner())
+	}
+
 	// Main content: topics | transcript
 	sections = append(sections, m.renderMainContent())
 
@@ -1445,6 +1513,24 @@ func (m Model) renderFirstLaunchBanner() string {
 	wrapped := wrapText(firstLaunchBanner, w)
 	body := strings.Join(wrapped, "\n")
 	return ui.FirstLaunchBannerStyle.Render(body)
+}
+
+// renderTranscriptionUnavailableBanner shows the #62 prominent, persistent
+// banner when the on-device transcription model is unavailable on this Mac.
+// Headline plus the daemon-supplied reason (e.g. the Neural-Engine
+// requirement), wrapped to fit the terminal width.
+func (m Model) renderTranscriptionUnavailableBanner() string {
+	w := m.width - 4
+	if w < 20 {
+		w = 20
+	}
+	headline := "Transcription unavailable — this Mac can't transcribe."
+	body := headline
+	if m.transcriptionReason != "" {
+		body += "\n" + m.transcriptionReason
+	}
+	wrapped := wrapText(body, w)
+	return ui.ModelUnavailableBannerStyle.Render(strings.Join(wrapped, "\n"))
 }
 
 // renderErrorModal renders the U9 error-history overlay.
@@ -1521,7 +1607,37 @@ func (m Model) renderStatusBar() string {
 		hint = ui.DimStyle.Render("press p to resume first")
 	}
 
-	return composeStatusBar(state, lastSeg, lastSegPriority, meters, processing, hint, m.width)
+	// #62: subtle model-readiness hints (transcription "preparing", and
+	// the soft diarization states). The serious transcription-unavailable
+	// case is NOT here — it gets the prominent banner in View().
+	modelHint := m.modelStatusHint()
+
+	return composeStatusBar(state, lastSeg, lastSegPriority, meters, processing, modelHint, hint, m.width)
+}
+
+// modelStatusHint builds the subtle status-bar annotation for the #62
+// model-readiness states that don't warrant the prominent banner:
+//
+//   - transcription "preparing" → "⏳ Preparing transcription model…"
+//   - diarization "preparing"   → "Preparing speaker labels…"
+//   - diarization "unavailable" → "Speaker labels unavailable"
+//
+// Transcription "preparing" takes precedence over the (soft) diarization
+// hints when both apply — the user cares more about the transcript itself
+// coming online than about speaker labels. Returns "" when nothing soft
+// is pending. Transcription "unavailable" deliberately returns ""
+// (handled by the prominent banner, not this subtle line).
+func (m Model) modelStatusHint() string {
+	if m.transcriptionState == ModelStatePreparing {
+		return ui.ModelPreparingStyle.Render("⏳ Preparing transcription model…")
+	}
+	switch m.diarizationState {
+	case ModelStatePreparing:
+		return ui.DimStyle.Render("Preparing speaker labels…")
+	case ModelStateUnavailable:
+		return ui.DimStyle.Render("Speaker labels unavailable")
+	}
+	return ""
 }
 
 // statusLabel returns the leading state token and whether the daemon is
@@ -1548,7 +1664,7 @@ func (m Model) statusLabel() (label string, recordingish bool) {
 
 	// Permission-revoked surface is a more-specific FAILED variant.
 	if m.permissionRevoked {
-		return ui.FailedStyle.Render("✗ "+MicOrScreenPermissionRevoked+" — grant in System Settings"), false
+		return ui.FailedStyle.Render("✗ " + MicOrScreenPermissionRevoked + " — grant in System Settings"), false
 	}
 
 	switch m.engineStatus {
@@ -1643,8 +1759,11 @@ func (m Model) lastSegmentAnnotation(isRecording bool) (text string, highPriorit
 //
 // Width=0 (no WindowSizeMsg yet) means render everything — no truncation.
 //
-// Hint sits on the right edge of the bar when present.
-func composeStatusBar(state, lastSeg string, lastSegHigh bool, meters, processing, hint string, width int) string {
+// Hint sits on the right edge of the bar when present. `modelHint` is the
+// subtle #62 model-readiness annotation; it's the first thing dropped
+// under width pressure (it's purely informational) but kept ahead of the
+// transient pause hint.
+func composeStatusBar(state, lastSeg string, lastSegHigh bool, meters, processing, modelHint, hint string, width int) string {
 	parts := []string{state}
 	suffixes := []string{} // appended after state, joined with "  "
 
@@ -1656,6 +1775,9 @@ func composeStatusBar(state, lastSeg string, lastSegHigh bool, meters, processin
 	}
 	if processing != "" {
 		suffixes = append(suffixes, processing)
+	}
+	if modelHint != "" {
+		suffixes = append(suffixes, modelHint)
 	}
 	if hint != "" {
 		suffixes = append(suffixes, hint)
@@ -1670,13 +1792,14 @@ func composeStatusBar(state, lastSeg string, lastSegHigh bool, meters, processin
 	//   2. level meters
 	//   3. last-seg (high priority — yellow warn)
 	//   4. AI processing spinner
+	//   5. #62 model-readiness hint (subtle)
 	// We keep popping until the line fits.
 	composed := func() string {
 		return strings.Join(append([]string{state}, suffixes...), "  ")
 	}
 	for lipgloss.Width(composed()) > width && len(suffixes) > 0 {
 		// Find the lowest-priority remaining suffix and drop it.
-		idx := lowestPriorityIdx(suffixes, lastSeg, lastSegHigh, meters, processing, hint)
+		idx := lowestPriorityIdx(suffixes, lastSeg, lastSegHigh, meters, processing, modelHint, hint)
 		if idx < 0 {
 			break
 		}
@@ -1693,13 +1816,14 @@ func composeStatusBar(state, lastSeg string, lastSegHigh bool, meters, processin
 
 // lowestPriorityIdx finds the index of the suffix to drop first under
 // width pressure. Drop order:
-//   1. last-seg when low-priority (informational only)
-//   2. level meters
-//   3. last-seg when high-priority (yellow warn)
-//   4. processing spinner
-//   5. hint (kept until last — it's transient information that informs
-//      the user about a just-pressed key)
-func lowestPriorityIdx(suffixes []string, lastSeg string, lastSegHigh bool, meters, processing, hint string) int {
+//  1. last-seg when low-priority (informational only)
+//  2. level meters
+//  3. last-seg when high-priority (yellow warn)
+//  4. processing spinner
+//  5. #62 model-readiness hint (subtle, informational)
+//  6. hint (kept until last — it's transient information that informs
+//     the user about a just-pressed key)
+func lowestPriorityIdx(suffixes []string, lastSeg string, lastSegHigh bool, meters, processing, modelHint, hint string) int {
 	// Build an ordered list of the candidates we'd drop.
 	for _, target := range []string{
 		// 1. Low-priority last-seg.
@@ -1710,6 +1834,8 @@ func lowestPriorityIdx(suffixes []string, lastSeg string, lastSegHigh bool, mete
 		conditionalString(lastSegHigh, lastSeg),
 		// 4. Processing.
 		processing,
+		// 5. Model-readiness hint.
+		modelHint,
 	} {
 		if target == "" {
 			continue

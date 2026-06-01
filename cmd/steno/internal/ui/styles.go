@@ -148,4 +148,24 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(ColorRed).
 			Padding(0, 1)
+
+	// #62 — model readiness surfaces.
+
+	// ModelUnavailableBannerStyle: prominent, persistent red banner shown
+	// when the on-device TRANSCRIPTION model is unavailable on this Mac.
+	// This is the serious case (no transcript possible) — given the same
+	// visual weight as the first-launch consent banner (bordered box) but
+	// in red to signal a hard capability gap.
+	ModelUnavailableBannerStyle = lipgloss.NewStyle().
+					Foreground(ColorRed).
+					Bold(true).
+					Border(lipgloss.NormalBorder()).
+					BorderForeground(ColorRed).
+					Padding(0, 1)
+
+	// ModelPreparingStyle: subtle, non-alarming indicator for a model that
+	// is still loading (transcription "preparing"). Cyan, not bold — sits
+	// quietly in the status bar.
+	ModelPreparingStyle = lipgloss.NewStyle().
+				Foreground(ColorCyan)
 )

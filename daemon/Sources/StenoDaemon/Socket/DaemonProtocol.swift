@@ -128,6 +128,13 @@ public struct DaemonEvent: Codable, Sendable {
     /// e.g. a future enriched `segment`). `nil` for un-diarized events.
     public var speakerId: String?
 
+    /// #62 — `model_status` event payload. `component` is "transcription" or
+    /// "diarization"; `state` is "preparing" / "ready" / "unavailable";
+    /// `reason` carries the human-readable detail when `state == "unavailable"`.
+    public var component: String?
+    public var state: String?
+    public var reason: String?
+
     public init(
         event: String,
         text: String? = nil,
@@ -145,7 +152,10 @@ public struct DaemonEvent: Codable, Sendable {
         paused: Bool? = nil,
         pausedIndefinitely: Bool? = nil,
         pauseExpiresAt: Double? = nil,
-        speakerId: String? = nil
+        speakerId: String? = nil,
+        component: String? = nil,
+        state: String? = nil,
+        reason: String? = nil
     ) {
         self.event = event
         self.text = text
@@ -164,5 +174,8 @@ public struct DaemonEvent: Codable, Sendable {
         self.pausedIndefinitely = pausedIndefinitely
         self.pauseExpiresAt = pauseExpiresAt
         self.speakerId = speakerId
+        self.component = component
+        self.state = state
+        self.reason = reason
     }
 }

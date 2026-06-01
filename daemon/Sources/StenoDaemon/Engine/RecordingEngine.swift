@@ -8,6 +8,10 @@ public enum RecordingEngineError: Error, Equatable {
     case permissionDenied(String)
     case audioSourceFailed(String)
     case recognizerFailed(String)
+    /// On-device transcription can't run for the requested locale on this
+    /// machine (#62): unsupported hardware, unsupported locale, or a failed ASR
+    /// model download. Carries the human-readable reason.
+    case transcriptionUnavailable(String)
 }
 
 /// The core orchestrator for recording, transcription, and summarization.
@@ -32,6 +36,24 @@ public actor RecordingEngine {
     private let dedupTriggerDebounce: Duration
     private let audioSourceFactory: AudioSourceFactory
     private let speechRecognizerFactory: SpeechRecognizerFactory
+    /// Layer-A availability + ASR-asset gate (#62). Checked once before the
+    /// first bring-up; gates whether transcription can run at all on this
+    /// machine and downloads the locale model if needed.
+    private let transcriptionGate: TranscriptionModelGate
+    /// Normalized locale identifiers whose Layer-A model is confirmed ready
+    /// (#62). Keyed per-locale, not a single flag: a daemon that prepared
+    /// `en_US` must still run the gate (and download the asset) when later asked
+    /// to `start(locale: fr_FR)`, or the new locale's model is silently skipped.
+    /// An internal pipeline restart with the same locale hits the cache and
+    /// doesn't re-emit "preparing".
+    private var preparedLocales: Set<String> = []
+
+    /// Last-emitted readiness per pipeline (#62), so a client that subscribes
+    /// *after* startup — e.g. a TUI connecting to an already-unsupported Mac —
+    /// can be replayed the current state instead of missing it. Updated by
+    /// `emitModelStatus(...)`.
+    private var lastTranscriptionReadiness: ModelReadiness?
+    private var lastDiarizationReadiness: ModelReadiness?
     private var delegate: (any RecordingEngineDelegate)?
 
     // MARK: - U12 prune + retention thresholds
@@ -117,12 +139,13 @@ public actor RecordingEngine {
     /// Shared across sources — a physical speaker resolves to one `SpeakerID`
     /// regardless of stream.
     private let speakerRegistry = SpeakerRegistry()
-    /// Per-source `DiarizationService` (FluidAudio-backed). Each owns its own
-    /// long-lived `SortformerDiarizer` / `LSEENDDiarizer`; within-source
-    /// speaker identity is stable across streamed chunks via the diarizer's
-    /// own tracking.
-    private let micDiarizer = DefaultDiarizationService()
-    private let sysDiarizer = DefaultDiarizationService()
+    /// Per-source `DiarizationService` (FluidAudio-backed in production). Each
+    /// owns its own long-lived `SortformerDiarizer` / `LSEENDDiarizer`;
+    /// within-source speaker identity is stable across streamed chunks via the
+    /// diarizer's own tracking. Injectable (#62) so tests can drive the
+    /// model-preparation success/failure branches with a mock.
+    private let micDiarizer: any DiarizationService
+    private let sysDiarizer: any DiarizationService
     /// Per-source sticky Sortformer → LS-EEND tier ladder (#60).
     private let micTierController = DiarizationTierController()
     private let sysTierController = DiarizationTierController()
@@ -313,13 +336,19 @@ public actor RecordingEngine {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         retentionDays: Int = 90,
-        pauseTimer: PauseTimer? = nil
+        pauseTimer: PauseTimer? = nil,
+        transcriptionGate: TranscriptionModelGate = ReadyTranscriptionModelGate(),
+        micDiarizer: (any DiarizationService)? = nil,
+        sysDiarizer: (any DiarizationService)? = nil
     ) {
         self.repository = repository
         self.permissionService = permissionService
         self.summaryCoordinator = summaryCoordinator
         self.audioSourceFactory = audioSourceFactory
         self.speechRecognizerFactory = speechRecognizerFactory
+        self.transcriptionGate = transcriptionGate
+        self.micDiarizer = micDiarizer ?? DefaultDiarizationService()
+        self.sysDiarizer = sysDiarizer ?? DefaultDiarizationService()
         self.delegate = delegate
         self.backoffSleep = backoffSleep
         self.powerAssertion = powerAssertion ?? PowerAssertion()
@@ -382,6 +411,13 @@ public actor RecordingEngine {
             await emit(.error(message, isTransient: false))
             throw RecordingEngineError.permissionDenied(message)
         }
+
+        // #62 Layer A gate: confirm on-device transcription can run for this
+        // locale (and download its model) before creating a session or bringing
+        // up pipelines. On unsupported hardware/locale this sets `.unsupported`
+        // and throws — degrading explicitly instead of crash-looping the
+        // recognizer. Skipped after the first successful preparation.
+        try await ensureTranscriptionAvailable(locale: locale)
 
         // Create session
         let session: Session
@@ -707,6 +743,12 @@ public actor RecordingEngine {
             await emit(.error(message, isTransient: false))
             throw RecordingEngineError.permissionDenied(message)
         }
+
+        // Step 3b (#62): Layer A gate. Same as `start()` — confirm transcription
+        // can run for this locale (and download its model) before opening a
+        // session. On unsupported hardware this sets `.unsupported` and throws;
+        // RunCommand's auto-start catch logs it and the daemon stays up.
+        try await ensureTranscriptionAvailable(locale: locale)
 
         // Step 4: open a fresh active session. Sweep already ran in step 1.
         let session: Session
@@ -1670,15 +1712,77 @@ public actor RecordingEngine {
         return max(-90.0, db)
     }
 
+    // MARK: - Layer A availability gate (#62)
+
+    /// Confirm on-device transcription can run for `locale` and that its model
+    /// asset is installed, before any pipeline bring-up. Surfaces the lifecycle
+    /// over `model_status` events so the TUI can show "preparing model" and,
+    /// on a blocking condition, an explicit "unavailable" state instead of a
+    /// crash-looping recognizer.
+    ///
+    /// Idempotent across bring-ups: once Layer A is confirmed ready, internal
+    /// pipeline restarts skip the gate (no repeated "preparing" flicker).
+    ///
+    /// - Throws: `RecordingEngineError.transcriptionUnavailable` when the gate
+    ///   reports the machine/locale can't transcribe. Status is set to
+    ///   `.unsupported` first so callers that catch the throw leave the daemon
+    ///   in the explicit terminal-but-alive state, not `.error`.
+    private func ensureTranscriptionAvailable(locale: Locale) async throws {
+        let key = locale.identifier
+        if preparedLocales.contains(key) { return }
+        await emitModelStatus(.transcription, .preparing)
+        switch await transcriptionGate.prepare(locale: locale) {
+        case .ready:
+            preparedLocales.insert(key)
+            await emitModelStatus(.transcription, .ready)
+        case .unavailable(let reason):
+            await emitModelStatus(.transcription, .unavailable(reason: reason))
+            await setStatus(.unsupported)
+            await emit(.error(
+                "On-device transcription unavailable: \(reason)",
+                isTransient: false
+            ))
+            throw RecordingEngineError.transcriptionUnavailable(reason)
+        }
+    }
+
+    /// Emit a `model_status` event and remember it as the pipeline's last-known
+    /// readiness (#62), so `currentModelReadiness()` can replay it to clients
+    /// that subscribe after the event was first broadcast.
+    private func emitModelStatus(_ component: ModelComponent, _ readiness: ModelReadiness) async {
+        switch component {
+        case .transcription: lastTranscriptionReadiness = readiness
+        case .diarization: lastDiarizationReadiness = readiness
+        }
+        await emit(.modelStatus(component, readiness))
+    }
+
+    /// Current readiness of each pipeline that has reported at least once, in a
+    /// stable order (transcription first). Used by the dispatcher to replay
+    /// model status to a freshly-subscribed client (#62) so late connectors —
+    /// notably a TUI attaching to an already-`.unsupported` daemon — see the
+    /// real state instead of nothing.
+    public func currentModelReadiness() -> [(ModelComponent, ModelReadiness)] {
+        var out: [(ModelComponent, ModelReadiness)] = []
+        if let t = lastTranscriptionReadiness { out.append((.transcription, t)) }
+        if let d = lastDiarizationReadiness { out.append((.diarization, d)) }
+        return out
+    }
+
     // MARK: - Diarization pipeline (#61 wiring)
 
     /// Download (cached) FluidAudio models for both tier diarizers in parallel.
     /// Until this returns successfully, the tick is a no-op and recording
     /// continues without speaker labels. Idempotent — safe to call repeatedly.
-    /// Errors are surfaced as a transient `.error` event; the engine keeps
-    /// running mic-only diarization-less.
+    ///
+    /// Surfaces lifecycle over `model_status` events (#62): `.preparing` while
+    /// downloading, `.ready` on success, `.unavailable(reason:)` on failure. On
+    /// failure the transcript keeps working — speaker labels just never appear —
+    /// so this is a soft, non-fatal degrade (the event is also mirrored as a
+    /// transient `.error` for older clients).
     public func prepareDiarization() async {
         guard !diarizationModelsReady else { return }
+        await emitModelStatus(.diarization, .preparing)
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await self.micDiarizer.prepareModels() }
@@ -1686,7 +1790,12 @@ public actor RecordingEngine {
                 try await group.waitForAll()
             }
             diarizationModelsReady = true
+            await emitModelStatus(.diarization, .ready)
         } catch {
+            await emitModelStatus(
+                .diarization,
+                .unavailable(reason: error.localizedDescription)
+            )
             await emit(.error(
                 "Diarization models failed to load: \(error.localizedDescription)",
                 isTransient: true
@@ -2547,7 +2656,7 @@ public actor RecordingEngine {
             // Reject — paused has no current session to demarcate. The
             // user must explicitly resume first ("press p to resume").
             throw RecordingEngineError.notRecording
-        case .idle, .starting, .stopping, .error:
+        case .idle, .starting, .stopping, .error, .unsupported:
             throw RecordingEngineError.notRecording
         }
     }

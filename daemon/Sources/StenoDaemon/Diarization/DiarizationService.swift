@@ -95,6 +95,12 @@ public struct DiarizationResult: Sendable, Equatable {
 /// tests use `MockDiarizationService`. Swappable per the project's
 /// protocol-first / DI conventions so the model tier (#60) is injectable.
 public protocol DiarizationService: Sendable {
+    /// Download (cached) and initialize the backing models before the first
+    /// `diarize` call. Long-running on first run (network). Idempotent. Surfaced
+    /// on the protocol (#62) so the engine can gate on readiness and inject a
+    /// test double that fails preparation deterministically.
+    func prepareModels() async throws
+
     /// Diarize a mono PCM window. Returns window-relative speaker segments plus
     /// one embedding per detected speaker, stamped with model provenance.
     /// `model` selects the tier (#60); the implementation resamples to whatever
