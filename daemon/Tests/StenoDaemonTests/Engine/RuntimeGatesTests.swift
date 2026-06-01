@@ -103,6 +103,73 @@ struct RuntimeGatesTests {
         #expect(secondStartStatuses.isEmpty)
     }
 
+    @Test("gate re-runs when a later start uses a different locale")
+    func gateReRunsOnLocaleChange() async throws {
+        let gate = MockTranscriptionModelGate(outcome: .ready)
+        let (engine, _, _) = await makeEngine(gate: gate)
+
+        _ = try await engine.start(locale: Locale(identifier: "en_US"))
+        await engine.stop()
+        _ = try await engine.start(locale: Locale(identifier: "fr_FR"))
+
+        // Each distinct locale is prepared (and its asset checked) — the
+        // per-locale cache must not skip the new locale.
+        let locales = await gate.preparedLocales.map(\.identifier)
+        let callCount = await gate.prepareCallCount
+        #expect(callCount == 2)
+        #expect(Set(locales) == ["en_US", "fr_FR"])
+    }
+
+    @Test("currentModelReadiness reports last-known state for late subscribers")
+    func currentModelReadinessReportsState() async throws {
+        let reason = "No Neural Engine."
+        let gate = MockTranscriptionModelGate(outcome: .unavailable(reason: reason))
+        let (engine, _, _) = await makeEngine(gate: gate)
+
+        try? await engine.start(locale: Locale(identifier: "en_US"))
+
+        let readiness = await engine.currentModelReadiness()
+        #expect(readiness.count == 1)
+        #expect(readiness.first?.0 == .transcription)
+        #expect(readiness.first?.1 == .unavailable(reason: reason))
+    }
+
+    @Test("a late subscriber is replayed the unsupported state it missed")
+    func lateSubscriberReplay() async throws {
+        let gate = MockTranscriptionModelGate(outcome: .unavailable(reason: "unsupported hw"))
+        let repo = MockTranscriptRepository()
+        let coordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: MockSummarizationService(),
+            triggerCount: 100,
+            timeThreshold: 3600
+        )
+        let engine = await RecordingEngine(
+            repository: repo,
+            permissionService: MockPermissionService(),
+            summaryCoordinator: coordinator,
+            audioSourceFactory: MockAudioSourceFactory(),
+            speechRecognizerFactory: MockSpeechRecognizerFactory(),
+            transcriptionGate: gate
+        )
+        let broadcaster = EventBroadcaster()
+        let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
+
+        // Daemon attempted auto-start and hit the unsupported state BEFORE any
+        // client connected.
+        try? await engine.start(locale: Locale(identifier: "en_US"))
+
+        // Now a TUI connects and subscribes.
+        let client = MockClientConnection()
+        await dispatcher.handle(DaemonCommand(cmd: "subscribe"), from: client)
+
+        let events = await client.sentEvents.filter { $0.event == "model_status" }
+        #expect(events.contains {
+            $0.component == "transcription" && $0.state == "unavailable"
+                && $0.reason == "unsupported hw"
+        })
+    }
+
     // MARK: - Layer B: diarization model readiness
 
     @Test("diarization prepare success emits preparing→ready")

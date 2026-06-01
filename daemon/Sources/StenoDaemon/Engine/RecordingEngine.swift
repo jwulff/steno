@@ -40,10 +40,20 @@ public actor RecordingEngine {
     /// first bring-up; gates whether transcription can run at all on this
     /// machine and downloads the locale model if needed.
     private let transcriptionGate: TranscriptionModelGate
-    /// `true` once `ensureTranscriptionAvailable(...)` has confirmed Layer A is
-    /// ready (and any ASR model download finished). Subsequent bring-ups skip
-    /// the gate so internal pipeline restarts don't re-emit "preparing".
-    private var transcriptionPrepared = false
+    /// Normalized locale identifiers whose Layer-A model is confirmed ready
+    /// (#62). Keyed per-locale, not a single flag: a daemon that prepared
+    /// `en_US` must still run the gate (and download the asset) when later asked
+    /// to `start(locale: fr_FR)`, or the new locale's model is silently skipped.
+    /// An internal pipeline restart with the same locale hits the cache and
+    /// doesn't re-emit "preparing".
+    private var preparedLocales: Set<String> = []
+
+    /// Last-emitted readiness per pipeline (#62), so a client that subscribes
+    /// *after* startup — e.g. a TUI connecting to an already-unsupported Mac —
+    /// can be replayed the current state instead of missing it. Updated by
+    /// `emitModelStatus(...)`.
+    private var lastTranscriptionReadiness: ModelReadiness?
+    private var lastDiarizationReadiness: ModelReadiness?
     private var delegate: (any RecordingEngineDelegate)?
 
     // MARK: - U12 prune + retention thresholds
@@ -1718,14 +1728,15 @@ public actor RecordingEngine {
     ///   `.unsupported` first so callers that catch the throw leave the daemon
     ///   in the explicit terminal-but-alive state, not `.error`.
     private func ensureTranscriptionAvailable(locale: Locale) async throws {
-        if transcriptionPrepared { return }
-        await emit(.modelStatus(.transcription, .preparing))
+        let key = locale.identifier
+        if preparedLocales.contains(key) { return }
+        await emitModelStatus(.transcription, .preparing)
         switch await transcriptionGate.prepare(locale: locale) {
         case .ready:
-            transcriptionPrepared = true
-            await emit(.modelStatus(.transcription, .ready))
+            preparedLocales.insert(key)
+            await emitModelStatus(.transcription, .ready)
         case .unavailable(let reason):
-            await emit(.modelStatus(.transcription, .unavailable(reason: reason)))
+            await emitModelStatus(.transcription, .unavailable(reason: reason))
             await setStatus(.unsupported)
             await emit(.error(
                 "On-device transcription unavailable: \(reason)",
@@ -1733,6 +1744,29 @@ public actor RecordingEngine {
             ))
             throw RecordingEngineError.transcriptionUnavailable(reason)
         }
+    }
+
+    /// Emit a `model_status` event and remember it as the pipeline's last-known
+    /// readiness (#62), so `currentModelReadiness()` can replay it to clients
+    /// that subscribe after the event was first broadcast.
+    private func emitModelStatus(_ component: ModelComponent, _ readiness: ModelReadiness) async {
+        switch component {
+        case .transcription: lastTranscriptionReadiness = readiness
+        case .diarization: lastDiarizationReadiness = readiness
+        }
+        await emit(.modelStatus(component, readiness))
+    }
+
+    /// Current readiness of each pipeline that has reported at least once, in a
+    /// stable order (transcription first). Used by the dispatcher to replay
+    /// model status to a freshly-subscribed client (#62) so late connectors —
+    /// notably a TUI attaching to an already-`.unsupported` daemon — see the
+    /// real state instead of nothing.
+    public func currentModelReadiness() -> [(ModelComponent, ModelReadiness)] {
+        var out: [(ModelComponent, ModelReadiness)] = []
+        if let t = lastTranscriptionReadiness { out.append((.transcription, t)) }
+        if let d = lastDiarizationReadiness { out.append((.diarization, d)) }
+        return out
     }
 
     // MARK: - Diarization pipeline (#61 wiring)
@@ -1748,7 +1782,7 @@ public actor RecordingEngine {
     /// transient `.error` for older clients).
     public func prepareDiarization() async {
         guard !diarizationModelsReady else { return }
-        await emit(.modelStatus(.diarization, .preparing))
+        await emitModelStatus(.diarization, .preparing)
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await self.micDiarizer.prepareModels() }
@@ -1756,12 +1790,12 @@ public actor RecordingEngine {
                 try await group.waitForAll()
             }
             diarizationModelsReady = true
-            await emit(.modelStatus(.diarization, .ready))
+            await emitModelStatus(.diarization, .ready)
         } catch {
-            await emit(.modelStatus(
+            await emitModelStatus(
                 .diarization,
                 .unavailable(reason: error.localizedDescription)
-            ))
+            )
             await emit(.error(
                 "Diarization models failed to load: \(error.localizedDescription)",
                 isTransient: true

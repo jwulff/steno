@@ -46,6 +46,25 @@ public actor EventBroadcaster: RecordingEngineDelegate {
         await broadcast(event)
     }
 
+    /// Send specific events to a single already-subscribed client, honoring its
+    /// subscription filter (#62). Used to replay current model readiness to a
+    /// client that connected after the daemon first emitted it, so a late TUI
+    /// learns an `.unsupported` / preparing state it would otherwise miss.
+    public func replay(_ events: [EngineEvent], toClient clientId: UUID) async {
+        guard let sub = subscriptions[clientId] else { return }
+        for event in events {
+            let (eventType, daemonEvent) = mapEvent(event)
+            guard sub.events.contains(eventType) else { continue }
+            guard let data = try? encoder.encode(daemonEvent) else { continue }
+            do {
+                try await sub.client.send(data + Data("\n".utf8))
+            } catch {
+                subscriptions.removeValue(forKey: clientId)
+                return
+            }
+        }
+    }
+
     private func broadcast(_ event: EngineEvent) async {
         let (eventType, daemonEvent) = mapEvent(event)
 
