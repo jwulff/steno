@@ -135,12 +135,6 @@ public actor RecordingEngine {
     /// 10 Hz tick that drains ready windows from both schedulers. Mirrors
     /// `levelThrottleTask`'s lifecycle.
     private var diarizationTickTask: Task<Void, Never>?
-    /// Rolling per-source buffer of recently-finalized segments so the merger
-    /// can match diarized window segments by audio time without hitting the
-    /// DB. Capacity is well above the diarization horizon (60s windows + slack).
-    private var recentMicSegments: [StoredSegment] = []
-    private var recentSysSegments: [StoredSegment] = []
-    private static let recentSegmentCapacity = 200
 
     // MARK: - U11 dedup-trigger debounce state
 
@@ -472,10 +466,6 @@ public actor RecordingEngine {
         // intentionally discarded.
         await micRingBuffer.reset()
         await sysRingBuffer.reset()
-        // Diarization (#61): the recent-segments rollover follows the same
-        // per-bring-up reset since labels relate to the new capture timeline.
-        recentMicSegments.removeAll(keepingCapacity: true)
-        recentSysSegments.removeAll(keepingCapacity: true)
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
         lastDeviceUID = deviceUIDProvider()
@@ -987,8 +977,24 @@ public actor RecordingEngine {
             // #64: carry the recognizer's audio-frame time (capture clock) for
             // the diarization merge, independent of the wall-clock startedAt/
             // endedAt that dedup, demarcation, and the TUI rely on.
-            let audioEnd = result.audioStartSeconds.map {
-                $0 + (result.audioDurationSeconds ?? 0)
+            //
+            // Bug 1 fix: `audioStart` and `audioEnd` must be NULL together. Only
+            // populate them when BOTH a start AND a strictly-positive duration
+            // are reported. A present-start / absent-or-nonpositive-duration
+            // result previously persisted `audioEnd == audioStart`, a
+            // zero-length span the diarization merge silently skips (overlap is
+            // always 0 against an empty span). Leave both nil in that case so
+            // the segment is honestly "no valid audio range" per the model docs.
+            let audioStart: TimeInterval?
+            let audioEnd: TimeInterval?
+            if let start = result.audioStartSeconds,
+                let duration = result.audioDurationSeconds,
+                duration > 0 {
+                audioStart = start
+                audioEnd = start + duration
+            } else {
+                audioStart = nil
+                audioEnd = nil
             }
 
             let segment = StoredSegment(
@@ -1001,7 +1007,7 @@ public actor RecordingEngine {
                 source: result.source,
                 healMarker: healMarker,
                 micPeakDb: micPeakDb,
-                audioStart: result.audioStartSeconds,
+                audioStart: audioStart,
                 audioEnd: audioEnd
             )
 
@@ -1014,10 +1020,6 @@ public actor RecordingEngine {
             }
 
             await emit(.segmentFinalized(segment))
-            // Diarization (#61): keep a rolling per-source view of recent
-            // segments so the merger can join them against window results
-            // without going back to the DB.
-            recordRecentSegment(segment)
 
             // U11: schedule a debounced dedup pass for the session this
             // segment landed on (routing-aware — a demarcate-routed
@@ -1574,13 +1576,36 @@ public actor RecordingEngine {
         return stream
     }
 
-    /// Extract channel 0 of a float PCM buffer as a value-type sample array
-    /// for the diarization ring buffer. Empty for a non-float / empty buffer.
-    private static func monoSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let channelData = buffer.floatChannelData?[0] else { return [] }
+    /// Downmix a float PCM buffer to a single mono channel as a value-type
+    /// sample array for the diarization ring buffer. Empty for a non-float /
+    /// empty buffer.
+    ///
+    /// Bug 3 fix: system audio is captured 2-channel, so the previous
+    /// channel-0-only extraction discarded the entire right channel —
+    /// potentially half the speech energy — before diarization ever saw it.
+    /// We now average across ALL channels (channelCount divisor) so a stereo
+    /// source contributes both channels. The 1-channel case is a pass-through
+    /// (average of one channel == that channel) and stays allocation-cheap.
+    static func monoSamples(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let floatChannelData = buffer.floatChannelData else { return [] }
         let frameLength = Int(buffer.frameLength)
         guard frameLength > 0 else { return [] }
-        return Array(UnsafeBufferPointer(start: channelData, count: frameLength))
+
+        let channelCount = Int(buffer.format.channelCount)
+        guard channelCount > 1 else {
+            // Single channel: direct copy, no averaging needed.
+            return Array(UnsafeBufferPointer(start: floatChannelData[0], count: frameLength))
+        }
+
+        let scale = 1.0 / Float(channelCount)
+        var mono = [Float](repeating: 0, count: frameLength)
+        for channel in 0..<channelCount {
+            let data = floatChannelData[channel]
+            for frame in 0..<frameLength {
+                mono[frame] += data[frame] * scale
+            }
+        }
+        return mono
     }
 
     /// A window of buffered audio for one source, on the frame-counted capture
@@ -1720,23 +1745,87 @@ public actor RecordingEngine {
         }
     }
 
-    /// Apply a window's results to the per-source recent-segments buffer:
-    /// run the timestamp merge, persist any new labels via `updateSpeaker`,
-    /// and emit a `speakerLabel` event so live clients can update without
-    /// re-fetching from the DB. Also feeds the tier controller the
-    /// distinct-speaker count for its escalation decision.
-    private func applyDiarizationResult(_ result: DiarizationWindowResult, isMic: Bool) async {
+    /// Apply a closed window's diarization result to the session's stored
+    /// segments: run the timestamp merge, propagate the dedup-gate inheritance,
+    /// persist any new/changed labels via `updateSpeaker`, and emit a
+    /// `speakerLabel` event so live clients can update without re-fetching from
+    /// the DB. Also feeds the tier controller the distinct-speaker count for its
+    /// escalation decision.
+    ///
+    /// Bug 4 fix: the merge now sources its candidate segments from the DB
+    /// (`repository.segments(for:)`) rather than only the in-memory
+    /// `recent…Segments` snapshot. A transcript segment whose audio falls in
+    /// this window but which finalized *after* the window's diarization tick
+    /// (e.g. a 40–44s segment that lands just past the 45s boundary) was absent
+    /// from the in-memory snapshot at assign time and — because the *next*
+    /// window [45,90) has no temporal overlap with it — never got revisited,
+    /// leaving `speaker_id` permanently NULL. Re-querying stored segments per
+    /// window and re-assigning any not-yet-labeled segment that overlaps the
+    /// window range backfills these late finalizers. Idempotent: a segment
+    /// already carrying the same speaker is neither re-written nor re-emitted.
+    ///
+    /// Bug 2 fix: duplicates (`duplicateOf != nil`) are never diarized directly
+    /// (the §9 dedup gate); they inherit the canonical segment's speaker via
+    /// `SpeakerLabelMerger.inheritedLabels`. That inheritance was never wired,
+    /// so duplicate rows kept a NULL `speaker_id`. We now build the canonical
+    /// speaker map from both this window's fresh assignments AND any
+    /// already-persisted canonical labels, then propagate to the duplicates.
+    func applyDiarizationResult(_ result: DiarizationWindowResult, isMic: Bool) async {
         let distinct = Set(result.segments.map(\.speaker.raw)).count
+        let source: AudioSourceType
         if isMic {
             await micTierController.observe(speakerCount: distinct)
+            source = .microphone
         } else {
             await sysTierController.observe(speakerCount: distinct)
+            source = .systemAudio
         }
 
-        let recent = isMic ? recentMicSegments : recentSysSegments
-        let assignments = SpeakerLabelMerger.assign(window: result, segments: recent)
-        for (segmentId, speakerUUID) in assignments {
-            guard let segment = recent.first(where: { $0.id == segmentId }) else { continue }
+        // Determine which session these segments belong to. During recording
+        // this is the live session; outside it (no active session) there is
+        // nothing to label.
+        guard let sessionId = currentSession?.id else { return }
+
+        // Bug 4: pull the freshest stored view rather than the in-memory
+        // snapshot so late-finalized segments covered by this window are seen.
+        let stored: [StoredSegment]
+        do {
+            stored = try await repository.segments(for: sessionId)
+                .filter { $0.source == source }
+        } catch {
+            await emit(.error(
+                "Failed to load segments for diarization merge: \(error.localizedDescription)",
+                isTransient: true
+            ))
+            return
+        }
+
+        // Canonical (non-duplicate) assignments by max temporal overlap.
+        let assignments = SpeakerLabelMerger.assign(window: result, segments: stored)
+
+        // Bug 2: canonical map = this window's assignments unioned with any
+        // canonical label already persisted in a prior window. A duplicate may
+        // point at a canonical that was labeled earlier, so the persisted
+        // labels matter, not just the current batch.
+        var canonicalSpeaker = assignments
+        for segment in stored where segment.duplicateOf == nil {
+            if let existing = segment.speakerId, canonicalSpeaker[segment.id] == nil {
+                canonicalSpeaker[segment.id] = existing
+            }
+        }
+
+        let duplicates = stored.filter { $0.duplicateOf != nil }
+        let inherited = SpeakerLabelMerger.inheritedLabels(
+            duplicates: duplicates,
+            canonicalSpeaker: canonicalSpeaker
+        )
+
+        // Persist canonical + inherited labels. Skip no-op writes/events where
+        // the segment already carries the target speaker (idempotent re-merge).
+        let segmentsById = Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) })
+        for (segmentId, speakerUUID) in assignments.merging(inherited, uniquingKeysWith: { lhs, _ in lhs }) {
+            guard let segment = segmentsById[segmentId] else { continue }
+            if segment.speakerId == speakerUUID { continue }
             do {
                 try await repository.updateSpeaker(
                     segmentId: segmentId,
@@ -1752,28 +1841,6 @@ public actor RecordingEngine {
                     "Failed to persist speaker label: \(error.localizedDescription)",
                     isTransient: true
                 ))
-            }
-        }
-    }
-
-    /// Append a freshly-finalized segment to the right per-source rolling
-    /// buffer. Called from `handleRecognizerResult` after the segment lands
-    /// in the DB.
-    private func recordRecentSegment(_ segment: StoredSegment) {
-        switch segment.source {
-        case .microphone:
-            recentMicSegments.append(segment)
-            if recentMicSegments.count > Self.recentSegmentCapacity {
-                recentMicSegments.removeFirst(
-                    recentMicSegments.count - Self.recentSegmentCapacity
-                )
-            }
-        case .systemAudio:
-            recentSysSegments.append(segment)
-            if recentSysSegments.count > Self.recentSegmentCapacity {
-                recentSysSegments.removeFirst(
-                    recentSysSegments.count - Self.recentSegmentCapacity
-                )
             }
         }
     }
