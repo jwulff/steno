@@ -17,11 +17,11 @@
 class Steno < Formula
   desc "macOS always-on speech-to-text TUI + MCP server (Swift daemon + Go CLI)"
   homepage "https://github.com/jwulff/steno"
-  url "https://github.com/jwulff/steno/archive/refs/tags/v0.4.0.tar.gz"
+  url "https://github.com/jwulff/steno/archive/refs/tags/v0.5.0.tar.gz"
   # Replace with the value of:
-  #   curl -sL https://github.com/jwulff/steno/archive/refs/tags/v0.4.0.tar.gz \
+  #   curl -sL https://github.com/jwulff/steno/archive/refs/tags/v0.5.0.tar.gz \
   #     | shasum -a 256
-  sha256 "REPLACE_WITH_RELEASE_SHA256"
+  sha256 "f642d702bc405af370dc20b94a40d459d97b114674b5f4d8deb15fcb387fd3c6"
   license "MIT"
   head "https://github.com/jwulff/steno.git", branch: "main"
 
