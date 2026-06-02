@@ -1,6 +1,7 @@
 .PHONY: build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
        run-daemon run-steno run-mcp \
+       build-app run-app test-app clean-app \
        test test-daemon test-steno \
        clean install
 
@@ -67,7 +68,7 @@ run-mcp: build-steno
 
 # --- Test ---
 
-test: test-daemon test-steno
+test: test-daemon test-steno test-app
 
 test-daemon:
 	# Swift testing's process-teardown allocator races libdispatch's
@@ -123,3 +124,32 @@ install: sign-daemon build-steno
 	@echo "Installed to $(PREFIX):"
 	@echo "  $(PREFIX)/$(DAEMON_BIN)"
 	@echo "  $(PREFIX)/$(STENO_BIN)  (TUI default, --mcp for MCP server)"
+
+# --- macOS App (SwiftUI) ---
+# A native front-end to the daemon. Assembled into a signed .app bundle so it
+# runs as a proper GUI/menu-bar app (the bare SwiftPM binary lacks an
+# Info.plist and won't activate correctly).
+APP_DIR        = app
+APP_RELEASE    = $(APP_DIR)/.build/release
+APP_BIN        = StenoApp
+APP_BUNDLE     = $(APP_DIR)/.build/Steno.app
+APP_INFO_PLIST = $(APP_DIR)/Resources/Info.plist
+
+build-app:
+	cd $(APP_DIR) && swift build -c release --product StenoApp
+	@rm -rf "$(APP_BUNDLE)"
+	@mkdir -p "$(APP_BUNDLE)/Contents/MacOS" "$(APP_BUNDLE)/Contents/Resources"
+	@cp "$(APP_RELEASE)/$(APP_BIN)" "$(APP_BUNDLE)/Contents/MacOS/$(APP_BIN)"
+	@cp "$(APP_INFO_PLIST)" "$(APP_BUNDLE)/Contents/Info.plist"
+	@codesign --force --deep --sign "$(CODESIGN_IDENTITY)" "$(APP_BUNDLE)" >/dev/null 2>&1 || true
+	@echo "Built $(APP_BUNDLE)"
+
+run-app: build-app
+	open "$(APP_BUNDLE)"
+
+test-app:
+	cd $(APP_DIR) && swift test
+
+clean-app:
+	cd $(APP_DIR) && swift package clean
+	rm -rf "$(APP_BUNDLE)"
