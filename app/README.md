@@ -14,6 +14,10 @@ exact same daemon the TUI uses:
   (`~/Library/Application Support/Steno/steno.sqlite`, read-only).
 - **Daemon lifecycle**: locates `steno-daemon` (co-located → `$STENO_DAEMON_PATH`
   → `~/.local/bin` → `PATH`), auto-starts it, and reconnects if the socket drops.
+- **Health + restart**: an engine-health chip (header and menu bar) shows whether
+  the daemon is healthy / unreachable / stopped / errored, with a one-click
+  **Restart Engine** that safely stops the process (confirming identity before
+  signaling) and brings up a fresh one.
 
 ## Run
 

@@ -40,17 +40,24 @@ public final class AppModel {
     public private(set) var lastError: String?
     public private(set) var systemAudioParkedNoDisplay = false
 
+    // Daemon process health.
+    public private(set) var daemonProcessRunning = false
+    public private(set) var daemonPID: Int?
+    public private(set) var daemonRestarting = false
+
     public var defaultPauseSeconds: Double = 1800
 
     // MARK: - Dependencies
 
     private let launcher: DaemonLauncher
     private let client: DaemonClient
+    private let controller: DaemonController
     private let storeProvider: @Sendable () -> SQLiteReader?
     private var store: SQLiteReader?
 
     private var eventTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var healthTask: Task<Void, Never>?
 
     /// Per-session first-seen ordering of speaker UUIDs → "Speaker N".
     private var speakerOrder: [String] = []
@@ -58,10 +65,12 @@ public final class AppModel {
     public init(
         launcher: DaemonLauncher = DaemonLauncher(),
         client: DaemonClient = DaemonClient(),
+        controller: DaemonController = DaemonController(),
         storeProvider: @escaping @Sendable () -> SQLiteReader? = { SQLiteReader() }
     ) {
         self.launcher = launcher
         self.client = client
+        self.controller = controller
         self.storeProvider = storeProvider
     }
 
@@ -70,12 +79,71 @@ public final class AppModel {
     public func start() {
         reconnectTask?.cancel()
         reconnectTask = Task { await self.connectLoop() }
+        startHealthPolling()
     }
 
     public func stop() {
         eventTask?.cancel()
         reconnectTask?.cancel()
+        healthTask?.cancel()
         Task { await client.disconnect() }
+    }
+
+    // MARK: - Daemon health
+
+    /// Pure derivation of overall daemon health (testable).
+    public static func daemonHealth(
+        status: EngineStatus, processRunning: Bool, restarting: Bool
+    ) -> DaemonHealth {
+        if restarting { return .restarting }
+        switch status {
+        case .recording, .idle, .starting: return .healthy
+        case .paused: return .paused
+        case .recovering, .stopping: return .recovering
+        case .error: return .error
+        case .connecting: return .connecting
+        case .disconnected, .unknown:
+            return processRunning ? .unreachable : .stopped
+        }
+    }
+
+    public var daemonHealth: DaemonHealth {
+        Self.daemonHealth(
+            status: status, processRunning: daemonProcessRunning, restarting: daemonRestarting
+        )
+    }
+
+    private func startHealthPolling() {
+        healthTask?.cancel()
+        healthTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshProcessHealth()
+                try? await Task.sleep(for: .seconds(3))
+            }
+        }
+    }
+
+    private func refreshProcessHealth() {
+        let pid = controller.runningDaemonPID()
+        daemonPID = pid
+        daemonProcessRunning = pid != nil
+    }
+
+    /// Stop the (possibly stuck) daemon and bring up a fresh one, then
+    /// reconnect. Safe to call from any UI affordance.
+    public func restartDaemon() {
+        guard !daemonRestarting else { return }
+        Task {
+            daemonRestarting = true
+            status = .connecting
+            reconnectTask?.cancel()
+            eventTask?.cancel()
+            await client.disconnect()
+            try? await controller.restart()
+            refreshProcessHealth()
+            daemonRestarting = false
+            start()
+        }
     }
 
     private func connectLoop() async {

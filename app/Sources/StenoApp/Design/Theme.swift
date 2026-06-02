@@ -15,7 +15,18 @@ enum Theme {
     static let recording = Color(red: 0.93, green: 0.27, blue: 0.31)
     static let paused = Color(red: 0.95, green: 0.66, blue: 0.20)
     static let recovering = Color(red: 0.95, green: 0.66, blue: 0.20)
+    static let healthy = Color(red: 0.27, green: 0.72, blue: 0.46)
     static let idle = Color.secondary
+
+    /// Color for a daemon-health severity.
+    static func healthColor(_ severity: DaemonHealth.Severity) -> Color {
+        switch severity {
+        case .ok: return healthy
+        case .warn: return paused
+        case .bad: return recording
+        case .neutral: return idle
+        }
+    }
 
     /// Distinct, gentle hues per audio source so mic vs. system reads at a glance.
     static func sourceColor(_ source: AudioSource?) -> Color {

@@ -19,6 +19,8 @@ struct StatusHeader: View {
 
                 Spacer()
 
+                EngineHealthChip()
+
                 if model.modelProcessing {
                     Label("Thinking", systemImage: "sparkles")
                         .font(.system(size: 11, weight: .medium))

@@ -92,6 +92,54 @@ public struct Summary: Sendable, Equatable {
     }
 }
 
+/// Overall health of the daemon process, as the app sees it. Combines socket
+/// reachability, engine status, and whether the process is actually running.
+public enum DaemonHealth: String, Sendable {
+    case healthy        // connected, engine recording/idle
+    case paused         // connected, intentionally paused
+    case recovering     // engine restarting its pipeline
+    case error          // engine reported an error (often missing permission)
+    case unreachable    // process up but socket not responding
+    case stopped        // no daemon process running
+    case restarting     // we're restarting it right now
+    case connecting     // initial connect in progress
+
+    public enum Severity: Sendable { case ok, warn, bad, neutral }
+
+    public var severity: Severity {
+        switch self {
+        case .healthy: return .ok
+        case .paused, .recovering, .connecting, .restarting: return .warn
+        case .error, .unreachable, .stopped: return .bad
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .healthy: return "Engine healthy"
+        case .paused: return "Engine paused"
+        case .recovering: return "Engine recovering"
+        case .error: return "Engine error"
+        case .unreachable: return "Engine unreachable"
+        case .stopped: return "Engine stopped"
+        case .restarting: return "Restarting…"
+        case .connecting: return "Connecting…"
+        }
+    }
+
+    public var symbol: String {
+        switch self {
+        case .healthy: return "bolt.heart.fill"
+        case .paused: return "pause.circle.fill"
+        case .recovering, .connecting: return "arrow.triangle.2.circlepath"
+        case .error: return "exclamationmark.triangle.fill"
+        case .unreachable: return "bolt.horizontal.circle"
+        case .stopped: return "bolt.slash.fill"
+        case .restarting: return "arrow.triangle.2.circlepath"
+        }
+    }
+}
+
 /// Model-readiness for one pipeline component (#62).
 public struct ComponentReadiness: Sendable, Equatable {
     public enum State: String, Sendable { case preparing, ready, unavailable, unknown }

@@ -21,6 +21,35 @@ struct MenuBarView: View {
 
             Divider()
 
+            // Engine health line + restart.
+            HStack(spacing: 8) {
+                Image(systemName: model.daemonHealth.symbol)
+                    .foregroundStyle(Theme.healthColor(model.daemonHealth.severity))
+                    .font(.system(size: 12, weight: .semibold))
+                Text(model.daemonHealth.title)
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                if model.daemonPID != nil {
+                    Text("pid \(model.daemonPID!)")
+                        .font(Theme.mono)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            VStack(spacing: 2) {
+                MenuButton(model.daemonRestarting ? "Restarting…" : "Restart engine",
+                           systemImage: "arrow.triangle.2.circlepath") {
+                    model.restartDaemon()
+                }
+                .disabled(model.daemonRestarting)
+            }
+            .padding(.horizontal, 6)
+            .padding(.bottom, 6)
+
+            Divider()
+
             VStack(spacing: 2) {
                 MenuButton(model.paused ? "Resume" : "Pause for 30 min",
                            systemImage: model.paused ? "play.fill" : "pause.fill") {
