@@ -7,7 +7,6 @@ import StenoCore
 struct TranscriptView: View {
     @Environment(AppModel.self) private var model
     @State private var following = true
-    @State private var lastCount = 0
 
     private let bottomAnchor = "steno.transcript.bottom"
 
@@ -40,9 +39,8 @@ struct TranscriptView: View {
                     jumpToLive(proxy)
                 }
             }
-            .onChange(of: model.entries.count) { _, newCount in
+            .onChange(of: model.entries.count) { _, _ in
                 if following { scrollToBottom(proxy) }
-                lastCount = newCount
             }
             .onChange(of: model.orderedPartials.count) { _, _ in
                 if following { scrollToBottom(proxy) }

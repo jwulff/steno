@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import StenoCore
 
@@ -56,6 +57,7 @@ struct PartialRow: View {
     let source: AudioSource
     let text: String
     @State private var caretOn = true
+    private let blinkTimer = Timer.publish(every: 0.55, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -73,8 +75,8 @@ struct PartialRow: View {
                 .font(Theme.transcript)
                 .lineSpacing(Theme.transcriptLeading)
                 .fixedSize(horizontal: false, vertical: true)
-                .onAppear {
-                    withAnimation(.easeInOut(duration: 0.55).repeatForever()) { caretOn.toggle() }
+                .onReceive(blinkTimer) { _ in
+                    withAnimation(.easeInOut(duration: 0.1)) { caretOn.toggle() }
                 }
             Spacer(minLength: 0)
         }

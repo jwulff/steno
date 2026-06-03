@@ -7,8 +7,9 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 ///
 /// Opens the database `SQLITE_OPEN_READONLY`; the daemon is the sole writer and
 /// keeps WAL active, so the app only ever reads regenerable view data
-/// (topics, segments, summaries). All queries exclude `duplicate_of IS NOT
-/// NULL` rows, matching the TUI's default dedup filter.
+/// (topics, segments, summaries). The `segments` query excludes
+/// `duplicate_of IS NOT NULL` rows, matching the TUI's default dedup filter;
+/// `topics` and `summaries` do not have a `duplicate_of` column.
 public final class SQLiteReader: @unchecked Sendable {
     private var db: OpaquePointer?
     private let queue = DispatchQueue(label: "steno.sqlite.reader")

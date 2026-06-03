@@ -199,6 +199,15 @@ public actor DaemonClient {
     }
 
     private func handleDrop() {
+        // Cancel and nil out both connections so stale callbacks from old
+        // connections can't tear down a freshly-established session, and so
+        // commands fail immediately rather than queuing against a dead socket.
+        commandConn?.cancel()
+        commandConn = nil
+        eventConn?.cancel()
+        eventConn = nil
+        commandFramer = LineFramer()
+        eventFramer = LineFramer()
         finishEvents()
         failAllWaiters(DaemonClientError.closed)
         let handler = onConnectionLost

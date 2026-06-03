@@ -235,6 +235,9 @@ public final class AppModel {
         if paused { status = .paused }
         if let sid = resp.sessionId, sid != currentSessionId {
             currentSessionId = sid
+            // Reset per-session speaker labels so they don't carry over into
+            // the new session (e.g. on reconnect via status poll).
+            speakerOrder.removeAll()
         }
     }
 
