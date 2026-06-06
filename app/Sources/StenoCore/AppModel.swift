@@ -234,10 +234,11 @@ public final class AppModel {
         pauseExpiresAt = resp.pauseExpiresAt.map { Date(timeIntervalSince1970: $0) }
         if paused { status = .paused }
         if let sid = resp.sessionId, sid != currentSessionId {
-            currentSessionId = sid
-            // Reset per-session speaker labels so they don't carry over into
-            // the new session (e.g. on reconnect via status poll).
-            speakerOrder.removeAll()
+            // A new session observed via status poll (e.g. reconnect). Treat
+            // this identically to beginNewSession so that (a) speakerOrder
+            // doesn't incorrectly re-number existing visible entries, and (b)
+            // stale transcript content from the old session is cleared.
+            beginNewSession(sid)
         }
     }
 
@@ -299,9 +300,9 @@ public final class AppModel {
 
         if let sid = event.sessionId, sid != currentSessionId {
             // A fresh session appeared without an explicit demarcate (e.g.
-            // daemon restart). Adopt it and reset per-session speaker labels.
-            currentSessionId = sid
-            speakerOrder.removeAll()
+            // daemon restart). Use beginNewSession so speaker labels and
+            // entries are reset together — avoids renumbering visible segments.
+            beginNewSession(sid)
         }
 
         let started = event.startedAt.map { Date(timeIntervalSince1970: $0) } ?? Date()
@@ -415,8 +416,9 @@ public final class AppModel {
 
     private func reloadTopics(sessionId: String) {
         guard let store else { return }
-        let loaded = store.topics(sessionId: sessionId)
-        if !loaded.isEmpty { topics = loaded }
+        // Always assign (even an empty result) so stale topics from a prior
+        // session don't remain visible when the new session has no topics yet.
+        topics = store.topics(sessionId: sessionId)
     }
 
     /// Ordered partial lines for rendering (microphone first).

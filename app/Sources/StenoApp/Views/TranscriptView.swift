@@ -76,7 +76,10 @@ struct TranscriptView: View {
 
             if model.status == .error {
                 Button("Open Privacy Settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                    // Open the top-level Privacy & Security pane so users can
+                    // navigate to whichever permission is missing (Microphone
+                    // or Screen Recording) — both are needed for full capture.
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy") {
                         NSWorkspace.shared.open(url)
                     }
                 }
