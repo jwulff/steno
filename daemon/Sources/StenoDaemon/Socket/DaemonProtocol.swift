@@ -63,6 +63,15 @@ public struct DaemonResponse: Codable, Sendable {
     /// fire. `nil` for indefinite pauses or when not paused.
     public var pauseExpiresAt: Double?
 
+    /// #76 — latest or just-completed real-audio health pulse report.
+    public var healthPulseOk: Bool?
+    public var healthPulseTrigger: String?
+    public var healthPulseState: String?
+    public var healthPulseExpected: String?
+    public var healthPulseObserved: String?
+    public var healthPulseSimilarity: Double?
+    public var healthPulseThreshold: Double?
+
     public init(
         ok: Bool,
         sessionId: String? = nil,
@@ -75,7 +84,14 @@ public struct DaemonResponse: Codable, Sendable {
         systemAudio: Bool? = nil,
         paused: Bool? = nil,
         pausedIndefinitely: Bool? = nil,
-        pauseExpiresAt: Double? = nil
+        pauseExpiresAt: Double? = nil,
+        healthPulseOk: Bool? = nil,
+        healthPulseTrigger: String? = nil,
+        healthPulseState: String? = nil,
+        healthPulseExpected: String? = nil,
+        healthPulseObserved: String? = nil,
+        healthPulseSimilarity: Double? = nil,
+        healthPulseThreshold: Double? = nil
     ) {
         self.ok = ok
         self.sessionId = sessionId
@@ -89,6 +105,13 @@ public struct DaemonResponse: Codable, Sendable {
         self.paused = paused
         self.pausedIndefinitely = pausedIndefinitely
         self.pauseExpiresAt = pauseExpiresAt
+        self.healthPulseOk = healthPulseOk
+        self.healthPulseTrigger = healthPulseTrigger
+        self.healthPulseState = healthPulseState
+        self.healthPulseExpected = healthPulseExpected
+        self.healthPulseObserved = healthPulseObserved
+        self.healthPulseSimilarity = healthPulseSimilarity
+        self.healthPulseThreshold = healthPulseThreshold
     }
 
     /// Convenience: success response.
@@ -135,6 +158,15 @@ public struct DaemonEvent: Codable, Sendable {
     public var state: String?
     public var reason: String?
 
+    /// #76 — health pulse event payload.
+    public var healthPulseOk: Bool?
+    public var healthPulseTrigger: String?
+    public var healthPulseState: String?
+    public var healthPulseExpected: String?
+    public var healthPulseObserved: String?
+    public var healthPulseSimilarity: Double?
+    public var healthPulseThreshold: Double?
+
     public init(
         event: String,
         text: String? = nil,
@@ -155,7 +187,14 @@ public struct DaemonEvent: Codable, Sendable {
         speakerId: String? = nil,
         component: String? = nil,
         state: String? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        healthPulseOk: Bool? = nil,
+        healthPulseTrigger: String? = nil,
+        healthPulseState: String? = nil,
+        healthPulseExpected: String? = nil,
+        healthPulseObserved: String? = nil,
+        healthPulseSimilarity: Double? = nil,
+        healthPulseThreshold: Double? = nil
     ) {
         self.event = event
         self.text = text
@@ -177,5 +216,12 @@ public struct DaemonEvent: Codable, Sendable {
         self.component = component
         self.state = state
         self.reason = reason
+        self.healthPulseOk = healthPulseOk
+        self.healthPulseTrigger = healthPulseTrigger
+        self.healthPulseState = healthPulseState
+        self.healthPulseExpected = healthPulseExpected
+        self.healthPulseObserved = healthPulseObserved
+        self.healthPulseSimilarity = healthPulseSimilarity
+        self.healthPulseThreshold = healthPulseThreshold
     }
 }

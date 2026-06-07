@@ -103,6 +103,11 @@ public actor RecordingEngine {
     /// sleep.
     private let nowProvider: @Sendable () -> Date
 
+    /// #76 — optional sink for automatic health-pulse triggers emitted after
+    /// startup/wake/device-change recovery paths settle. Production wires this
+    /// to `HealthPulseCoordinator.schedule(trigger:)`; tests default to no-op.
+    private let healthPulseTrigger: @Sendable (HealthPulseTrigger) async -> Void
+
     // MARK: - Internal state
 
     private var micRecognizerHandle: (any SpeechRecognizerHandle)?
@@ -331,6 +336,7 @@ public actor RecordingEngine {
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
         healThresholdSeconds: Int = 30,
         now: @Sendable @escaping () -> Date = { Date() },
+        healthPulseTrigger: @Sendable @escaping (HealthPulseTrigger) async -> Void = { _ in },
         dedupCoordinator: DedupCoordinator? = nil,
         dedupTriggerDebounce: Duration = .seconds(5),
         emptySessionMinChars: Int = 20,
@@ -355,6 +361,7 @@ public actor RecordingEngine {
         self.deviceUIDProvider = deviceUIDProvider
         self.healThresholdSeconds = healThresholdSeconds
         self.nowProvider = now
+        self.healthPulseTrigger = healthPulseTrigger
         self.dedupCoordinator = dedupCoordinator
         self.dedupTriggerDebounce = dedupTriggerDebounce
         self.emptySessionMinChars = emptySessionMinChars
@@ -887,6 +894,37 @@ public actor RecordingEngine {
 
         await setStatus(.idle)
         isStopping = false
+    }
+
+    /// #76 Step 1 recovery: rebuild the production capture/transcription
+    /// graph in place, reusing the existing U5 restart machinery instead of
+    /// a synthetic health path. This restarts the mic pipeline and, when
+    /// system audio is enabled and not parked for no-display, the sys pipeline.
+    public func restartCaptureForHealthPulse(reason: String) async throws {
+        guard status == .recording || status == .recovering || status == .error else {
+            throw RecordingEngineError.notRecording
+        }
+        guard currentSession != nil else {
+            throw RecordingEngineError.notRecording
+        }
+
+        if micRestartTask == nil {
+            await scheduleMicRestart(reason: reason, errorCode: "health_pulse")
+        }
+        if isSystemAudioEnabled && !sysParkedAwaitingDisplay && sysRestartTask == nil {
+            await scheduleSysRestart(reason: reason, errorCode: "health_pulse")
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while (micRestartTask != nil || sysRestartTask != nil) && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        if micRestartTask != nil || sysRestartTask != nil {
+            throw RecordingEngineError.audioSourceFailed("health pulse capture recovery timed out")
+        }
+        if status == .error {
+            throw RecordingEngineError.audioSourceFailed("health pulse capture recovery surrendered")
+        }
     }
 
     /// List available audio devices.
@@ -2222,6 +2260,10 @@ public actor RecordingEngine {
                 await setStatus(.error)
             }
         }
+
+        if status == .recording {
+            await healthPulseTrigger(.wakeFromSleep)
+        }
     }
 
     // MARK: - U7 Device-Change Handler
@@ -2318,6 +2360,9 @@ public actor RecordingEngine {
             // Cheap re-tap path — restart already ran via U5 (which
             // staged its own `after_gap:Ns` heal marker). No heal-rule
             // invocation, no session boundary change.
+            if status == .recording {
+                await healthPulseTrigger(.defaultInputChanged)
+            }
             return
         }
 
@@ -2374,6 +2419,10 @@ public actor RecordingEngine {
                     isTransient: false
                 ))
             }
+        }
+
+        if status == .recording {
+            await healthPulseTrigger(.defaultInputChanged)
         }
     }
 

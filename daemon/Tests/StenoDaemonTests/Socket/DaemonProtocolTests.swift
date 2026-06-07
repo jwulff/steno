@@ -77,6 +77,27 @@ struct DaemonProtocolTests {
         #expect(decoded.devices == ["Mic 1", "Mic 2"])
     }
 
+    @Test func responseHealthPulseFieldsRoundTrip() throws {
+        let response = DaemonResponse(
+            ok: true,
+            healthPulseOk: true,
+            healthPulseTrigger: "manual",
+            healthPulseState: "passed",
+            healthPulseExpected: "Steno health pulse token amber bravo cedar delta",
+            healthPulseObserved: "steno health pulse token amber bravo cedar delta",
+            healthPulseSimilarity: 1,
+            healthPulseThreshold: 0.82
+        )
+
+        let data = try JSONEncoder().encode(response)
+        let decoded = try JSONDecoder().decode(DaemonResponse.self, from: data)
+
+        #expect(decoded.healthPulseOk == true)
+        #expect(decoded.healthPulseTrigger == "manual")
+        #expect(decoded.healthPulseState == "passed")
+        #expect(decoded.healthPulseThreshold == 0.82)
+    }
+
     @Test func responseSuccess() throws {
         let response = DaemonResponse.success()
         let data = try JSONEncoder().encode(response)
@@ -110,6 +131,28 @@ struct DaemonProtocolTests {
         #expect(decoded.event == "partial")
         #expect(decoded.text == "hello world")
         #expect(decoded.source == "microphone")
+    }
+
+    @Test func eventHealthPulseFieldsRoundTrip() throws {
+        let event = DaemonEvent(
+            event: "health_pulse",
+            message: "passed",
+            healthPulseOk: true,
+            healthPulseTrigger: "manual",
+            healthPulseState: "passed",
+            healthPulseExpected: "expected",
+            healthPulseObserved: "observed",
+            healthPulseSimilarity: 0.9,
+            healthPulseThreshold: 0.82
+        )
+
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(DaemonEvent.self, from: data)
+
+        #expect(decoded.event == "health_pulse")
+        #expect(decoded.healthPulseOk == true)
+        #expect(decoded.healthPulseTrigger == "manual")
+        #expect(decoded.healthPulseSimilarity == 0.9)
     }
 
     @Test func eventLevelFields() throws {

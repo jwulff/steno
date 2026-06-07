@@ -190,6 +190,41 @@ struct CommandDispatcherTests {
         #expect(responses[0].error?.contains("Unknown command") == true)
     }
 
+    @Test @MainActor func healthPulseCommandReturnsStructuredReport() async throws {
+        let (_, engine, broadcaster) = makeDispatcher()
+        let runner = DispatcherScriptedHealthPulseRunner(result: HealthPulseRunResult(
+            state: .passed,
+            expectedText: "Steno health pulse token amber bravo cedar delta",
+            observedText: "steno health pulse token amber bravo cedar delta",
+            similarity: 1,
+            threshold: 0.82,
+            message: "passed"
+        ))
+        let coordinator = HealthPulseCoordinator(
+            runner: runner,
+            recoverer: DispatcherNoopHealthPulseRecoverer(),
+            logger: { _ in }
+        )
+        let dispatcher = CommandDispatcher(
+            engine: engine,
+            broadcaster: broadcaster,
+            healthPulseCoordinator: coordinator
+        )
+        let client = MockClientConnection()
+
+        await dispatcher.handle(DaemonCommand(cmd: "health_pulse"), from: client)
+
+        let responses = await client.sentResponses
+        #expect(responses.count == 1)
+        #expect(responses[0].ok == true)
+        #expect(responses[0].healthPulseOk == true)
+        #expect(responses[0].healthPulseTrigger == "manual")
+        #expect(responses[0].healthPulseState == "passed")
+        #expect(responses[0].healthPulseObserved == "steno health pulse token amber bravo cedar delta")
+        #expect(responses[0].healthPulseSimilarity == 1)
+        #expect(responses[0].healthPulseThreshold == 0.82)
+    }
+
     // MARK: - Cluster-4 review fixes (PR #37)
 
     @Test @MainActor func demarcateResponseReflectsEngineStatusOnHappyPath() async throws {
@@ -287,5 +322,23 @@ struct CommandDispatcherTests {
             audioSourceFactory: MockAudioSourceFactory(),
             speechRecognizerFactory: MockSpeechRecognizerFactory()
         )
+    }
+}
+
+private actor DispatcherScriptedHealthPulseRunner: HealthPulseRunning {
+    private let result: HealthPulseRunResult
+
+    init(result: HealthPulseRunResult) {
+        self.result = result
+    }
+
+    func run(trigger: HealthPulseTrigger) async -> HealthPulseRunResult {
+        result
+    }
+}
+
+private struct DispatcherNoopHealthPulseRecoverer: HealthPulseRecovering {
+    func recover(step: HealthPulseRecoveryStep, trigger: HealthPulseTrigger) async -> HealthPulseRecoveryAttempt {
+        HealthPulseRecoveryAttempt(step: step, ok: true, message: "noop")
     }
 }

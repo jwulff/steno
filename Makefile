@@ -1,6 +1,6 @@
 .PHONY: build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
-       run-daemon run-steno run-mcp \
+       run-daemon run-steno run-mcp run-local \
        test test-daemon test-steno \
        clean install
 
@@ -64,6 +64,9 @@ run-steno: build-steno
 
 run-mcp: build-steno
 	$(STENO_DIR)/$(STENO_BIN) --mcp
+
+run-local:
+	./scripts/run-local
 
 # --- Test ---
 

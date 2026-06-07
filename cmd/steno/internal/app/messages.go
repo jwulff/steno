@@ -33,6 +33,12 @@ type DevicesResponseMsg struct {
 	Response daemon.Response
 }
 
+// HealthPulseResponseMsg carries the response to the automatic TUI health pulse.
+type HealthPulseResponseMsg struct {
+	Response           daemon.Response
+	AllowDaemonRestart bool
+}
+
 // StartResponseMsg carries the response to a start command.
 type StartResponseMsg struct {
 	Response daemon.Response
