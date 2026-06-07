@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jwulff/steno/internal/db"
@@ -11,16 +13,67 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jwulff/steno/internal/app"
+	"github.com/jwulff/steno/internal/daemon"
 )
 
 func main() {
 	mcpMode := flag.Bool("mcp", false, "Run as MCP stdio server (read-only database access)")
+	healthPulse := flag.Bool("health-pulse", false, "Run the real speaker-to-mic audio health pulse and print the result")
 	flag.Parse()
 
-	if *mcpMode {
+	if *healthPulse {
+		runHealthPulse()
+	} else if *mcpMode {
 		runMCP()
 	} else {
 		runTUI()
+	}
+}
+
+func runHealthPulse() {
+	mgr := daemon.NewManager()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := mgr.EnsureRunning(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "steno: %v\n", err)
+		os.Exit(1)
+	}
+
+	client, err := daemon.Connect(daemon.SocketPath())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "steno: %v\n", err)
+		os.Exit(1)
+	}
+	defer client.Close()
+
+	resp, err := client.SendCommand(daemon.HealthPulseCmd())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "steno: %v\n", err)
+		os.Exit(1)
+	}
+
+	if resp.HealthPulseOK != nil && *resp.HealthPulseOK {
+		fmt.Println("Health pulse passed")
+	} else {
+		fmt.Println("Health pulse failed")
+	}
+	if resp.HealthPulseState != "" {
+		fmt.Printf("state: %s\n", resp.HealthPulseState)
+	}
+	if resp.HealthPulseExpected != "" {
+		fmt.Printf("expected: %s\n", resp.HealthPulseExpected)
+	}
+	if resp.HealthPulseObserved != "" {
+		fmt.Printf("observed: %s\n", resp.HealthPulseObserved)
+	}
+	if resp.HealthPulseSimilarity != nil && resp.HealthPulseThreshold != nil {
+		fmt.Printf("similarity: %.2f (threshold %.2f)\n", *resp.HealthPulseSimilarity, *resp.HealthPulseThreshold)
+	}
+	if !resp.OK {
+		if resp.Error != "" {
+			fmt.Fprintf(os.Stderr, "steno: %s\n", resp.Error)
+		}
+		os.Exit(1)
 	}
 }
 

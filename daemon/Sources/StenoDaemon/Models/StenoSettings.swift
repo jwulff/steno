@@ -106,6 +106,17 @@ public struct StenoSettings: Codable, Sendable {
     /// rolling window for privacy or storage reasons.
     public var retentionDays: Int
 
+    /// #76 automatic real-audio health pulses. Disabled by default because a
+    /// pulse intentionally speaks through the default output device; the
+    /// on-demand `steno --health-pulse` command works regardless.
+    public var healthPulseAutomaticEnabled: Bool
+
+    /// #76 timeout for the real speaker→air→mic health pulse.
+    public var healthPulseTimeoutSeconds: Double
+
+    /// #76 fuzzy threshold for matching lossy TTS→ASR output.
+    public var healthPulseFuzzyThreshold: Double
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
@@ -120,7 +131,10 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinChars: Int = 20,
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
-        retentionDays: Int = 0
+        retentionDays: Int = 0,
+        healthPulseAutomaticEnabled: Bool = false,
+        healthPulseTimeoutSeconds: Double = 45,
+        healthPulseFuzzyThreshold: Double = 0.82
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -136,6 +150,9 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.topicExtractionMinSegments = topicExtractionMinSegments
         self.retentionDays = retentionDays
+        self.healthPulseAutomaticEnabled = healthPulseAutomaticEnabled
+        self.healthPulseTimeoutSeconds = healthPulseTimeoutSeconds
+        self.healthPulseFuzzyThreshold = healthPulseFuzzyThreshold
     }
 
     // MARK: - Codable
@@ -158,6 +175,9 @@ public struct StenoSettings: Codable, Sendable {
         case emptySessionMinDurationSeconds
         case topicExtractionMinSegments
         case retentionDays
+        case healthPulseAutomaticEnabled
+        case healthPulseTimeoutSeconds
+        case healthPulseFuzzyThreshold
     }
 
     public init(from decoder: Decoder) throws {
@@ -176,6 +196,9 @@ public struct StenoSettings: Codable, Sendable {
         self.emptySessionMinDurationSeconds = try container.decodeIfPresent(Double.self, forKey: .emptySessionMinDurationSeconds) ?? 3.0
         self.topicExtractionMinSegments = try container.decodeIfPresent(Int.self, forKey: .topicExtractionMinSegments) ?? 3
         self.retentionDays = try container.decodeIfPresent(Int.self, forKey: .retentionDays) ?? 0
+        self.healthPulseAutomaticEnabled = try container.decodeIfPresent(Bool.self, forKey: .healthPulseAutomaticEnabled) ?? false
+        self.healthPulseTimeoutSeconds = try container.decodeIfPresent(Double.self, forKey: .healthPulseTimeoutSeconds) ?? 45
+        self.healthPulseFuzzyThreshold = try container.decodeIfPresent(Double.self, forKey: .healthPulseFuzzyThreshold) ?? 0.82
     }
 
     // MARK: - Persistence

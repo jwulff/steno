@@ -51,6 +51,15 @@ type Response struct {
 	// auto-resume timer will fire. Nil for indefinite pauses or when
 	// not paused. (U10)
 	PauseExpiresAt *float64 `json:"pauseExpiresAt,omitempty"`
+
+	// #76 — real-audio health pulse report fields.
+	HealthPulseOK         *bool    `json:"healthPulseOk,omitempty"`
+	HealthPulseTrigger    string   `json:"healthPulseTrigger,omitempty"`
+	HealthPulseState      string   `json:"healthPulseState,omitempty"`
+	HealthPulseExpected   string   `json:"healthPulseExpected,omitempty"`
+	HealthPulseObserved   string   `json:"healthPulseObserved,omitempty"`
+	HealthPulseSimilarity *float64 `json:"healthPulseSimilarity,omitempty"`
+	HealthPulseThreshold  *float64 `json:"healthPulseThreshold,omitempty"`
 }
 
 // Event is streamed from the daemon to subscribed clients.
@@ -89,6 +98,15 @@ type Event struct {
 	Component string `json:"component,omitempty"`
 	State     string `json:"state,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+
+	// #76 — real-audio health pulse event payload.
+	HealthPulseOK         *bool    `json:"healthPulseOk,omitempty"`
+	HealthPulseTrigger    string   `json:"healthPulseTrigger,omitempty"`
+	HealthPulseState      string   `json:"healthPulseState,omitempty"`
+	HealthPulseExpected   string   `json:"healthPulseExpected,omitempty"`
+	HealthPulseObserved   string   `json:"healthPulseObserved,omitempty"`
+	HealthPulseSimilarity *float64 `json:"healthPulseSimilarity,omitempty"`
+	HealthPulseThreshold  *float64 `json:"healthPulseThreshold,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.
@@ -129,4 +147,9 @@ func DemarcateCmd() Command {
 // `lastSystemAudioEnabled` so future auto-starts inherit the new value.
 func ReconfigureCmd(systemAudio bool) Command {
 	return Command{Cmd: "reconfigure", SystemAudio: BoolPtr(systemAudio)}
+}
+
+// HealthPulseCmd fires the real speaker→air→mic health pulse on demand.
+func HealthPulseCmd() Command {
+	return Command{Cmd: "health_pulse"}
 }
