@@ -4,6 +4,7 @@ import Foundation
 public actor CommandDispatcher {
     private let engine: RecordingEngine
     private let broadcaster: EventBroadcaster
+    private let healthPulseCoordinator: HealthPulseCoordinator?
 
     /// Default auto-resume window for `pause` commands that omit both
     /// `autoResumeSeconds` and `indefinite`. 30 minutes matches the
@@ -11,9 +12,14 @@ public actor CommandDispatcher {
     /// number sprinkled in the engine).
     public static let defaultPauseAutoResumeSeconds: Double = 1800
 
-    public init(engine: RecordingEngine, broadcaster: EventBroadcaster) {
+    public init(
+        engine: RecordingEngine,
+        broadcaster: EventBroadcaster,
+        healthPulseCoordinator: HealthPulseCoordinator? = nil
+    ) {
         self.engine = engine
         self.broadcaster = broadcaster
+        self.healthPulseCoordinator = healthPulseCoordinator
     }
 
     /// Handle a command from a client and send a response.
@@ -50,6 +56,9 @@ public actor CommandDispatcher {
 
         case "reconfigure":
             response = await handleReconfigure(command)
+
+        case "health_pulse":
+            response = await handleHealthPulse()
 
         default:
             response = DaemonResponse.failure("Unknown command: \(command.cmd)")
@@ -230,6 +239,26 @@ public actor CommandDispatcher {
         } catch {
             return DaemonResponse.failure(error.localizedDescription)
         }
+    }
+
+
+    private func handleHealthPulse() async -> DaemonResponse {
+        guard let healthPulseCoordinator else {
+            return DaemonResponse.failure("Health pulse is not configured")
+        }
+
+        let report = await healthPulseCoordinator.run(trigger: .manual)
+        return DaemonResponse(
+            ok: report.ok,
+            error: report.ok ? nil : report.message,
+            healthPulseOk: report.ok,
+            healthPulseTrigger: report.trigger.rawValue,
+            healthPulseState: report.finalState.rawValue,
+            healthPulseExpected: report.expectedText,
+            healthPulseObserved: report.observedText,
+            healthPulseSimilarity: report.similarity,
+            healthPulseThreshold: report.threshold
+        )
     }
 
     private func handleDevices() async -> DaemonResponse {

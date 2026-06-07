@@ -160,6 +160,12 @@ type Model struct {
 	systemAudio  bool
 	devices      []string
 
+	// The TUI automatically asks the daemon to run one real speaker-to-mic
+	// health pulse after it attaches to an active recording session.
+	healthPulseTriggered       bool
+	healthPulseRetryPending    bool
+	healthPulseRestartAttempts int
+
 	// Pause state (U9 / U10 wire)
 	pauseExpiresAt     *time.Time // nil for indefinite or not-paused
 	pausedIndefinitely bool
@@ -429,6 +435,50 @@ func devicesCmd(client *daemon.Client) tea.Cmd {
 	}
 }
 
+// healthPulseCmd asks the daemon to run the real speaker-to-mic health pulse.
+func healthPulseCmd(client *daemon.Client, allowDaemonRestart bool) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := client.SendCommand(daemon.HealthPulseCmd())
+		if err != nil {
+			return HealthPulseResponseMsg{
+				Response: daemon.Response{
+					OK:    false,
+					Error: err.Error(),
+				},
+				AllowDaemonRestart: allowDaemonRestart,
+			}
+		}
+		return HealthPulseResponseMsg{
+			Response:           resp,
+			AllowDaemonRestart: allowDaemonRestart,
+		}
+	}
+}
+
+func restartDaemonForHealthPulseCmd() tea.Cmd {
+	return func() tea.Msg {
+		mgr := daemon.NewManager()
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+
+		if err := mgr.Restart(ctx); err != nil {
+			return DaemonConnectErrorMsg{Err: err}
+		}
+
+		sockPath := daemon.SocketPath()
+		client, err := daemon.Connect(sockPath)
+		if err != nil {
+			return DaemonConnectErrorMsg{Err: err}
+		}
+		evClient, err := daemon.Connect(sockPath)
+		if err != nil {
+			client.Close()
+			return DaemonConnectErrorMsg{Err: err}
+		}
+		return DaemonConnectedMsg{Client: client, EvClient: evClient}
+	}
+}
+
 // startCmd sends a start recording command.
 func startCmd(client *daemon.Client, device string, sysAudio bool) tea.Cmd {
 	return func() tea.Msg {
@@ -640,13 +690,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reconnecting = false
 		m.reconnectAttempt = 0
 		m.statusText = "Connected"
-		// Subscribe on event client, fetch status/devices on command client
-		return m, tea.Batch(
+		// Subscribe on event client, fetch status/devices on command client.
+		cmds := []tea.Cmd{
 			subscribeCmd(m.evClient),
 			statusCmd(m.client),
 			devicesCmd(m.client),
 			openStoreCmd(),
-		)
+		}
+		if m.healthPulseRetryPending {
+			m.healthPulseRetryPending = false
+			m.errorMessage = "Retrying health pulse..."
+			m.errorTransient = true
+			cmds = append(cmds, healthPulseCmd(m.client, false))
+		}
+		return m, tea.Batch(cmds...)
 
 	case DaemonConnectErrorMsg:
 		m.connected = false
@@ -687,11 +744,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// U10: status response carries pause-state on every status fetch
 		// so a freshly-connected TUI sees the truth immediately.
 		m.applyPauseFields(r.Paused, r.PausedIndefinitely, r.PauseExpiresAt)
+		if !m.healthPulseTriggered && m.recording && m.sessionID != "" && m.client != nil {
+			m.healthPulseTriggered = true
+			m.healthPulseRetryPending = false
+			m.healthPulseRestartAttempts = 0
+			m.errorMessage = "Running health pulse..."
+			m.errorTransient = true
+			return m, healthPulseCmd(m.client, true)
+		}
 		return m, nil
 
 	case DevicesResponseMsg:
 		if msg.Response.Devices != nil {
 			m.devices = msg.Response.Devices
+		}
+		return m, nil
+
+	case HealthPulseResponseMsg:
+		r := msg.Response
+		if shouldRestartForHealthPulse(r, msg.AllowDaemonRestart, m.healthPulseRestartAttempts) {
+			m.healthPulseRestartAttempts++
+			m.healthPulseRetryPending = true
+			m.connected = false
+			m.statusText = "Restarting daemon for health pulse..."
+			m.errorMessage = "Health pulse failed; restarting daemon once..."
+			m.errorTransient = true
+			if m.client != nil {
+				m.client.Close()
+				m.client = nil
+			}
+			if m.evClient != nil {
+				m.evClient.Close()
+				m.evClient = nil
+			}
+			return m, restartDaemonForHealthPulseCmd()
+		}
+		if r.HealthPulseOK != nil {
+			message := r.Error
+			if message == "" {
+				message = "HEALTH_PULSE_FAILED"
+			}
+			return m, m.applyHealthPulseResult(*r.HealthPulseOK, message)
+		}
+		if !r.OK {
+			msg := r.Error
+			if msg == "" {
+				msg = "HEALTH_PULSE_FAILED"
+			}
+			return m, m.applyHealthPulseResult(false, msg)
 		}
 		return m, nil
 
@@ -1133,6 +1233,17 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		}
 		return nil
 
+	case "health_pulse":
+		if ev.HealthPulseOK != nil && *ev.HealthPulseOK {
+			return m.applyHealthPulseResult(true, ev.Message)
+		}
+
+		msg := ev.Message
+		if msg == "" {
+			msg = "HEALTH_PULSE_FAILED"
+		}
+		return m.applyHealthPulseResult(false, msg)
+
 	case "speaker_label":
 		// #61: the diarization merge assigned (or revised) a speaker for a
 		// segment we already have in the live view. Find it by sequenceNumber
@@ -1232,6 +1343,37 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 	return nil
 }
 
+func (m *Model) applyHealthPulseResult(ok bool, message string) tea.Cmd {
+	if ok {
+		m.errorMessage = "Health pulse passed"
+		m.errorTransient = true
+		return clearTransientErrorCmd()
+	}
+
+	if message == "" {
+		message = "HEALTH_PULSE_FAILED"
+	}
+	m.engineStatus = StatusError
+	m.errorTransient = false
+	if m.errorMessage != message || m.errorTransient {
+		m.errorMessage = message
+		m.appendErrorHistory(message)
+		return nil
+	}
+	m.errorMessage = message
+	return nil
+}
+
+func shouldRestartForHealthPulse(resp daemon.Response, allowDaemonRestart bool, attempts int) bool {
+	if !allowDaemonRestart || attempts >= 1 {
+		return false
+	}
+	if resp.HealthPulseOK != nil {
+		return !*resp.HealthPulseOK
+	}
+	return !resp.OK
+}
+
 // handleKey processes key presses.
 //
 // First-launch banner intercepts ALL keypresses — any key dismisses it
@@ -1325,6 +1467,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// U9: toggle error-history modal.
 		m.showErrorModal = !m.showErrorModal
 		return m, nil
+
+	case KeyHealthPulse:
+		if !m.connected || m.client == nil {
+			return m, nil
+		}
+		if m.engineStatus == StatusPaused {
+			return m, func() tea.Msg { return PauseHintMsg{} }
+		}
+		m.healthPulseRetryPending = false
+		m.healthPulseRestartAttempts = 0
+		m.errorMessage = "Running health pulse..."
+		m.errorTransient = true
+		return m, healthPulseCmd(m.client, true)
 
 	case KeySystemAudio:
 		// Toggle system-audio capture via the daemon's `reconfigure`
@@ -2210,6 +2365,7 @@ func (m Model) renderFooter() string {
 			parts = append(parts, ui.FooterKeyStyle.Render("P")+ui.FooterDescStyle.Render(" Pause"))
 		}
 		parts = append(parts, ui.FooterKeyStyle.Render("e")+ui.FooterDescStyle.Render(" Errors"))
+		parts = append(parts, ui.FooterKeyStyle.Render("h")+ui.FooterDescStyle.Render(" Health"))
 		// Sys-audio toggle. Label shows the action the keypress will perform
 		// (the opposite of the current state) so it doubles as a status hint.
 		if m.systemAudio {

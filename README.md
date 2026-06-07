@@ -54,6 +54,7 @@ That's it. Running `steno` automatically starts the daemon in the background if 
 | `Space` | Start/stop recording |
 | `i` | Cycle input devices |
 | `a` | Toggle system audio capture |
+| `h` | Run health pulse |
 | `Tab` | Switch panel focus (topics/transcript) |
 | `j`/`k` | Navigate topics |
 | `Enter` | Expand/collapse topic |
@@ -155,11 +156,22 @@ make build          # Build daemon (release) + steno
 make test           # Run all test suites (daemon + steno)
 make test-daemon    # Daemon tests only (Swift)
 make test-steno     # Steno tests only (Go)
+make run-local      # Build debug daemon + TUI, stop old daemons, run local TUI
 make run-daemon     # Build, sign, and run daemon (debug)
 make run-steno      # Build and run TUI
 make run-mcp        # Build and run MCP server
 make clean          # Remove all build artifacts
 make install        # Install to ~/.local/bin (override with PREFIX=)
+```
+
+For PR/local daemon work, prefer `scripts/run-local`. It can be run from any
+Steno working-tree directory, builds both binaries, unloads a launchd-managed
+daemon if present, stops exact-name `steno-daemon` processes, and runs the
+local Go binary with `STENO_DAEMON_PATH` pointed at the freshly built debug
+daemon. Pass CLI flags through to the local binary, for example:
+
+```bash
+scripts/run-local --health-pulse
 ```
 
 See [CLAUDE.md](CLAUDE.md) for development conventions.

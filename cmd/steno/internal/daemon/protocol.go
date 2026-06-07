@@ -51,6 +51,17 @@ type Response struct {
 	// auto-resume timer will fire. Nil for indefinite pauses or when
 	// not paused. (U10)
 	PauseExpiresAt *float64 `json:"pauseExpiresAt,omitempty"`
+
+	// Health-pulse fields mirror PR #78's daemon response payload for the
+	// speaker→air→mic self-test. They are optional so older daemons can still
+	// respond to other commands without breaking the client.
+	HealthPulseOK         *bool    `json:"healthPulseOk,omitempty"`
+	HealthPulseTrigger    string   `json:"healthPulseTrigger,omitempty"`
+	HealthPulseState      string   `json:"healthPulseState,omitempty"`
+	HealthPulseExpected   string   `json:"healthPulseExpected,omitempty"`
+	HealthPulseObserved   string   `json:"healthPulseObserved,omitempty"`
+	HealthPulseSimilarity *float64 `json:"healthPulseSimilarity,omitempty"`
+	HealthPulseThreshold  *float64 `json:"healthPulseThreshold,omitempty"`
 }
 
 // Event is streamed from the daemon to subscribed clients.
@@ -89,6 +100,16 @@ type Event struct {
 	Component string `json:"component,omitempty"`
 	State     string `json:"state,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+
+	// Health-pulse event payload from PR #78. HealthPulseOK is a pointer so
+	// clients can distinguish a failed pulse (`false`) from an unrelated event.
+	HealthPulseOK         *bool    `json:"healthPulseOk,omitempty"`
+	HealthPulseTrigger    string   `json:"healthPulseTrigger,omitempty"`
+	HealthPulseState      string   `json:"healthPulseState,omitempty"`
+	HealthPulseExpected   string   `json:"healthPulseExpected,omitempty"`
+	HealthPulseObserved   string   `json:"healthPulseObserved,omitempty"`
+	HealthPulseSimilarity *float64 `json:"healthPulseSimilarity,omitempty"`
+	HealthPulseThreshold  *float64 `json:"healthPulseThreshold,omitempty"`
 }
 
 // BoolPtr returns a pointer to a bool value. Convenience for building commands.
@@ -129,4 +150,9 @@ func DemarcateCmd() Command {
 // `lastSystemAudioEnabled` so future auto-starts inherit the new value.
 func ReconfigureCmd(systemAudio bool) Command {
 	return Command{Cmd: "reconfigure", SystemAudio: BoolPtr(systemAudio)}
+}
+
+// HealthPulseCmd builds the on-demand real speaker-to-mic health pulse command.
+func HealthPulseCmd() Command {
+	return Command{Cmd: "health_pulse"}
 }

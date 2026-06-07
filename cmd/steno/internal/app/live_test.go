@@ -170,3 +170,38 @@ func applyUpdate(m Model, msg tea.Msg) (Model, tea.Cmd) {
 	newModel, cmd := m.Update(msg)
 	return newModel.(Model), cmd
 }
+
+func TestHealthPulseEventPassedIsTransient(t *testing.T) {
+	m := New()
+	ok := true
+	cmd := m.handleEvent(daemon.Event{Event: "health_pulse", HealthPulseOK: &ok})
+
+	if m.errorMessage != "Health pulse passed" {
+		t.Fatalf("errorMessage = %q, want Health pulse passed", m.errorMessage)
+	}
+	if !m.errorTransient {
+		t.Fatalf("errorTransient = false, want true")
+	}
+	if cmd == nil {
+		t.Fatalf("cmd is nil, want transient clear command")
+	}
+}
+
+func TestHealthPulseEventFailureIsPersistent(t *testing.T) {
+	m := New()
+	ok := false
+	m.handleEvent(daemon.Event{Event: "health_pulse", Message: "health pulse could not hear nonce", HealthPulseOK: &ok})
+
+	if m.engineStatus != StatusError {
+		t.Fatalf("engineStatus = %v, want StatusError", m.engineStatus)
+	}
+	if m.errorMessage != "health pulse could not hear nonce" {
+		t.Fatalf("errorMessage = %q", m.errorMessage)
+	}
+	if m.errorTransient {
+		t.Fatalf("errorTransient = true, want false")
+	}
+	if len(m.errorHistory) != 1 || m.errorHistory[0].Message != "health pulse could not hear nonce" {
+		t.Fatalf("errorHistory = %#v", m.errorHistory)
+	}
+}

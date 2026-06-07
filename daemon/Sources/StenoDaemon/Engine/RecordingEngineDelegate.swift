@@ -54,6 +54,11 @@ public enum EngineEvent: Sendable {
     /// TUI update the in-memory segment without re-fetching from the DB.
     case speakerLabel(sessionId: UUID, sequenceNumber: Int, speakerId: UUID)
 
+    /// Ephemeral: real-audio health pulse finished (#76). Passed and failed
+    /// reports are queryable over the socket and failures route through the
+    /// existing loud error surface as well.
+    case healthPulse(HealthPulseReport)
+
     /// Ephemeral: an on-device model pipeline changed readiness (#62). Lets the
     /// TUI show "preparing model" / "unavailable" states for transcription
     /// (Layer A) and diarization (Layer B) instead of failing silently.

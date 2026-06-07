@@ -480,7 +480,6 @@ func captureCommand(t *testing.T, m Model, key tea.KeyMsg) []byte {
 	}
 }
 
-
 func TestSpaceSendsDemarcate(t *testing.T) {
 	m := New()
 	m.connected = true
@@ -582,6 +581,56 @@ func TestASendsReconfigureToggledOff(t *testing.T) {
 	}
 	if !strings.Contains(s, `"systemAudio":false`) {
 		t.Errorf("expected systemAudio=false (toggled from on); got %q", s)
+	}
+}
+
+func TestHSendsHealthPulse(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusRecording
+	m.width, m.height = 80, 24
+
+	data := captureCommand(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	if !strings.Contains(string(data), `"cmd":"health_pulse"`) {
+		t.Fatalf("sent command = %s, want health_pulse", string(data))
+	}
+}
+
+func TestHStartsFreshHealthPulseRetryBudget(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusRecording
+	m.width, m.height = 80, 24
+	m.client = &daemon.Client{}
+	m.healthPulseRetryPending = true
+	m.healthPulseRestartAttempts = 1
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	if cmd == nil {
+		t.Fatal("expected h to send health pulse command")
+	}
+	got := updated.(Model)
+	if got.healthPulseRetryPending {
+		t.Fatal("manual health pulse should clear pending retry state")
+	}
+	if got.healthPulseRestartAttempts != 0 {
+		t.Fatalf("manual health pulse restart attempts = %d, want 0", got.healthPulseRestartAttempts)
+	}
+}
+
+func TestHWhilePausedFlashesHint(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusPaused
+	m.width, m.height = 80, 24
+	m.client = &daemon.Client{}
+
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+	if cmd == nil {
+		t.Fatal("expected h while paused to flash pause hint")
+	}
+	if _, ok := cmd().(PauseHintMsg); !ok {
+		t.Fatalf("expected PauseHintMsg, got %T", cmd())
 	}
 }
 
@@ -1081,6 +1130,9 @@ func TestFooterReflectsEngineStatus(t *testing.T) {
 	if !strings.Contains(footer, "Pause 30m") {
 		t.Errorf("footer missing 'Pause 30m'; got %q", footer)
 	}
+	if !strings.Contains(footer, "Health") {
+		t.Errorf("footer missing 'Health'; got %q", footer)
+	}
 
 	m.engineStatus = StatusPaused
 	footer = m.renderFooter()
@@ -1511,8 +1563,8 @@ func TestSystemAudioParkedRenderedInHeader(t *testing.T) {
 func TestSystemAudioParkedNotRenderedWhenSysOff(t *testing.T) {
 	m := New()
 	m.connected = true
-	m.systemAudio = false       // user disabled system audio
-	m.systemAudioParked = true  // stale flag (shouldn't happen, but be defensive)
+	m.systemAudio = false      // user disabled system audio
+	m.systemAudioParked = true // stale flag (shouldn't happen, but be defensive)
 
 	header := m.renderHeader()
 	if strings.Contains(header, "waiting for display") {
@@ -1760,6 +1812,121 @@ func TestSpeakerOrderPersistsAcrossSameSession(t *testing.T) {
 		t.Errorf("labels unstable across same-session status update: %q / %q",
 			got.speakerLabel("uuid1"), got.speakerLabel("uuid2"))
 	}
+}
+
+func TestStatusResponseAutoTriggersHealthPulseForRunningSession(t *testing.T) {
+	m, receivedCh, cleanup := modelWithCommandCapture(t, `{"ok":true,"healthPulseOk":true}`+"\n")
+	defer cleanup()
+
+	updated, cmd := m.Update(StatusResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-a",
+		Recording: daemon.BoolPtr(true),
+		Status:    "recording",
+	}})
+	if cmd == nil {
+		t.Fatal("expected status response to trigger health pulse command")
+	}
+	_ = cmd()
+
+	got := updated.(Model)
+	if !got.healthPulseTriggered {
+		t.Fatal("healthPulseTriggered = false, want true")
+	}
+	if got.errorMessage != "Running health pulse..." {
+		t.Fatalf("errorMessage = %q, want running health pulse hint", got.errorMessage)
+	}
+
+	select {
+	case data := <-receivedCh:
+		if !strings.Contains(string(data), `"cmd":"health_pulse"`) {
+			t.Fatalf("sent command = %s, want health_pulse", string(data))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for health pulse command")
+	}
+}
+
+func TestStatusResponseHealthPulseAutoTriggerIsOneShot(t *testing.T) {
+	m, _, cleanup := modelWithCommandCapture(t, `{"ok":true,"healthPulseOk":true}`+"\n")
+	defer cleanup()
+
+	updated, cmd := m.Update(StatusResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-a",
+		Recording: daemon.BoolPtr(true),
+		Status:    "recording",
+	}})
+	if cmd == nil {
+		t.Fatal("expected first status response to trigger health pulse command")
+	}
+	got := updated.(Model)
+
+	_, cmd = got.Update(StatusResponseMsg{Response: daemon.Response{
+		OK:        true,
+		SessionID: "session-a",
+		Recording: daemon.BoolPtr(true),
+		Status:    "recording",
+	}})
+	if cmd != nil {
+		t.Fatal("second status response triggered another health pulse command")
+	}
+}
+
+func TestHealthPulseRestartPredicateIsCappedAtOne(t *testing.T) {
+	ok := false
+	resp := daemon.Response{OK: false, HealthPulseOK: &ok}
+
+	if !shouldRestartForHealthPulse(resp, true, 0) {
+		t.Fatal("first failed health pulse should restart daemon")
+	}
+	if shouldRestartForHealthPulse(resp, true, 1) {
+		t.Fatal("second failed health pulse must not restart daemon")
+	}
+	if shouldRestartForHealthPulse(resp, false, 0) {
+		t.Fatal("health pulse retry should not restart daemon when restart is disallowed")
+	}
+}
+
+func modelWithCommandCapture(t *testing.T, response string) (Model, <-chan []byte, func()) {
+	t.Helper()
+
+	sockPath := fmt.Sprintf("/tmp/steno-health-%d.sock", time.Now().UnixNano())
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	receivedCh := make(chan []byte, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		conn.Write([]byte(response))
+		receivedCh <- buf[:n]
+	}()
+
+	client, err := daemon.Connect(sockPath)
+	if err != nil {
+		listener.Close()
+		os.Remove(sockPath)
+		t.Fatalf("connect: %v", err)
+	}
+
+	m := New()
+	m.connected = true
+	m.client = client
+
+	cleanup := func() {
+		client.Close()
+		listener.Close()
+		os.Remove(sockPath)
+	}
+	return m, receivedCh, cleanup
 }
 
 // TestTranscriptRendersSpeakerPrefix exercises the renderer: when a

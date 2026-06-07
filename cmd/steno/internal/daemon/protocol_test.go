@@ -412,3 +412,49 @@ func TestEventPauseStateIndefinite(t *testing.T) {
 		t.Errorf("PauseExpiresAt should be nil for indefinite pause")
 	}
 }
+
+func TestHealthPulseCommand(t *testing.T) {
+	cmd := HealthPulseCmd()
+	if cmd.Cmd != "health_pulse" {
+		t.Fatalf("cmd = %q, want health_pulse", cmd.Cmd)
+	}
+}
+
+func TestHealthPulseResponseFields(t *testing.T) {
+	j := `{"ok":true,"healthPulseOk":true,"healthPulseTrigger":"manual","healthPulseState":"passed","healthPulseExpected":"expected","healthPulseObserved":"observed","healthPulseSimilarity":0.91,"healthPulseThreshold":0.82}`
+
+	var resp Response
+	if err := json.Unmarshal([]byte(j), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.HealthPulseOK == nil || !*resp.HealthPulseOK {
+		t.Fatalf("healthPulseOk = %v, want true", resp.HealthPulseOK)
+	}
+	if resp.HealthPulseTrigger != "manual" || resp.HealthPulseState != "passed" {
+		t.Fatalf("trigger/state = %q/%q, want manual/passed", resp.HealthPulseTrigger, resp.HealthPulseState)
+	}
+	if resp.HealthPulseExpected != "expected" || resp.HealthPulseObserved != "observed" {
+		t.Fatalf("expected/observed = %q/%q", resp.HealthPulseExpected, resp.HealthPulseObserved)
+	}
+	if resp.HealthPulseSimilarity == nil || *resp.HealthPulseSimilarity != 0.91 {
+		t.Fatalf("similarity = %v, want 0.91", resp.HealthPulseSimilarity)
+	}
+}
+
+func TestHealthPulseEventFields(t *testing.T) {
+	j := `{"event":"health_pulse","message":"passed","healthPulseOk":true,"healthPulseTrigger":"manual","healthPulseState":"passed","healthPulseSimilarity":1,"healthPulseThreshold":0.8}`
+
+	var ev Event
+	if err := json.Unmarshal([]byte(j), &ev); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if ev.Event != "health_pulse" {
+		t.Fatalf("event = %q, want health_pulse", ev.Event)
+	}
+	if ev.HealthPulseOK == nil || !*ev.HealthPulseOK {
+		t.Fatalf("healthPulseOk = %v, want true", ev.HealthPulseOK)
+	}
+	if ev.HealthPulseSimilarity == nil || *ev.HealthPulseSimilarity != 1 {
+		t.Fatalf("similarity = %v, want 1", ev.HealthPulseSimilarity)
+	}
+}

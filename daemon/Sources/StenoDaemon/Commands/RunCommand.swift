@@ -75,6 +75,9 @@ struct RunCommand: ParsableCommand {
 
                 // 5. Create engine, broadcaster, dispatcher
                 let broadcaster = EventBroadcaster()
+                let healthPulseRelay = HealthPulseTriggerRelay(
+                    automaticEnabled: settings.healthPulseAutomaticEnabled
+                )
 
                 // U11: cross-source dedup coordinator runs as a background
                 // pass after each segment write, debounced per-session.
@@ -94,6 +97,9 @@ struct RunCommand: ParsableCommand {
                     delegate: broadcaster,
                     deviceUIDProvider: { defaultInputDeviceUID() },
                     healThresholdSeconds: settings.healGapSeconds,
+                    healthPulseTrigger: { trigger in
+                        await healthPulseRelay.schedule(trigger)
+                    },
                     dedupCoordinator: dedupCoordinator,
                     dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
                     emptySessionMinChars: settings.emptySessionMinChars,
@@ -104,7 +110,29 @@ struct RunCommand: ParsableCommand {
                     transcriptionGate: DefaultTranscriptionModelGate()
                 )
 
-                let dispatcher = CommandDispatcher(engine: engine, broadcaster: broadcaster)
+                let healthPulseCoordinator = HealthPulseCoordinator(
+                    runner: RealAudioHealthPulseRunner(
+                        repository: repository,
+                        permissionService: permissionService,
+                        timeoutSeconds: settings.healthPulseTimeoutSeconds,
+                        threshold: settings.healthPulseFuzzyThreshold,
+                        requiredSources: {
+                            await engine.isSystemAudioEnabled
+                                ? [.microphone, .systemAudio]
+                                : [.microphone]
+                        }
+                    ),
+                    recoverer: DaemonHealthPulseRecovery(engine: engine),
+                    reporter: broadcaster,
+                    logger: { message in log.info("\(message)") }
+                )
+                await healthPulseRelay.setCoordinator(healthPulseCoordinator)
+
+                let dispatcher = CommandDispatcher(
+                    engine: engine,
+                    broadcaster: broadcaster,
+                    healthPulseCoordinator: healthPulseCoordinator
+                )
 
                 // U6: register IOKit power observer BEFORE auto-start so
                 // a willSleep arriving during the orphan sweep is
@@ -177,6 +205,10 @@ struct RunCommand: ParsableCommand {
                     )
                 } catch {
                     log.error("Auto-start failed: \(error). Engine remains in error state; awaiting external resume.")
+                }
+
+                if settings.healthPulseAutomaticEnabled {
+                    await healthPulseRelay.schedule(.startup)
                 }
 
                 // 5c. Kick off FluidAudio diarization model load in the

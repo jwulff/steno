@@ -7,6 +7,7 @@ package app
 //   - p     → toggle pause with 30-min auto-resume.
 //   - P     → toggle pause indefinite (manual resume only).
 //   - e     → toggle the error-history modal (last 10 non-transient errors).
+//   - h     → run a real health pulse; on failure, restart daemon once and retry.
 //
 // `start` and `stop` are still valid commands on the wire but no longer
 // have keybinds — the daemon is always recording in the always-on model.
@@ -44,6 +45,7 @@ const (
 	KeyErrorHistory    = "e"
 	KeyErrorHistoryUp  = "E"
 	KeyEsc             = "esc"
+	KeyHealthPulse     = "h"
 	// System-audio toggle (protocol-level reconfigure).
 	KeySystemAudio = "a"
 )
