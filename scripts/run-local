@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/run-local [--no-kill] [--] [steno args...]
+
+Builds the local debug daemon and Go TUI, stops any existing steno-daemon,
+then runs the local steno binary with STENO_DAEMON_PATH pointing at the freshly
+built daemon.
+
+Examples:
+  scripts/run-local
+  scripts/run-local --health-pulse
+  scripts/run-local -- --mcp
+
+Options:
+  --no-kill   Do not stop existing steno-daemon processes first.
+  -h, --help  Show this help.
+USAGE
+}
+
+die() {
+  printf 'run-local: %s\n' "$*" >&2
+  exit 1
+}
+
+repo_root_from() {
+  git -C "$1" rev-parse --show-toplevel 2>/dev/null || true
+}
+
+is_steno_root() {
+  [ -f "$1/Makefile" ] &&
+    [ -f "$1/daemon/Package.swift" ] &&
+    [ -f "$1/cmd/steno/go.mod" ]
+}
+
+wait_for_exit() {
+  local pid
+  local deadline
+
+  deadline=$((SECONDS + 5))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    local still_running=""
+    for pid in "$@"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_running=1
+        break
+      fi
+    done
+    [ -z "$still_running" ] && return 0
+    sleep 0.2
+  done
+
+  return 1
+}
+
+stop_launchd_daemon() {
+  local label="com.steno.daemon"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+
+  if [ -f "$plist" ]; then
+    printf 'Stopping launchd job %s if loaded...\n' "$label"
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  fi
+}
+
+stop_running_daemons() {
+  local pids
+
+  pids="$(pgrep -x steno-daemon 2>/dev/null || true)"
+  [ -z "$pids" ] && return 0
+
+  printf 'Stopping existing steno-daemon process(es): %s\n' "$pids"
+  kill $pids 2>/dev/null || true
+
+  if ! wait_for_exit $pids; then
+    printf 'Escalating stubborn steno-daemon process(es)...\n'
+    kill -KILL $pids 2>/dev/null || true
+    wait_for_exit $pids || true
+  fi
+}
+
+clean_stale_runtime_files() {
+  local base="$HOME/Library/Application Support/Steno"
+
+  rm -f "$base/steno.pid" "$base/steno.sock"
+}
+
+kill_daemons=1
+steno_args=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-kill)
+      kill_daemons=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      steno_args+=("$@")
+      break
+      ;;
+    *)
+      steno_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="$(repo_root_from "$PWD")"
+
+if [ -z "$root" ] || ! is_steno_root "$root"; then
+  root="$(repo_root_from "$script_dir")"
+fi
+
+[ -n "$root" ] && is_steno_root "$root" || die "could not find a Steno repo root from $PWD"
+
+daemon_bin="$root/daemon/.build/debug/steno-daemon"
+steno_bin="$root/cmd/steno/steno"
+
+printf 'Using Steno repo: %s\n' "$root"
+printf 'Building local debug daemon and Go TUI...\n'
+make -C "$root" sign-daemon-debug build-steno
+
+[ -x "$daemon_bin" ] || die "daemon binary was not built at $daemon_bin"
+[ -x "$steno_bin" ] || die "steno binary was not built at $steno_bin"
+
+if [ "$kill_daemons" -eq 1 ]; then
+  stop_launchd_daemon
+  stop_running_daemons
+  clean_stale_runtime_files
+else
+  printf 'Skipping daemon termination because --no-kill was provided.\n'
+fi
+
+printf 'Running local steno with daemon: %s\n' "$daemon_bin"
+if [ "${#steno_args[@]}" -eq 0 ]; then
+  exec env STENO_DAEMON_PATH="$daemon_bin" "$steno_bin"
+else
+  exec env STENO_DAEMON_PATH="$daemon_bin" "$steno_bin" "${steno_args[@]}"
+fi

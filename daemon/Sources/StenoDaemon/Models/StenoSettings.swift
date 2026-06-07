@@ -179,6 +179,17 @@ public struct StenoSettings: Codable, Sendable {
     /// Default: `false`.
     public var reArmIdleOnWake: Bool
 
+    /// #76 automatic real-audio health pulses. Disabled by default because a
+    /// pulse intentionally speaks through the default output device; the
+    /// on-demand `steno --health-pulse` command works regardless.
+    public var healthPulseAutomaticEnabled: Bool
+
+    /// #76 timeout for the real speaker→air→mic health pulse.
+    public var healthPulseTimeoutSeconds: Double
+
+    /// #76 fuzzy threshold for matching lossy TTS→ASR output.
+    public var healthPulseFuzzyThreshold: Double
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
@@ -196,7 +207,10 @@ public struct StenoSettings: Codable, Sendable {
         topicExtractionMinSegments: Int = 3,
         retentionDays: Int = 0,
         errorRecoveryIntervalSeconds: Int = 60,
-        reArmIdleOnWake: Bool = false
+        reArmIdleOnWake: Bool = false,
+        healthPulseAutomaticEnabled: Bool = false,
+        healthPulseTimeoutSeconds: Double = 45,
+        healthPulseFuzzyThreshold: Double = 0.82
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -215,6 +229,9 @@ public struct StenoSettings: Codable, Sendable {
         self.retentionDays = retentionDays
         self.errorRecoveryIntervalSeconds = errorRecoveryIntervalSeconds
         self.reArmIdleOnWake = reArmIdleOnWake
+        self.healthPulseAutomaticEnabled = healthPulseAutomaticEnabled
+        self.healthPulseTimeoutSeconds = healthPulseTimeoutSeconds
+        self.healthPulseFuzzyThreshold = healthPulseFuzzyThreshold
     }
 
     // MARK: - Codable
@@ -240,6 +257,9 @@ public struct StenoSettings: Codable, Sendable {
         case retentionDays
         case errorRecoveryIntervalSeconds
         case reArmIdleOnWake
+        case healthPulseAutomaticEnabled
+        case healthPulseTimeoutSeconds
+        case healthPulseFuzzyThreshold
     }
 
     public init(from decoder: Decoder) throws {
@@ -265,5 +285,8 @@ public struct StenoSettings: Codable, Sendable {
         // on, so an upgraded install gets automatic recovery from `error`.
         self.errorRecoveryIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .errorRecoveryIntervalSeconds) ?? 60
         self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? false
+        self.healthPulseAutomaticEnabled = try container.decodeIfPresent(Bool.self, forKey: .healthPulseAutomaticEnabled) ?? false
+        self.healthPulseTimeoutSeconds = try container.decodeIfPresent(Double.self, forKey: .healthPulseTimeoutSeconds) ?? 45
+        self.healthPulseFuzzyThreshold = try container.decodeIfPresent(Double.self, forKey: .healthPulseFuzzyThreshold) ?? 0.82
     }
 }

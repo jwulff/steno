@@ -320,6 +320,49 @@ func (m *Manager) EnsureRunning(ctx context.Context) error {
 	return m.WaitForSocket(waitCtx)
 }
 
+// Restart terminates a running steno-daemon if one is identified, clears stale
+// runtime files, starts the configured daemon binary, and waits for its socket.
+func (m *Manager) Restart(ctx context.Context) error {
+	running, pid, err := m.IsRunning()
+	if err != nil {
+		return err
+	}
+
+	if running {
+		idCtx, cancel := context.WithTimeout(ctx, processIdentifyTimeout)
+		exePath, idErr := m.identifyProcess(idCtx, pid)
+		cancel()
+		if idErr != nil {
+			return fmt.Errorf("restart daemon: identify pid %d: %w", pid, idErr)
+		}
+		if exePath == "" {
+			return fmt.Errorf("restart daemon: pid %d no longer resolvable", pid)
+		}
+		if filepath.Base(exePath) != daemonExecutableBasename {
+			return fmt.Errorf("restart daemon: pid %d is %q, not %s", pid, exePath, daemonExecutableBasename)
+		}
+		if err := m.killGhost(pid); err != nil {
+			return err
+		}
+	}
+
+	if err := m.CleanStale(); err != nil {
+		return err
+	}
+
+	binaryPath, err := FindBinary()
+	if err != nil {
+		return err
+	}
+	if err := m.Start(binaryPath); err != nil {
+		return err
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return m.WaitForSocket(waitCtx)
+}
+
 // recoverGhostIfNeeded inspects a daemon whose PID is alive but whose socket
 // is unreachable. If the PID file is older than ghostDetectionGracePeriod,
 // the process at that PID is examined more closely:
