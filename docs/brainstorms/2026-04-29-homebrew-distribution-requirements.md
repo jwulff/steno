@@ -21,7 +21,7 @@ The phasing matters because it forces Phase 1 to use patterns compatible with `h
 
 **Tap and formula**
 - R1. Create a new public GitHub repo `jwulff/homebrew-steno` containing a single formula `Formula/steno.rb` that builds Steno from source.
-- R2. The formula must depend on the Go toolchain at build time (`depends_on "go" => :build`) and on a Swift toolchain capable of building `daemon/Package.swift` (Swift 6.2+). Express via `depends_on xcode: ["16.0", :build]` or equivalent constraint that resolves on macOS 26.
+- R2. The formula must depend on the Go toolchain at build time (`depends_on "go" => :build`) and on a Swift toolchain capable of building `daemon/Package.swift` (Swift 6.2+). Express via `depends_on xcode: ["26.0", :build]` or equivalent constraint that guarantees Swift 6.2+ on macOS 26 — verify the exact minimum Xcode version during implementation (Xcode 16 ships Swift 6.0, not 6.2; Xcode 26+ is the expected constraint).
 - R3. The formula must constrain to Apple Silicon (`depends_on arch: :arm64`) and to macOS 26 or later (`depends_on macos: ">= :tahoe"` or whichever symbol Homebrew uses for macOS 26 — verify during planning).
 - R4. The formula must build both binaries (`steno` from `cmd/steno`, `steno-daemon` from `daemon`), ad-hoc codesign the daemon with the entitlements file at `daemon/Resources/StenoDaemon.entitlements`, and install both to the formula's `bin/`.
 - R5. The formula must include a working test block (`test do`) that at minimum verifies both binaries are executable and report a version (e.g., `steno --version`, `steno-daemon --version`) — add `--version` flags if they don't yet exist.
@@ -31,7 +31,7 @@ The phasing matters because it forces Phase 1 to use patterns compatible with `h
 - R7. Document in the README that `brew services start steno` and `steno-daemon install` are alternative paths for autostart; users should pick one to avoid duplicate launchd registrations.
 
 **Bottles and release CI**
-- R8. Add a GitHub Actions workflow in `jwulff/homebrew-steno` that, on each new release tag of `jwulff/steno`, builds an arm64 macOS-26 bottle, uploads it as a GitHub Release asset on the tap repo, and opens a PR against the tap to update the formula's `bottle do` block.
+- R8. Add a GitHub Actions workflow in `jwulff/homebrew-steno` that builds an arm64 macOS-26 bottle on each PR against the tap and uploads it as a GitHub Release asset via the `pr-pull` label flow. For Phase 1, bumping the formula version is a manual step via `brew bump-formula-pr` (run locally after each Steno release, opens the tap PR). Fully automated tag-driven formula-bump PR creation (firing `repository_dispatch` from `jwulff/steno` to the tap) is deferred to Phase 2 to avoid the PAT-trust surface and additional CI complexity.
 - R9. The bottle build must run on a runner that natively matches the bottle's target (macOS 26 arm64). If GitHub-hosted runners do not yet provide a macOS 26 arm64 image, document the gap in `Outstanding Questions` and plan a fallback (self-hosted runner, manual bottle production, or temporarily ship without bottles).
 - R10. Stale `release.yml` in `jwulff/steno` must be fixed before bottle CI is wired up: align Swift version (6.2), runner image (macOS 26), entitlements path (`daemon/Resources/StenoDaemon.entitlements`), tarball naming (`steno-darwin-arm64.tar.gz`), and ensure both binaries are included.
 
@@ -45,7 +45,7 @@ The phasing matters because it forces Phase 1 to use patterns compatible with `h
 
 - A macOS 26 user with Homebrew installed can run `brew tap jwulff/steno && brew install steno` and end up with working `steno` and `steno-daemon` binaries on `PATH` in under 30 seconds (bottle hit) or under 5 minutes (source build fallback).
 - `brew services start steno` registers a working launchd job that auto-starts the daemon on login.
-- Cutting a new release tag in `jwulff/steno` results in an updated formula and a new bottle within one CI run, with no manual editing of `Formula/steno.rb`.
+- For Phase 1: cutting a new release tag in `jwulff/steno`, running `brew bump-formula-pr` locally, and opening a tap PR results in an updated formula and a new bottle — with no manual editing of `Formula/steno.rb` (the bump tool edits it automatically). Fully zero-touch formula updates (no local command required) are a Phase 2 goal.
 - The formula is structurally a candidate for `homebrew/core` submission whenever notability criteria are met — no rewrite required.
 
 ---

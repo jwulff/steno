@@ -208,7 +208,8 @@ R12 (origin: "track core notability + surface in README") was dropped during doc
 - Build BOTH binaries via `make build` (which now invokes `make gen-version` first per U1).
 - Sign daemon: ad-hoc with the entitlements file at `daemon/Resources/StenoDaemon.entitlements`.
 - Binary tarball: `tar -czf steno-darwin-arm64.tar.gz -C <release-dir> steno steno-daemon` (two binaries, fixed asset name).
-- Source tarball: produce a clean, reproducible `steno-${tag}-source.tar.gz` containing the repo at the tagged commit (use `git archive` for determinism: `git archive --format=tar.gz --prefix=steno-${tag}/ ${tag} > steno-${tag}-source.tar.gz`).
+- Define `tag` from the release ref (`github.ref_name`, e.g., `v0.3.1`) and normalize `version=${tag#v}` so asset filenames use bare semver (`0.3.1`) while release URLs remain under `download/${tag}/` (`v0.3.1`).
+- Source tarball: produce a clean, reproducible `steno-${version}-source.tar.gz` containing the repo at the tagged commit (use `git archive` for determinism: `git archive --format=tar.gz --prefix=steno-${version}/ ${tag} > steno-${version}-source.tar.gz`).
 - SHA256 sidecars for both tarballs.
 - Upload all four assets to the GitHub Release.
 
@@ -354,7 +355,7 @@ R12 (origin: "track core notability + surface in README") was dropped during doc
 
 **Approach:**
 
-1. **Cut a real release through the new path.** Bump `VERSION` to v0.3.1, run `make gen-version`, commit, tag, push. `release.yml` builds + uploads source tarball + binary tarball as release assets.
+1. **Cut a real release through the new path.** Bump `VERSION` to `0.3.1` (bare semver, no leading `v` — the `v` prefix is for git tags only), run `make gen-version`, commit, create and push git tag `v0.3.1`. `release.yml` builds + uploads source tarball + binary tarball as release assets.
 
 2. **Manual formula bump.** From a local clone of `jwulff/homebrew-steno`: `brew bump-formula-pr --version=0.3.1 --url=https://github.com/jwulff/steno/releases/download/v0.3.1/steno-0.3.1-source.tar.gz Formula/steno.rb`. Push branch, open PR.
 
@@ -455,7 +456,7 @@ R12 (origin: "track core notability + surface in README") was dropped during doc
 - **API surface parity:** No changes to the daemon NDJSON protocol or SQLite schema. The `--version` flag added in U1 is a new CLI surface but additive. U7 adds new error messages on failure paths but doesn't change existing happy-path behavior.
 - **Integration coverage:** Unit tests of `--version` flags (U1), `brew audit` lint (U3), and `LaunchdRegistry` mocked-fs tests (U7) don't prove the end-to-end install works. U6's manual smoke test on a clean user account is the only path that validates the full chain — including the TCC re-prompt and Gatekeeper quarantine question.
 - **Unchanged invariants:** Daemon protocol (NDJSON commands/events), socket location (`~/Library/Application Support/Steno/steno.sock`), SQLite schema, MCP tool surface. The `make install` and tarball-download install paths continue to work as alternatives.
-- **TCC permission lifecycle:** Documented in U6. macOS keys permissions on cdhash; brew-built and `make install`-built binaries have different cdhashes; users migrating between paths will be re-prompted once.
+- **TCC permission lifecycle:** Documented in U6. macOS keys permissions on cdhash; brew-built and `make install`-built binaries are expected to have different cdhashes (different SwiftPM caches, toolchain metadata) — U6 verifies this empirically. If confirmed, users migrating between paths will be re-prompted once; if cdhashes happen to match, the migration warning is unnecessary.
 
 ---
 
