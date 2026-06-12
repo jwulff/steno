@@ -1133,6 +1133,22 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		}
 		return nil
 
+	case "health_pulse":
+		if ev.HealthPulseOK != nil && *ev.HealthPulseOK {
+			m.errorMessage = "Health pulse passed"
+			m.errorTransient = true
+			return clearTransientErrorCmd()
+		}
+		msg := ev.Message
+		if msg == "" {
+			msg = "HEALTH_PULSE_FAILED"
+		}
+		m.engineStatus = StatusError
+		m.errorMessage = msg
+		m.errorTransient = false
+		m.appendErrorHistory(msg)
+		return nil
+
 	case "speaker_label":
 		// #61: the diarization merge assigned (or revised) a speaker for a
 		// segment we already have in the live view. Find it by sequenceNumber

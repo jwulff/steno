@@ -15,13 +15,15 @@ public enum EventType: String, Sendable, Codable, CaseIterable {
     /// #62 — an on-device model pipeline changed readiness (transcription /
     /// diarization preparing / ready / unavailable).
     case modelStatus
+    /// #76 — real-audio health pulse result.
+    case healthPulse
 }
 
 /// Broadcasts engine events to subscribed socket clients.
 ///
 /// Maintains a subscription map: each client can subscribe to specific event types.
 /// Maps EngineEvent → DaemonEvent → NDJSON and sends to subscribed clients.
-public actor EventBroadcaster: RecordingEngineDelegate {
+public actor EventBroadcaster: RecordingEngineDelegate, HealthPulseReporting {
     private var subscriptions: [UUID: (client: any ClientConnection, events: Set<EventType>)] = [:]
     private let encoder = JSONEncoder()
 
@@ -44,6 +46,13 @@ public actor EventBroadcaster: RecordingEngineDelegate {
 
     nonisolated public func engine(_ engine: RecordingEngine, didEmit event: EngineEvent) async {
         await broadcast(event)
+    }
+
+    nonisolated public func healthPulseDidFinish(_ report: HealthPulseReport) async {
+        await broadcast(.healthPulse(report))
+        if !report.ok {
+            await broadcast(.error("HEALTH_PULSE_FAILED: \(report.message)", isTransient: false))
+        }
     }
 
     /// Send specific events to a single already-subscribed client, honoring its
@@ -186,6 +195,20 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 sessionId: sessionId.uuidString,
                 sequenceNumber: sequenceNumber,
                 speakerId: speakerId.uuidString
+            ))
+
+        case .healthPulse(let report):
+            return (.healthPulse, DaemonEvent(
+                event: "health_pulse",
+                message: report.message,
+                transient: report.ok,
+                healthPulseOk: report.ok,
+                healthPulseTrigger: report.trigger.rawValue,
+                healthPulseState: report.finalState.rawValue,
+                healthPulseExpected: report.expectedText,
+                healthPulseObserved: report.observedText,
+                healthPulseSimilarity: report.similarity,
+                healthPulseThreshold: report.threshold
             ))
 
         // #62: model readiness for Layer A (transcription) / Layer B

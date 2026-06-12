@@ -412,3 +412,28 @@ func TestEventPauseStateIndefinite(t *testing.T) {
 		t.Errorf("PauseExpiresAt should be nil for indefinite pause")
 	}
 }
+
+func TestHealthPulseCommand(t *testing.T) {
+	cmd := HealthPulseCmd()
+	if cmd.Cmd != "health_pulse" {
+		t.Fatalf("cmd = %q, want health_pulse", cmd.Cmd)
+	}
+}
+
+func TestHealthPulseResponseFields(t *testing.T) {
+	j := `{"ok":true,"healthPulseOk":true,"healthPulseTrigger":"manual","healthPulseState":"passed","healthPulseExpected":"expected","healthPulseObserved":"observed","healthPulseSimilarity":0.91,"healthPulseThreshold":0.82}`
+
+	var resp Response
+	if err := json.Unmarshal([]byte(j), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.HealthPulseOK == nil || !*resp.HealthPulseOK {
+		t.Fatalf("healthPulseOk = %v, want true", resp.HealthPulseOK)
+	}
+	if resp.HealthPulseTrigger != "manual" || resp.HealthPulseState != "passed" {
+		t.Fatalf("trigger/state = %q/%q, want manual/passed", resp.HealthPulseTrigger, resp.HealthPulseState)
+	}
+	if resp.HealthPulseSimilarity == nil || *resp.HealthPulseSimilarity != 0.91 {
+		t.Fatalf("similarity = %v, want 0.91", resp.HealthPulseSimilarity)
+	}
+}
