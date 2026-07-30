@@ -280,3 +280,108 @@ func TestSearchTool(t *testing.T) {
 		t.Errorf("got %d scoped results, want 3", len(results.Segments))
 	}
 }
+
+// mcpLagBase is a fixed epoch for the lagging-session fixture, chosen
+// clear of seedTestData's timestamps.
+const mcpLagBase = 1720000000.0
+
+// testServerWithLaggingSession seeds the normal fixture plus one session
+// shaped like the 2026-07-29 incident: the row holding MAX(sequenceNumber)
+// describes older audio than the row holding MAX(startedAt), because the
+// two source workers share a sequence counter and one is behind.
+func testServerWithLaggingSession(t *testing.T) *server.MCPServer {
+	t.Helper()
+
+	rawDB := createTestDB(t)
+	seedTestData(t, rawDB)
+	t.Cleanup(func() { rawDB.Close() })
+
+	if _, err := rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-lag', 'en_US', ?, 'active', ?)`, mcpLagBase, mcpLagBase); err != nil {
+		t.Fatalf("seed lagging session: %v", err)
+	}
+	rows := []struct {
+		seq       int
+		source    string
+		audioAt   float64
+		writtenAt float64
+	}{
+		{1, "microphone", mcpLagBase + 10, mcpLagBase + 11},
+		{2, "systemAudio", mcpLagBase + 10, mcpLagBase + 12},
+		{3, "microphone", mcpLagBase + 40, mcpLagBase + 41},
+		{4, "systemAudio", mcpLagBase + 20, mcpLagBase + 90},
+	}
+	for _, r := range rows {
+		if _, err := rawDB.Exec(`INSERT INTO segments
+			(id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-lag', ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("seg-lag-%d", r.seq), fmt.Sprintf("Lagging segment %d.", r.seq),
+			r.audioAt, r.audioAt+1, r.seq, r.writtenAt, r.source); err != nil {
+			t.Fatalf("seed lagging segment %d: %v", r.seq, err)
+		}
+	}
+
+	store := db.NewStore(rawDB)
+	s := server.NewMCPServer("steno-mcp-test", "0.0.1", server.WithToolCapabilities(false))
+	RegisterTools(s, store)
+	return s
+}
+
+func TestGetSessionToolReportsLag(t *testing.T) {
+	s := testServerWithLaggingSession(t)
+	text := callTool(t, s, "get_session", map[string]any{"session_id": "sess-lag"})
+
+	var resp sessionDetailResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.Lag == nil {
+		t.Fatal("expected lag on a session with segments")
+	}
+	// Sequence frontier sits 20s behind the timestamp frontier — the
+	// signal that told the operator the pipeline was behind rather than
+	// the room being quiet.
+	if resp.Lag.SequenceFrontierLagSeconds != 20 {
+		t.Errorf("SequenceFrontierLagSeconds = %v, want 20", resp.Lag.SequenceFrontierLagSeconds)
+	}
+	if resp.Lag.AudioTimeAtMaxSequence == "" || resp.Lag.MaxAudioTime == "" {
+		t.Error("expected both frontier timestamps to be populated")
+	}
+}
+
+func TestGetSessionToolOmitsLagWhenNoSegments(t *testing.T) {
+	s := testServer(t)
+	// sess-3 is seeded with no segments. A zero-valued lag would read as
+	// a healthy pipeline; the field must be absent instead.
+	text := callTool(t, s, "get_session", map[string]any{"session_id": "sess-3"})
+
+	var resp sessionDetailResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Lag != nil {
+		t.Errorf("expected no lag for a session without segments, got %+v", resp.Lag)
+	}
+}
+
+func TestGetOverviewToolReportsActiveSessionLag(t *testing.T) {
+	s := testServerWithLaggingSession(t)
+	text := callTool(t, s, "get_overview", nil)
+
+	var resp overviewResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.ActiveSession == nil {
+		t.Fatal("expected an active session")
+	}
+	if resp.ActiveSessionLag == nil {
+		t.Fatal("expected lag alongside the active session")
+	}
+	if resp.ActiveSessionLag.SequenceFrontierLagSeconds != 20 {
+		t.Errorf("SequenceFrontierLagSeconds = %v, want 20",
+			resp.ActiveSessionLag.SequenceFrontierLagSeconds)
+	}
+}

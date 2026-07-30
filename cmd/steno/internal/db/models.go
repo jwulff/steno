@@ -97,11 +97,52 @@ type SessionCounts struct {
 	Summaries int
 }
 
+// SessionLag describes how far the daemon's write side has fallen behind
+// the audio it is transcribing (#82).
+//
+// Two independent measures, because they answer different questions:
+//
+//   - FrontierDivergence answers "is sequence order safe to read?" It is
+//     the gap between the newest audio in the session and the audio
+//     described by the highest-numbered row. Nonzero means a consumer
+//     ordering or cursoring by sequenceNumber is looking at a frontier
+//     that trails what is already queryable by timestamp — the sequence
+//     counter is shared by the mic and systemAudio workers, so it drifts
+//     whenever they make unequal progress.
+//   - RecentIngestLag answers "how far behind wall clock is the writer
+//     right now?" It is the worst gap between a row's audio time and the
+//     moment it was committed, over rows written in the recent window.
+//     This is the actionable one: a live consumer seeing tens of minutes
+//     here should treat a silent transcript as backlog, not as quiet.
+type SessionLag struct {
+	// AudioTimeAtMaxSequence is the audio time of the row holding the
+	// session's highest sequence number — where a sequence-ordered
+	// reader's tail sits.
+	AudioTimeAtMaxSequence time.Time
+
+	// MaxAudioTime is the newest audio time in the session — where a
+	// timestamp-ordered reader's tail sits.
+	MaxAudioTime time.Time
+
+	// FrontierDivergence is MaxAudioTime - AudioTimeAtMaxSequence. Zero
+	// on a healthy session.
+	FrontierDivergence time.Duration
+
+	// RecentIngestLag is the worst commit-minus-audio gap among rows
+	// written inside the sampled window. Zero when RecentSampleCount is
+	// zero — absence of recent writes is not evidence of health.
+	RecentIngestLag time.Duration
+
+	// RecentSampleCount is how many rows the window covered. Zero means
+	// nothing was written recently, so RecentIngestLag says nothing.
+	RecentSampleCount int
+}
+
 // Overview holds high-level database summary info.
 type Overview struct {
-	TotalSessions  int
-	ActiveSession  *Session
-	RecentSessions []SessionWithCounts
+	TotalSessions   int
+	ActiveSession   *Session
+	RecentSessions  []SessionWithCounts
 	EarliestSession *time.Time
 	LatestSession   *time.Time
 }
