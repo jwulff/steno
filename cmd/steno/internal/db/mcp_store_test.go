@@ -395,17 +395,29 @@ func TestActiveSession(t *testing.T) {
 const lagBase = 1720000000.0
 
 // seedLaggingSession builds the shape of the 2026-07-29 incident: two
-// source workers sharing one sequence counter, one of them behind. The
-// sequence number is assigned when a result *finalizes*, so the row
-// holding the highest sequence describes older audio than the row holding
-// MAX(startedAt).
+// source workers sharing one sequence counter, one of them far behind.
 //
-//	seq 1  microphone   T+10
-//	seq 2  systemAudio  T+10
-//	seq 3  microphone   T+40   ← mic worker keeping up
-//	seq 4  systemAudio  T+20   ← sys worker behind; higher seq, older audio
+// Three distinct clocks matter, and only one of them is the audio:
 //
-// Chronological order is 1, 2, 4, 3. Sequence order is 1, 2, 3, 4.
+//   - captured_at — when the audio actually happened. Derived by the daemon
+//     from the analyzer's frame timeline, so a backlog does not move it.
+//
+//   - startedAt   — when the recognizer got around to emitting the result.
+//     Drifts per source under load.
+//
+//   - sequenceNumber — assigned when the engine actor handled the result.
+//
+//     seq  source       captured  emitted  written
+//     1   microphone   T+10      T+11     T+12
+//     2   systemAudio  T+10      T+13     T+14
+//     3   microphone   T+40      T+41     T+42
+//     4   systemAudio  T+20      T+300    T+301   <- sys worker far behind
+//
+// Audio order is 1, 2, 4, 3. Both sequence order and emission order give
+// 1, 2, 3, 4 — which puts the T+20 utterance after the T+40 one. Note that
+// seq 2 and seq 4 are the systemAudio counterparts of mic seq 1 and 3: on
+// the capture axis each pair is within seconds, while on the emission axis
+// seq 4 sits over four minutes from anything.
 func seedLaggingSession(t *testing.T, rawDB *sql.DB) {
 	t.Helper()
 
@@ -415,38 +427,39 @@ func seedLaggingSession(t *testing.T, rawDB *sql.DB) {
 	}
 
 	rows := []struct {
-		seq       int
-		source    string
-		audioAt   float64
-		writtenAt float64
-		text      string
+		seq        int
+		source     string
+		capturedAt float64
+		emittedAt  float64
+		writtenAt  float64
+		text       string
 	}{
-		{1, "microphone", lagBase + 10, lagBase + 11, "First thing said."},
-		{2, "systemAudio", lagBase + 10, lagBase + 12, "First thing heard."},
-		{3, "microphone", lagBase + 40, lagBase + 41, "Third thing said."},
-		{4, "systemAudio", lagBase + 20, lagBase + 90, "Second thing heard."},
+		{1, "microphone", lagBase + 10, lagBase + 11, lagBase + 12, "First thing said."},
+		{2, "systemAudio", lagBase + 10, lagBase + 13, lagBase + 14, "First thing heard."},
+		{3, "microphone", lagBase + 40, lagBase + 41, lagBase + 42, "Third thing said."},
+		{4, "systemAudio", lagBase + 20, lagBase + 300, lagBase + 301, "Second thing heard."},
 	}
 	for _, r := range rows {
 		if _, err := rawDB.Exec(`INSERT INTO segments
-			(id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
-			VALUES (?, 'sess-lag', ?, ?, ?, ?, ?, ?)`,
+			(id, sessionId, text, startedAt, endedAt, captured_at, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-lag', ?, ?, ?, ?, ?, ?, ?)`,
 			fmt.Sprintf("seg-lag-%d", r.seq), r.text,
-			r.audioAt, r.audioAt+1, r.seq, r.writtenAt, r.source); err != nil {
+			r.emittedAt, r.writtenAt, r.capturedAt, r.seq, r.writtenAt, r.source); err != nil {
 			t.Fatalf("seed lagging segment %d: %v", r.seq, err)
 		}
 	}
 }
 
 // assertChronological fails if the segments are not in non-decreasing
-// startedAt order, naming the first pair that regresses.
+// capture order, naming the first pair that regresses.
 func assertChronological(t *testing.T, segments []Segment) {
 	t.Helper()
 	for i := 1; i < len(segments); i++ {
-		if segments[i].StartedAt.Before(segments[i-1].StartedAt) {
-			t.Fatalf("segments out of audio order at index %d: seq %d (%s) precedes seq %d (%s)",
+		if segments[i].CapturedAt.Before(segments[i-1].CapturedAt) {
+			t.Fatalf("segments out of audio order at index %d: seq %d (captured %s) precedes seq %d (captured %s)",
 				i,
-				segments[i].SequenceNumber, segments[i].StartedAt.UTC(),
-				segments[i-1].SequenceNumber, segments[i-1].StartedAt.UTC())
+				segments[i].SequenceNumber, segments[i].CapturedAt.UTC(),
+				segments[i-1].SequenceNumber, segments[i-1].CapturedAt.UTC())
 		}
 	}
 }
@@ -545,7 +558,7 @@ func TestSessionLagOnLaggingSession(t *testing.T) {
 	seedLaggingSession(t, rawDB)
 
 	store := NewStore(rawDB)
-	now := time.Unix(int64(lagBase+100), 0)
+	now := time.Unix(int64(lagBase+310), 0)
 
 	lag, err := store.SessionLag("sess-lag", 5*time.Minute, now)
 	if err != nil {
@@ -568,10 +581,10 @@ func TestSessionLagOnLaggingSession(t *testing.T) {
 		t.Errorf("MaxAudioTime = %d, want %d", got, int64(lagBase+40))
 	}
 
-	// Worst createdAt - startedAt among rows written in the window is
-	// seq 4: audio at T+20, written at T+90.
-	if got := lag.RecentIngestLag; got != 70*time.Second {
-		t.Errorf("RecentIngestLag = %v, want 70s", got)
+	// Worst createdAt - captured_at among rows written in the window is
+	// seq 4: audio captured at T+20, written at T+301.
+	if got := lag.RecentIngestLag; got != 281*time.Second {
+		t.Errorf("RecentIngestLag = %v, want 281s", got)
 	}
 	if lag.RecentSampleCount != 4 {
 		t.Errorf("RecentSampleCount = %d, want 4", lag.RecentSampleCount)
@@ -584,9 +597,9 @@ func TestSessionLagRecentWindowExcludesOlderWrites(t *testing.T) {
 	seedLaggingSession(t, rawDB)
 
 	store := NewStore(rawDB)
-	now := time.Unix(int64(lagBase+100), 0)
+	now := time.Unix(int64(lagBase+310), 0)
 
-	// A 20s window admits only seq 4 (written at T+90).
+	// A 20s window admits only seq 4 (written at T+301).
 	lag, err := store.SessionLag("sess-lag", 20*time.Second, now)
 	if err != nil {
 		t.Fatalf("SessionLag: %v", err)
@@ -597,8 +610,8 @@ func TestSessionLagRecentWindowExcludesOlderWrites(t *testing.T) {
 	if lag.RecentSampleCount != 1 {
 		t.Errorf("RecentSampleCount = %d, want 1", lag.RecentSampleCount)
 	}
-	if got := lag.RecentIngestLag; got != 70*time.Second {
-		t.Errorf("RecentIngestLag = %v, want 70s", got)
+	if got := lag.RecentIngestLag; got != 281*time.Second {
+		t.Errorf("RecentIngestLag = %v, want 281s", got)
 	}
 
 	// A window that admits nothing must not report a stale lag figure as

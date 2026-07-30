@@ -113,6 +113,16 @@ public actor RecordingEngine {
     private var systemRecognizerTask: Task<Void, Never>?
     private var levelThrottleTask: Task<Void, Never>?
     private var currentSequenceNumber: Int = 0
+
+    /// Wall-clock instant each source's analyzer began consuming audio (#85).
+    ///
+    /// `RecognizerResult.audioStartSeconds` is measured from that instant on
+    /// the analyzer's input timeline, so `analyzerStart + audioStartSeconds`
+    /// recovers when the audio was actually captured. That timeline advances
+    /// with audio frames rather than with processing, which is what makes it
+    /// survive a transcription backlog — unlike `result.timestamp`, which is
+    /// stamped when the result is finally emitted.
+    private var analyzerStartWallClock: [AudioSourceType: Date] = [:]
     private var lastLevelEmitTime: Date = .distantPast
     private var pendingMicLevel: Float = 0
     private var pendingSystemLevel: Float = 0
@@ -527,6 +537,11 @@ public actor RecordingEngine {
             let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .microphone)
             micRecognizerHandle = recognizer
 
+            // #85: anchor this analyzer's input timeline to wall clock
+            // before it consumes a frame. Re-stamped on every bring-up —
+            // a rebuilt analyzer restarts its timeline at zero, so a stale
+            // anchor would place healed segments back near session start.
+            markAnalyzerStart(.microphone)
             let results = recognizer.transcribe(buffers: micBuffers)
             recognizerTask = Task { [weak self] in
                 do {
@@ -935,6 +950,26 @@ public actor RecordingEngine {
         await delegate?.engine(self, didEmit: event)
     }
 
+    /// Anchor `source`'s analyzer input timeline to wall clock (#85). Called
+    /// immediately before the analyzer starts consuming, on every bring-up
+    /// and every heal/device-change rebuild.
+    private func markAnalyzerStart(_ source: AudioSourceType) {
+        analyzerStartWallClock[source] = Date()
+    }
+
+    /// Wall-clock instant the audio behind `result` was captured (#85).
+    ///
+    /// Falls back to the emission timestamp when the recognizer reported no
+    /// valid audio range — the mock recognizer, or an invalid `CMTimeRange` —
+    /// which is the behavior everything had before this existed.
+    private func capturedAt(for result: RecognizerResult) -> Date {
+        guard let audioStart = result.audioStartSeconds,
+              let analyzerStart = analyzerStartWallClock[result.source] else {
+            return result.timestamp
+        }
+        return analyzerStart.addingTimeInterval(audioStart)
+    }
+
     private func handleRecognizerResult(_ result: RecognizerResult) async {
         guard let session = currentSession else { return }
 
@@ -944,16 +979,24 @@ public actor RecordingEngine {
             currentSequenceNumber += 1
             segmentCount = currentSequenceNumber
 
+            // #85: the audio instant this result describes. Everything that
+            // reasons about *when something was said* — demarcation routing
+            // below, ordering, dedup windows, lag — uses this rather than
+            // `result.timestamp`, which is when the recognizer got around to
+            // emitting it.
+            let audioTime = capturedAt(for: result)
+
             // U10 demarcate timestamp routing: a finalized segment whose
             // audio-frame `startedAt` precedes the demarcate moment T is
             // attributed to the previously-closed session; segments at
             // or after T land on the new (current) session.
             //
-            // **Assumption (load-bearing, U1 was skipped):** `result.timestamp`
-            // is the audio-frame start instant. If real-world testing of
-            // SpeechAnalyzer shows otherwise, the plan's fallback is to
-            // plumb wall-clock timestamps through the audio path
-            // independent of the recognizer.
+            // U1's load-bearing assumption — that the routing timestamp is
+            // the audio-frame start instant — was false for `result.timestamp`
+            // and is now satisfied by `audioTime` (#85), which is derived from
+            // the analyzer's frame timeline. Under a backlog this matters:
+            // routing on emission time would push audio spoken *before* the
+            // demarcate onto the new session.
             //
             // The first finalized segment with `startedAt >= T` clears the
             // demarcate state — segments arriving after that always land on
@@ -962,7 +1005,7 @@ public actor RecordingEngine {
             let routingSessionId: UUID
             if let demarcateAt = demarcationTimestamp,
                let prevId = previousSessionId,
-               result.timestamp < demarcateAt {
+               audioTime < demarcateAt {
                 routingSessionId = prevId
             } else {
                 routingSessionId = session.id
@@ -1044,6 +1087,7 @@ public actor RecordingEngine {
                 text: result.text,
                 startedAt: result.timestamp,
                 endedAt: Date(),
+                capturedAt: audioTime,
                 confidence: result.confidence,
                 sequenceNumber: segmentSequence,
                 source: result.source,
@@ -1302,6 +1346,11 @@ public actor RecordingEngine {
             )
             micRecognizerHandle = recognizer
 
+            // #85: anchor this analyzer's input timeline to wall clock
+            // before it consumes a frame. Re-stamped on every bring-up —
+            // a rebuilt analyzer restarts its timeline at zero, so a stale
+            // anchor would place healed segments back near session start.
+            markAnalyzerStart(.microphone)
             let results = recognizer.transcribe(buffers: micBuffers)
             recognizerTask = Task { [weak self] in
                 do {
@@ -1425,6 +1474,11 @@ public actor RecordingEngine {
             )
             sysRecognizerHandle = recognizer
 
+            // #85: anchor this analyzer's input timeline to wall clock
+            // before it consumes a frame. Re-stamped on every bring-up —
+            // a rebuilt analyzer restarts its timeline at zero, so a stale
+            // anchor would place healed segments back near session start.
+            markAnalyzerStart(.systemAudio)
             let results = recognizer.transcribe(buffers: sysBuffers)
             systemRecognizerTask = Task { [weak self] in
                 do {
@@ -1551,6 +1605,11 @@ public actor RecordingEngine {
             let recognizer = try await speechRecognizerFactory.makeRecognizer(locale: locale, format: format, source: .systemAudio)
             sysRecognizerHandle = recognizer
 
+            // #85: anchor this analyzer's input timeline to wall clock
+            // before it consumes a frame. Re-stamped on every bring-up —
+            // a rebuilt analyzer restarts its timeline at zero, so a stale
+            // anchor would place healed segments back near session start.
+            markAnalyzerStart(.systemAudio)
             let results = recognizer.transcribe(buffers: sysBuffers)
             systemRecognizerTask = Task { [weak self] in
                 do {

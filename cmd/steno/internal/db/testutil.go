@@ -36,6 +36,7 @@ func createTestDB(t *testing.T) *sql.DB {
 			text TEXT NOT NULL,
 			startedAt REAL NOT NULL,
 			endedAt REAL NOT NULL,
+			captured_at REAL,
 			confidence REAL,
 			sequenceNumber INTEGER NOT NULL,
 			createdAt REAL NOT NULL,
@@ -88,12 +89,13 @@ func seedTestData(t *testing.T, rawDB *sql.DB) {
 
 	for i := 1; i <= 10; i++ {
 		conf := 0.9 + float64(i)*0.01
-		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source)
-			VALUES (?, 'sess-1', ?, ?, ?, ?, ?, ?, 'microphone')`,
+		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-1', ?, ?, ?, ?, ?, ?, ?, 'microphone')`,
 			fmt.Sprintf("seg-1-%d", i),
 			fmt.Sprintf("Segment %d from session one.", i),
 			s1Start+float64(i)*10,
 			s1Start+float64(i)*10+9,
+			s1Start+float64(i)*10,
 			conf, i,
 			s1Start+float64(i)*10)
 	}
@@ -112,12 +114,13 @@ func seedTestData(t *testing.T, rawDB *sql.DB) {
 		VALUES ('sess-2', 'en_US', ?, 'active', ?)`, s2Start, s2Start)
 
 	for i := 1; i <= 3; i++ {
-		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source)
-			VALUES (?, 'sess-2', ?, ?, ?, ?, ?, 'systemAudio')`,
+		rawDB.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, captured_at, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-2', ?, ?, ?, ?, ?, ?, 'systemAudio')`,
 			fmt.Sprintf("seg-2-%d", i),
 			fmt.Sprintf("Active session segment %d.", i),
 			s2Start+float64(i)*10,
 			s2Start+float64(i)*10+9,
+			s2Start+float64(i)*10,
 			i, s2Start+float64(i)*10)
 	}
 

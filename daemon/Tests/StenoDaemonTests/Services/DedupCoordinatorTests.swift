@@ -592,6 +592,11 @@ struct DedupCoordinatorTests {
     /// Save a single segment. Thin helper for the hold-back tests, which
     /// deliberately save mic and sys rows at different moments rather than
     /// as a pair.
+    /// `t` is the capture instant — when the words were actually said.
+    /// `emissionDelay` is how much later the recognizer got around to
+    /// emitting the result, which is what `startedAt` records and what
+    /// drifts per source under a backlog. Default 0 keeps the healthy case
+    /// terse.
     @discardableResult
     private func saveOne(
         repo: MockTranscriptRepository,
@@ -599,18 +604,51 @@ struct DedupCoordinatorTests {
         t: Date,
         text: String,
         seq: Int,
-        source: AudioSourceType
+        source: AudioSourceType,
+        emissionDelay: TimeInterval = 0
     ) async throws -> StoredSegment {
+        let emitted = t.addingTimeInterval(emissionDelay)
         let segment = StoredSegment(
             sessionId: sessionId,
             text: text,
-            startedAt: t,
-            endedAt: t.addingTimeInterval(1),
+            startedAt: emitted,
+            endedAt: emitted.addingTimeInterval(1),
+            capturedAt: t,
             sequenceNumber: seq,
             source: source
         )
         try await repo.saveSegment(segment)
         return segment
+    }
+
+    @Test func matchesCounterpartEmittedMinutesLate() async throws {
+        // The failure the capture clock exists for. Both recognizers heard
+        // the same words at the same instant, but the sys worker is minutes
+        // behind and emits its version long after. A +/-3s window over
+        // emission time cannot see the pair; over capture time it is exact.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 2, source: .systemAudio,
+            emissionDelay: 750
+        )
+        // Push the sys frontier past the mic segment's window so the
+        // hold-back lets it through.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(10),
+            text: "and on we go", seq: 3, source: .systemAudio,
+            emissionDelay: 760
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(outcome.evaluated == 1)
+        #expect(outcome.marked == 1)
     }
 
     @Test func holdDefersMicSegmentWhenSysSideHasWrittenNothing() async throws {

@@ -268,6 +268,62 @@ struct RecordingEngineTests {
         await engine.stop()
     }
 
+    @Test func capturedAtComesFromTheAnalyzerTimelineNotTheEmissionTime() async throws {
+        // #85: the whole point of the capture clock. A backlogged recognizer
+        // emits a result long after the audio it describes; `startedAt` records
+        // the emission, `capturedAt` must still land on the audio.
+        let rf = MockSpeechRecognizerFactory()
+        let (engine, repo, _, _, _, _, _) = await makeEngine(recognizerFactory: rf)
+
+        let analyzerStartedAround = Date()
+        let session = try await engine.start()
+
+        // Audio that began 5s into the analyzer's input timeline, but which
+        // the recognizer is only now getting around to emitting — 10 minutes
+        // of wall clock later.
+        rf.micHandle.emit(RecognizerResult(
+            text: "spoken early, transcribed late",
+            isFinal: true,
+            timestamp: Date().addingTimeInterval(600),
+            source: .microphone,
+            audioStartSeconds: 5,
+            audioDurationSeconds: 1
+        ))
+        try await Task.sleep(for: .milliseconds(50))
+
+        let segments = try await repo.segments(for: session.id)
+        #expect(segments.count == 1)
+        let segment = try #require(segments.first)
+
+        // capturedAt tracks the analyzer timeline: start + 5s.
+        let expected = analyzerStartedAround.addingTimeInterval(5)
+        #expect(abs(segment.capturedAt.timeIntervalSince(expected)) < 2)
+
+        // And it is emphatically not the emission timestamp, which is what
+        // `startedAt` still records.
+        #expect(segment.startedAt.timeIntervalSince(segment.capturedAt) > 500)
+
+        await engine.stop()
+    }
+
+    @Test func capturedAtFallsBackToEmissionWhenNoAudioRange() async throws {
+        // The mock recognizer and any result with an invalid CMTimeRange
+        // report no audio range. Those must still get a usable value rather
+        // than a nil or an epoch date.
+        let rf = MockSpeechRecognizerFactory()
+        let (engine, repo, _, _, _, _, _) = await makeEngine(recognizerFactory: rf)
+
+        let session = try await engine.start()
+        rf.micHandle.emit(RecognizerResult(text: "no range", isFinal: true, source: .microphone))
+        try await Task.sleep(for: .milliseconds(50))
+
+        let segments = try await repo.segments(for: session.id)
+        let segment = try #require(segments.first)
+        #expect(segment.capturedAt == segment.startedAt)
+
+        await engine.stop()
+    }
+
     @Test func dualSourceSegmentsPersistIndependently() async throws {
         let rf = MockSpeechRecognizerFactory()
 

@@ -198,16 +198,26 @@ public enum DatabaseConfiguration {
             try db.execute(sql: "ALTER TABLE segments ADD COLUMN speaker_id TEXT")
         }
 
-        // #81: the default transcript query now orders by `startedAt`, not
-        // `sequenceNumber` — sequence is finalization order across two
-        // source workers, not audio order. `idx_segments_dedup` still serves
-        // the filter but no longer serves the sort, which would leave long
-        // sessions sorting thousands of rows per read. Same partial-index
-        // shape, keyed on the column the query actually orders by.
-        migrator.registerMigration("20260730_001_segments_session_time_index") { db in
+        // #85: wall-clock capture time, recovered from the analyzer's own
+        // input timeline. Neither `startedAt` (recognizer emission) nor
+        // `sequenceNumber` (engine handling) is an audio time, and both drift
+        // per-source under a transcription backlog — so neither can order a
+        // transcript or window a dedup match. `captured_at` advances with
+        // audio frames instead of with processing, which makes it the one
+        // axis the two source workers share.
+        //
+        // Backfilled from `startedAt` rather than left NULL: prior rows have
+        // no analyzer anchor to recover, and the emission timestamp is the
+        // closest thing they carry. That keeps the column effectively NOT
+        // NULL so readers can order by it without a COALESCE. The index
+        // mirrors `idx_segments_dedup`'s partial shape so the default
+        // transcript read doesn't sort a long session's rows on every query.
+        migrator.registerMigration("20260730_001_segment_captured_at") { db in
+            try db.execute(sql: "ALTER TABLE segments ADD COLUMN captured_at REAL")
+            try db.execute(sql: "UPDATE segments SET captured_at = startedAt WHERE captured_at IS NULL")
             try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_segments_session_time
-                ON segments(sessionId, startedAt)
+                CREATE INDEX IF NOT EXISTS idx_segments_session_captured
+                ON segments(sessionId, captured_at)
                 WHERE duplicate_of IS NULL
             """)
         }

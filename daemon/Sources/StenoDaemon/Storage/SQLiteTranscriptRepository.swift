@@ -243,7 +243,7 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         try await dbQueue.read { db in
             try SegmentRecord
                 .filter(Column("sessionId") == sessionId.uuidString)
-                .order(Column("startedAt").asc, Column("sequenceNumber").asc)
+                .order(Column("captured_at").asc, Column("sequenceNumber").asc)
                 .fetchAll(db)
                 .compactMap { $0.toDomain() }
         }
@@ -252,9 +252,9 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
     public func segments(from: Date, to: Date) async throws -> [StoredSegment] {
         try await dbQueue.read { db in
             try SegmentRecord
-                .filter(Column("startedAt") >= from.timeIntervalSince1970)
-                .filter(Column("startedAt") <= to.timeIntervalSince1970)
-                .order(Column("startedAt").asc)
+                .filter(Column("captured_at") >= from.timeIntervalSince1970)
+                .filter(Column("captured_at") <= to.timeIntervalSince1970)
+                .order(Column("captured_at").asc)
                 .fetchAll(db)
                 .compactMap { $0.toDomain() }
         }
@@ -343,7 +343,7 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
             let value = try Double.fetchOne(
                 db,
                 sql: """
-                    SELECT MAX(startedAt)
+                    SELECT MAX(captured_at)
                     FROM segments
                     WHERE sessionId = ? AND source = ?
                 """,
@@ -366,9 +366,9 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
                     SELECT * FROM segments
                     WHERE sessionId = ?
                       AND source = ?
-                      AND startedAt >= ?
-                      AND startedAt <= ?
-                    ORDER BY startedAt ASC
+                      AND captured_at >= ?
+                      AND captured_at <= ?
+                    ORDER BY captured_at ASC
                 """,
                 arguments: [
                     sessionId.uuidString,

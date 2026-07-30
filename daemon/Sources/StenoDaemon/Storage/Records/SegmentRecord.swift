@@ -10,6 +10,12 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
     var text: String
     var startedAt: Double
     var endedAt: Double
+
+    /// Wall-clock instant the audio was captured, recovered from the
+    /// analyzer's input timeline (#85). Always populated: the writer falls
+    /// back to the emission timestamp when no valid audio range was
+    /// reported, and the migration backfills prior rows from `startedAt`.
+    var capturedAt: Double
     var confidence: Double?
     var sequenceNumber: Int
     var createdAt: Double
@@ -54,6 +60,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
 
     enum CodingKeys: String, CodingKey {
         case id, sessionId, text, startedAt, endedAt, confidence
+        case capturedAt = "captured_at"
         case sequenceNumber, createdAt, source
         case duplicateOf = "duplicate_of"
         case dedupMethod = "dedup_method"
@@ -82,6 +89,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             text: text,
             startedAt: Date(timeIntervalSince1970: startedAt),
             endedAt: Date(timeIntervalSince1970: endedAt),
+            capturedAt: Date(timeIntervalSince1970: capturedAt),
             confidence: confidence.map { Float($0) },
             sequenceNumber: sequenceNumber,
             createdAt: Date(timeIntervalSince1970: createdAt),
@@ -115,6 +123,7 @@ struct SegmentRecord: Codable, FetchableRecord, PersistableRecord {
             text: segment.text,
             startedAt: segment.startedAt.timeIntervalSince1970,
             endedAt: segment.endedAt.timeIntervalSince1970,
+            capturedAt: segment.capturedAt.timeIntervalSince1970,
             confidence: segment.confidence.map { Double($0) },
             sequenceNumber: segment.sequenceNumber,
             createdAt: segment.createdAt.timeIntervalSince1970,

@@ -364,10 +364,10 @@ func (s *Store) SummariesForSession(sessionID string) ([]Summary, error) {
 // daemon side, which already ordered this way.
 func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
+		SELECT id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND duplicate_of IS NULL
-		ORDER BY startedAt ASC, sequenceNumber ASC
+		ORDER BY captured_at ASC, sequenceNumber ASC
 		LIMIT ? OFFSET ?
 	`, sessionID, limit, offset)
 	if err != nil {
@@ -387,11 +387,11 @@ func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segme
 // but the rows come back ordered by `startedAt` (#81).
 func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
 	rows, err := s.db.Query(`
-		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
+		SELECT id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
 		  AND duplicate_of IS NULL
-		ORDER BY startedAt ASC, sequenceNumber ASC
+		ORDER BY captured_at ASC, sequenceNumber ASC
 	`, sessionID, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("query segments: %w", err)
@@ -405,20 +405,20 @@ func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, e
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time) ([]Segment, error) {
-	query := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
+	query := `SELECT id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments WHERE sessionId = ? AND duplicate_of IS NULL`
 	args := []any{sessionID}
 
 	if after != nil {
-		query += ` AND startedAt >= ?`
+		query += ` AND captured_at >= ?`
 		args = append(args, float64(after.Unix()))
 	}
 	if before != nil {
-		query += ` AND startedAt <= ?`
+		query += ` AND captured_at <= ?`
 		args = append(args, float64(before.Unix()))
 	}
 
-	query += ` ORDER BY startedAt ASC, sequenceNumber ASC`
+	query += ` ORDER BY captured_at ASC, sequenceNumber ASC`
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -432,7 +432,7 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, error) {
-	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
+	sqlQuery := `SELECT id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments WHERE text LIKE ? ESCAPE '\' AND duplicate_of IS NULL`
 	args := []any{"%" + escapeLike(query) + "%"}
 
@@ -441,7 +441,9 @@ func (s *Store) SearchSegments(query, sessionID string, limit int) ([]Segment, e
 		args = append(args, sessionID)
 	}
 
-	sqlQuery += ` ORDER BY startedAt DESC LIMIT ?`
+	// Newest-first means most recently *said*, not most recently
+	// transcribed (#85).
+	sqlQuery += ` ORDER BY captured_at DESC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := s.db.Query(sqlQuery, args...)
@@ -554,9 +556,9 @@ func (s *Store) SessionLag(sessionID string, window time.Duration, now time.Time
 	var atMaxSeq, maxAudio sql.NullFloat64
 	err := s.db.QueryRow(`
 		SELECT
-			(SELECT startedAt FROM segments WHERE sessionId = ?
+			(SELECT captured_at FROM segments WHERE sessionId = ?
 			   ORDER BY sequenceNumber DESC LIMIT 1),
-			(SELECT MAX(startedAt) FROM segments WHERE sessionId = ?)
+			(SELECT MAX(captured_at) FROM segments WHERE sessionId = ?)
 	`, sessionID, sessionID).Scan(&atMaxSeq, &maxAudio)
 	if err != nil {
 		return nil, fmt.Errorf("query lag frontiers: %w", err)
@@ -577,7 +579,7 @@ func (s *Store) SessionLag(sessionID string, window time.Duration, now time.Time
 	var count int
 	var worst sql.NullFloat64
 	err = s.db.QueryRow(`
-		SELECT COUNT(*), MAX(createdAt - startedAt)
+		SELECT COUNT(*), MAX(createdAt - captured_at)
 		FROM segments
 		WHERE sessionId = ? AND createdAt >= ?
 	`, sessionID, cutoff).Scan(&count, &worst)
@@ -633,14 +635,24 @@ func scanSegments(rows *sql.Rows) ([]Segment, error) {
 	for rows.Next() {
 		var seg Segment
 		var startedAt, endedAt, createdAt float64
+		var capturedAt sql.NullFloat64
 		var confidence sql.NullFloat64
 		var speakerID sql.NullString
 		if err := rows.Scan(&seg.ID, &seg.SessionID, &seg.Text,
-			&startedAt, &endedAt, &confidence, &seg.SequenceNumber, &createdAt, &seg.Source, &speakerID); err != nil {
+			&startedAt, &endedAt, &capturedAt, &confidence, &seg.SequenceNumber, &createdAt, &seg.Source, &speakerID); err != nil {
 			return nil, fmt.Errorf("scan segment: %w", err)
 		}
 		seg.StartedAt = timeFromUnix(startedAt)
 		seg.EndedAt = timeFromUnix(endedAt)
+		// The migration backfills captured_at and the daemon always writes
+		// it, so NULL means a row this reader didn't produce. Fall back to
+		// the emission timestamp rather than failing the whole query — a
+		// read-only consumer should degrade, not refuse to open a session.
+		if capturedAt.Valid {
+			seg.CapturedAt = timeFromUnix(capturedAt.Float64)
+		} else {
+			seg.CapturedAt = seg.StartedAt
+		}
 		seg.CreatedAt = timeFromUnix(createdAt)
 		if confidence.Valid {
 			c := confidence.Float64

@@ -252,7 +252,7 @@ actor MockTranscriptRepository: TranscriptRepository {
     func latestSegmentTime(sessionId: UUID, source: AudioSourceType) async throws -> Date? {
         (segments[sessionId] ?? [])
             .filter { $0.source == source }
-            .map(\.startedAt)
+            .map(\.capturedAt)
             .max()
     }
 
@@ -264,8 +264,8 @@ actor MockTranscriptRepository: TranscriptRepository {
     ) async throws -> [StoredSegment] {
         let segs = segments[sessionId] ?? []
         return segs
-            .filter { $0.source == source && $0.startedAt >= from && $0.startedAt <= to }
-            .sorted { $0.startedAt < $1.startedAt }
+            .filter { $0.source == source && $0.capturedAt >= from && $0.capturedAt <= to }
+            .sorted { $0.capturedAt < $1.capturedAt }
     }
 
     func markDuplicate(
@@ -283,6 +283,7 @@ actor MockTranscriptRepository: TranscriptRepository {
                     text: old.text,
                     startedAt: old.startedAt,
                     endedAt: old.endedAt,
+                    capturedAt: old.capturedAt,
                     confidence: old.confidence,
                     sequenceNumber: old.sequenceNumber,
                     createdAt: old.createdAt,
@@ -316,6 +317,7 @@ actor MockTranscriptRepository: TranscriptRepository {
                 text: old.text,
                 startedAt: old.startedAt,
                 endedAt: old.endedAt,
+                capturedAt: old.capturedAt,
                 confidence: old.confidence,
                 sequenceNumber: old.sequenceNumber,
                 createdAt: old.createdAt,

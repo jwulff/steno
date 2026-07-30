@@ -182,7 +182,7 @@ public actor DedupCoordinator {
                 // the first segment it cannot judge rather than skipping
                 // ahead — advancing over a later ready segment would strand
                 // this one behind the cursor permanently.
-                if let readinessHorizon, mic.startedAt > readinessHorizon {
+                if let readinessHorizon, mic.capturedAt > readinessHorizon {
                     deferred = micSegments.count - (marked + skipped)
                     break
                 }
@@ -190,8 +190,15 @@ public actor DedupCoordinator {
                 maxEvaluatedSeq = max(maxEvaluatedSeq, mic.sequenceNumber)
 
                 // 2. Find time-overlapping sys candidates.
-                let from = mic.startedAt.addingTimeInterval(-overlapSeconds)
-                let to = mic.startedAt.addingTimeInterval(overlapSeconds)
+                // #85: window on capture time, not emission time. The two
+                // recognizers emit the same utterance whenever each gets
+                // around to it — 12.5 minutes apart at the worst point of the
+                // 2026-07-29 incident — so a +/-3s window over `startedAt`
+                // cannot see a counterpart that a lagging worker has not
+                // finished transcribing. On the capture axis the pair sits
+                // within a few seconds no matter how late either arrives.
+                let from = mic.capturedAt.addingTimeInterval(-overlapSeconds)
+                let to = mic.capturedAt.addingTimeInterval(overlapSeconds)
                 let candidates = try await repository.overlappingSegments(
                     sessionId: sessionId,
                     source: .systemAudio,

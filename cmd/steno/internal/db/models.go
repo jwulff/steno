@@ -28,11 +28,19 @@ type Session struct {
 
 // Segment represents a finalized transcript segment.
 type Segment struct {
-	ID             string
-	SessionID      string
-	Text           string
-	StartedAt      time.Time
-	EndedAt        time.Time
+	ID        string
+	SessionID string
+	Text      string
+	StartedAt time.Time
+	EndedAt   time.Time
+
+	// CapturedAt is the wall-clock instant the audio was captured,
+	// recovered by the daemon from the analyzer's frame timeline. Unlike
+	// StartedAt (recognizer emission) and SequenceNumber (engine handling)
+	// it is unaffected by how far behind transcription has fallen, which
+	// makes it the axis to order and window on. Always populated: the
+	// migration backfills pre-existing rows from startedAt.
+	CapturedAt     time.Time
 	Confidence     *float64
 	SequenceNumber int
 	CreatedAt      time.Time
@@ -103,32 +111,35 @@ type SessionCounts struct {
 // Two independent measures, because they answer different questions:
 //
 //   - FrontierDivergence answers "is sequence order safe to read?" It is
-//     the gap between the newest audio in the session and the audio
-//     described by the highest-numbered row. Nonzero means a consumer
-//     ordering or cursoring by sequenceNumber is looking at a frontier
-//     that trails what is already queryable by timestamp — the sequence
-//     counter is shared by the mic and systemAudio workers, so it drifts
-//     whenever they make unequal progress.
+//     the gap between the newest captured audio in the session and the
+//     audio described by the highest-numbered row. Nonzero means a consumer
+//     ordering or cursoring by sequenceNumber is looking at a frontier that
+//     trails what is already queryable — the sequence counter is shared by
+//     the mic and systemAudio workers, so it drifts whenever they make
+//     unequal progress.
 //   - RecentIngestLag answers "how far behind wall clock is the writer
-//     right now?" It is the worst gap between a row's audio time and the
-//     moment it was committed, over rows written in the recent window.
-//     This is the actionable one: a live consumer seeing tens of minutes
-//     here should treat a silent transcript as backlog, not as quiet.
+//     right now?" It is the worst gap between when audio was captured and
+//     when its row was committed, over rows written in the recent window.
+//     Measured against captured_at, so it covers the whole path — time
+//     spent inside the analyzer as well as time queued between the
+//     recognizer and the engine actor. This is the actionable one: a live
+//     consumer seeing tens of minutes here should treat a silent transcript
+//     as backlog, not as quiet.
 type SessionLag struct {
-	// AudioTimeAtMaxSequence is the audio time of the row holding the
+	// AudioTimeAtMaxSequence is the capture time of the row holding the
 	// session's highest sequence number — where a sequence-ordered
 	// reader's tail sits.
 	AudioTimeAtMaxSequence time.Time
 
-	// MaxAudioTime is the newest audio time in the session — where a
-	// timestamp-ordered reader's tail sits.
+	// MaxAudioTime is the newest capture time in the session — where a
+	// capture-ordered reader's tail sits.
 	MaxAudioTime time.Time
 
 	// FrontierDivergence is MaxAudioTime - AudioTimeAtMaxSequence. Zero
 	// on a healthy session.
 	FrontierDivergence time.Duration
 
-	// RecentIngestLag is the worst commit-minus-audio gap among rows
+	// RecentIngestLag is the worst commit-minus-capture gap among rows
 	// written inside the sampled window. Zero when RecentSampleCount is
 	// zero — absence of recent writes is not evidence of health.
 	RecentIngestLag time.Duration

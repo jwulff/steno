@@ -14,11 +14,32 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     /// The transcribed text content.
     public let text: String
 
-    /// When this segment started in the audio.
+    /// When the recognizer *emitted* this result, in wall clock.
+    ///
+    /// Despite the name this is not an audio time: `RecognizerResult.timestamp`
+    /// defaults to `Date()` at the moment the result is constructed, and the
+    /// production recognizer never overrides it. Under a transcription backlog
+    /// that can be far later than the audio it describes. Kept for continuity
+    /// and for pre-`captured_at` rows — order and window on `capturedAt`.
     public let startedAt: Date
 
-    /// When this segment ended in the audio.
+    /// When this segment was handed to persistence, in wall clock. Like
+    /// `startedAt`, not an audio time.
     public let endedAt: Date
+
+    /// Wall-clock instant the audio was *captured* (#85).
+    ///
+    /// Recovered from the analyzer's own input timeline —
+    /// `analyzerStartWallClock[source] + audioStart` — which advances with
+    /// audio frames rather than with processing, so it stays true no matter
+    /// how far behind transcription has fallen. This is the only timeline on
+    /// which the microphone and systemAudio workers are comparable, and
+    /// therefore the axis for ordering, dedup windows, and lag.
+    ///
+    /// Falls back to `startedAt` when the recognizer reports no valid audio
+    /// range (the mock recognizer, an invalid `CMTimeRange`) and for rows
+    /// written before the column existed, so it is always populated.
+    public let capturedAt: Date
 
     /// Recognition confidence score (0.0 to 1.0), if available.
     public let confidence: Float?
@@ -80,6 +101,7 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         text: String,
         startedAt: Date,
         endedAt: Date,
+        capturedAt: Date? = nil,
         confidence: Float? = nil,
         sequenceNumber: Int,
         createdAt: Date = Date(),
@@ -97,6 +119,10 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.text = text
         self.startedAt = startedAt
         self.endedAt = endedAt
+        // Default to the emission timestamp so every construction site —
+        // including tests and pre-`captured_at` rows — has a usable audio
+        // axis without having to know about the analyzer timeline.
+        self.capturedAt = capturedAt ?? startedAt
         self.confidence = confidence
         self.sequenceNumber = sequenceNumber
         self.createdAt = createdAt
