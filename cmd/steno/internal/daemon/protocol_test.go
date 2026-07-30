@@ -97,7 +97,7 @@ func TestResponseSuccess(t *testing.T) {
 		t.Errorf("sessionId = %q, want %q", resp.SessionID, "abc-123")
 	}
 	if resp.Recording == nil || !*resp.Recording {
-		t.Errorf("recording = %v, want true", resp.Recording)
+		t.Errorf("recording = %v, want true", derefBool(resp.Recording))
 	}
 }
 
@@ -193,7 +193,7 @@ func TestEventStatus(t *testing.T) {
 	}
 
 	if ev.Recording == nil || !*ev.Recording {
-		t.Errorf("recording = %v, want true", ev.Recording)
+		t.Errorf("recording = %v, want true", derefBool(ev.Recording))
 	}
 }
 
@@ -411,4 +411,22 @@ func TestEventPauseStateIndefinite(t *testing.T) {
 	if ev.PauseExpiresAt != nil {
 		t.Errorf("PauseExpiresAt should be nil for indefinite pause")
 	}
+}
+
+// derefBool and derefInt render optional protocol fields for log and error
+// output. `%v` on the pointer itself prints an address, which is what
+// several of these lines used to do — "recording=0x7a07d8bb0108" tells you
+// nothing about whether the daemon was recording.
+func derefBool(b *bool) any {
+	if b == nil {
+		return "<nil>"
+	}
+	return *b
+}
+
+func derefInt(i *int) any {
+	if i == nil {
+		return "<nil>"
+	}
+	return *i
 }

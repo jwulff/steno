@@ -21,6 +21,20 @@ public actor CommandDispatcher {
         _ command: DaemonCommand,
         from client: any ClientConnection
     ) async {
+        // `subscribe` is ordering-sensitive and deliberately skips the
+        // compute-then-respond path below (#86). Registering the client with
+        // the broadcaster opens the event stream on its connection, and
+        // #62's readiness replay writes to it immediately — both would land
+        // before the shared tail below got to write the response. A client
+        // reads the socket line by line, so it decodes that first event as
+        // its response, finds no `ok` field, and reports the subscribe as
+        // failed with an empty error. Respond first, then start the stream.
+        if command.cmd == "subscribe" {
+            await send(DaemonResponse.success(), to: client)
+            await activateSubscription(command, from: client)
+            return
+        }
+
         let response: DaemonResponse
 
         switch command.cmd {
@@ -35,9 +49,6 @@ public actor CommandDispatcher {
 
         case "devices":
             response = await handleDevices()
-
-        case "subscribe":
-            response = await handleSubscribe(command, from: client)
 
         case "pause":
             response = await handlePause(command)
@@ -55,7 +66,13 @@ public actor CommandDispatcher {
             response = DaemonResponse.failure("Unknown command: \(command.cmd)")
         }
 
-        // Send response
+        await send(response, to: client)
+    }
+
+    /// Write one response line to a client. Failures are swallowed: a client
+    /// that disappeared mid-command is the socket layer's problem, not the
+    /// dispatcher's.
+    private func send(_ response: DaemonResponse, to client: any ClientConnection) async {
         if let data = try? JSONEncoder().encode(response) {
             try? await client.send(data + Data("\n".utf8))
         }
@@ -240,10 +257,13 @@ public actor CommandDispatcher {
         )
     }
 
-    private func handleSubscribe(
+    /// Register the client with the broadcaster and replay current model
+    /// readiness. Called only AFTER the subscribe response has been written —
+    /// everything here puts bytes on the client's connection (#86).
+    private func activateSubscription(
         _ command: DaemonCommand,
         from client: any ClientConnection
-    ) async -> DaemonResponse {
+    ) async {
         let eventTypes: Set<EventType>
         if let requested = command.events {
             eventTypes = Set(requested.compactMap { EventType(rawValue: $0) })
@@ -264,7 +284,5 @@ public actor CommandDispatcher {
         if !readiness.isEmpty {
             await broadcaster.replay(readiness, toClient: client.id)
         }
-
-        return DaemonResponse.success()
     }
 }

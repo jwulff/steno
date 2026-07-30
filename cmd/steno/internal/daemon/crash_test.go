@@ -41,12 +41,12 @@ func TestDaemonCrashDuringRecording(t *testing.T) {
 	if err != nil {
 		t.Fatalf("daemon crashed during recording (status failed): %v", err)
 	}
-	fmt.Printf("Still alive after 5s: recording=%v segments=%v\n", resp.Recording, resp.Segments)
+	fmt.Printf("Still alive after 5s: recording=%v segments=%v\n", derefBool(resp.Recording), derefInt(resp.Segments))
 
 	// Stop
 	resp, err = client.SendCommand(Command{Cmd: "stop"})
 	if err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	fmt.Printf("Stopped: recording=%v\n", resp.Recording)
+	fmt.Printf("Stopped: recording=%v\n", derefBool(resp.Recording))
 }

@@ -116,7 +116,7 @@ func TestLiveTUIFlow(t *testing.T) {
 					m.handleEvent(ev)
 				case "status":
 					m.handleEvent(ev)
-					fmt.Printf("  status: recording=%v\n", ev.Recording)
+					fmt.Printf("  status: recording=%v\n", ev.Recording != nil && *ev.Recording)
 				case "error":
 					m.handleEvent(ev)
 					fmt.Printf("  error: %s\n", ev.Message)
