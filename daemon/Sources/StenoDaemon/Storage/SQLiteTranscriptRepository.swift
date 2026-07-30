@@ -335,6 +335,24 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    public func latestSegmentTime(sessionId: UUID, source: AudioSourceType) async throws -> Date? {
+        try await dbQueue.read { db in
+            // MAX over an empty set is NULL, which `Double.fetchOne`
+            // surfaces as nil — exactly the "this source has produced
+            // nothing yet" signal the caller needs.
+            let value = try Double.fetchOne(
+                db,
+                sql: """
+                    SELECT MAX(startedAt)
+                    FROM segments
+                    WHERE sessionId = ? AND source = ?
+                """,
+                arguments: [sessionId.uuidString, source.rawValue]
+            )
+            return value.map { Date(timeIntervalSince1970: $0) }
+        }
+    }
+
     public func overlappingSegments(
         sessionId: UUID,
         source: AudioSourceType,

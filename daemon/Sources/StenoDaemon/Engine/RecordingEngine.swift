@@ -1966,6 +1966,11 @@ public actor RecordingEngine {
         // task returns without invoking the coordinator.
         pendingDedupTriggers[sessionId]?.cancel()
         let debounce = dedupTriggerDebounce
+        // #80: while systemAudio capture is live, the sys counterpart of a
+        // mic segment may still be queued behind a transcription backlog.
+        // Tell the pass to hold those back rather than judging them against
+        // a sys side that hasn't been written yet and burning the cursor.
+        let holdForSystemAudio = isSystemAudioEnabled
         let task: Task<Void, Never> = Task { [weak self] in
             do {
                 try await Task.sleep(for: debounce)
@@ -1977,7 +1982,10 @@ public actor RecordingEngine {
             // The coordinator owns its own reentrance — multiple cross-session
             // passes can run in parallel; same-session collapse is the
             // coordinator's responsibility.
-            await coordinator.runPass(sessionId: sessionId)
+            await coordinator.runPass(
+                sessionId: sessionId,
+                holdForSystemAudio: holdForSystemAudio
+            )
         }
         pendingDedupTriggers[sessionId] = task
     }
@@ -2021,8 +2029,13 @@ public actor RecordingEngine {
         //    pass might still be writing duplicates as we read counts;
         //    the pruner's threshold is conservative enough that this
         //    doesn't change outcomes in practice.
+        //
+        //    This is the terminal pass for the session, so it runs with the
+        //    #80 hold OFF: no further systemAudio segments are coming, and
+        //    anything the live passes deferred waiting for a lagging sys
+        //    worker has to be judged now or stay behind the cursor forever.
         if let coordinator = dedupCoordinator {
-            _ = await coordinator.runPass(sessionId: sessionId)
+            _ = await coordinator.runPass(sessionId: sessionId, holdForSystemAudio: false)
         }
 
         // Pruner is "disabled" sentinel: both thresholds at 0 means tests

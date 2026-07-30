@@ -22,11 +22,16 @@ public struct DedupOutcome: Sendable, Equatable {
     /// Number of mic segments inspected but NOT marked (no overlapping sys
     /// match, score below threshold, or audio-level guard rejected).
     public let skipped: Int
+    /// Number of mic segments left for a later pass because the systemAudio
+    /// side had not yet written past their match window (#80). The cursor
+    /// stays behind these — they are pending, not rejected.
+    public let deferred: Int
 
-    public init(evaluated: Int, marked: Int, skipped: Int) {
+    public init(evaluated: Int, marked: Int, skipped: Int, deferred: Int = 0) {
         self.evaluated = evaluated
         self.marked = marked
         self.skipped = skipped
+        self.deferred = deferred
     }
 
     public static let empty = DedupOutcome(evaluated: 0, marked: 0, skipped: 0)
@@ -120,8 +125,20 @@ public actor DedupCoordinator {
     /// calls succeed; a partial pass is acceptable because the next pass
     /// re-reads them as already-marked (filtered by `duplicate_of IS NULL`)
     /// and skips them.
+    ///
+    /// - Parameter holdForSystemAudio: when true, a mic segment is only
+    ///   judged once the systemAudio writer has committed audio past the end
+    ///   of its match window; earlier passes leave it (and the cursor) alone.
+    ///   Pass true whenever systemAudio capture is live — under a
+    ///   transcription backlog the sys counterpart can be tens of minutes
+    ///   behind the mic segment it matches, and judging early found no
+    ///   candidates while still burning the cursor past the pair, so dedup
+    ///   silently stopped firing exactly when duplication was most expensive
+    ///   (#80). Pass false when systemAudio is off (nothing is coming) or on
+    ///   the terminal end-of-session pass (nothing more is coming) — holding
+    ///   back there would strand segments behind the cursor forever.
     @discardableResult
-    public func runPass(sessionId: UUID) async -> DedupOutcome {
+    public func runPass(sessionId: UUID, holdForSystemAudio: Bool = false) async -> DedupOutcome {
         if isProcessing[sessionId] == true {
             return .empty
         }
@@ -140,11 +157,36 @@ public actor DedupCoordinator {
                 return .empty
             }
 
+            // 1a. Readiness horizon (#80). A mic segment is judgeable only
+            // once the sys writer has committed audio past the far edge of
+            // the mic segment's match window — before that, "no overlapping
+            // candidate" means "not yet transcribed", not "no match".
+            // A nil sys frontier means the sys side has written nothing at
+            // all for this session; with the hold on, nothing is judgeable.
+            var readinessHorizon: Date?
+            if holdForSystemAudio {
+                let sysFrontier = try await repository.latestSegmentTime(
+                    sessionId: sessionId,
+                    source: .systemAudio
+                )
+                readinessHorizon = sysFrontier?.addingTimeInterval(-overlapSeconds) ?? .distantPast
+            }
+
             var marked = 0
             var skipped = 0
+            var deferred = 0
             var maxEvaluatedSeq = 0
 
             for mic in micSegments {
+                // The cursor is a single watermark, so the pass must stop at
+                // the first segment it cannot judge rather than skipping
+                // ahead — advancing over a later ready segment would strand
+                // this one behind the cursor permanently.
+                if let readinessHorizon, mic.startedAt > readinessHorizon {
+                    deferred = micSegments.count - (marked + skipped)
+                    break
+                }
+
                 maxEvaluatedSeq = max(maxEvaluatedSeq, mic.sequenceNumber)
 
                 // 2. Find time-overlapping sys candidates.
@@ -197,18 +239,22 @@ public actor DedupCoordinator {
             // 6. Cursor advance — last step. Per-mic-seq, NOT per-pass-max:
             // we advance to the highest mic-seq we EVALUATED, not the highest
             // segment-seq across all sources, so an out-of-order mic segment
-            // arriving later isn't skipped.
-            try await repository.advanceDedupCursor(
-                sessionId: sessionId,
-                toSequence: maxEvaluatedSeq
-            )
+            // arriving later isn't skipped. Skipped entirely when the pass
+            // judged nothing, so a fully-deferred pass doesn't write.
+            if maxEvaluatedSeq > 0 {
+                try await repository.advanceDedupCursor(
+                    sessionId: sessionId,
+                    toSequence: maxEvaluatedSeq
+                )
+            }
 
             let outcome = DedupOutcome(
-                evaluated: micSegments.count,
+                evaluated: marked + skipped,
                 marked: marked,
-                skipped: skipped
+                skipped: skipped,
+                deferred: deferred
             )
-            logDedup("Session \(sessionId) — pass complete: \(outcome.evaluated) evaluated, \(outcome.marked) marked, \(outcome.skipped) skipped")
+            logDedup("Session \(sessionId) — pass complete: \(outcome.evaluated) evaluated, \(outcome.marked) marked, \(outcome.skipped) skipped, \(outcome.deferred) deferred")
             return outcome
         } catch {
             // Non-critical: log and surrender. Cursor was not advanced

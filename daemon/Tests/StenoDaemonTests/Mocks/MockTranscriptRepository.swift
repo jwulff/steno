@@ -249,6 +249,13 @@ actor MockTranscriptRepository: TranscriptRepository {
             .sorted { $0.sequenceNumber < $1.sequenceNumber }
     }
 
+    func latestSegmentTime(sessionId: UUID, source: AudioSourceType) async throws -> Date? {
+        (segments[sessionId] ?? [])
+            .filter { $0.source == source }
+            .map(\.startedAt)
+            .max()
+    }
+
     func overlappingSegments(
         sessionId: UUID,
         source: AudioSourceType,
