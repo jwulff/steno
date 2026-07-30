@@ -1,6 +1,9 @@
 package db
 
 import (
+	"database/sql"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -384,5 +387,297 @@ func TestActiveSession(t *testing.T) {
 	}
 	if sess.ID != "sess-2" {
 		t.Errorf("ID = %q, want sess-2", sess.ID)
+	}
+}
+
+// lagBase is a fixed epoch for the lagging-session fixture, chosen well
+// clear of seedTestData's timestamps so the two can coexist in one DB.
+const lagBase = 1720000000.0
+
+// seedLaggingSession builds the shape of the 2026-07-29 incident: two
+// source workers sharing one sequence counter, one of them far behind.
+//
+// Three distinct clocks matter, and only one of them is the audio:
+//
+//   - captured_at — when the audio actually happened. Derived by the daemon
+//     from the analyzer's frame timeline, so a backlog does not move it.
+//
+//   - startedAt   — when the recognizer got around to emitting the result.
+//     Drifts per source under load.
+//
+//   - sequenceNumber — assigned when the engine actor handled the result.
+//
+//     seq  source       captured  emitted  written
+//     1   microphone   T+10      T+11     T+12
+//     2   systemAudio  T+10      T+13     T+14
+//     3   microphone   T+40      T+41     T+42
+//     4   systemAudio  T+20      T+300    T+301   <- sys worker far behind
+//
+// Audio order is 1, 2, 4, 3. Both sequence order and emission order give
+// 1, 2, 3, 4 — which puts the T+20 utterance after the T+40 one. Note that
+// seq 2 and seq 4 are the systemAudio counterparts of mic seq 1 and 3: on
+// the capture axis each pair is within seconds, while on the emission axis
+// seq 4 sits over four minutes from anything.
+func seedLaggingSession(t *testing.T, rawDB *sql.DB) {
+	t.Helper()
+
+	if _, err := rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-lag', 'en_US', ?, 'active', ?)`, lagBase, lagBase); err != nil {
+		t.Fatalf("seed lagging session: %v", err)
+	}
+
+	rows := []struct {
+		seq        int
+		source     string
+		capturedAt float64
+		emittedAt  float64
+		writtenAt  float64
+		text       string
+	}{
+		{1, "microphone", lagBase + 10, lagBase + 11, lagBase + 12, "First thing said."},
+		{2, "systemAudio", lagBase + 10, lagBase + 13, lagBase + 14, "First thing heard."},
+		{3, "microphone", lagBase + 40, lagBase + 41, lagBase + 42, "Third thing said."},
+		{4, "systemAudio", lagBase + 20, lagBase + 300, lagBase + 301, "Second thing heard."},
+	}
+	for _, r := range rows {
+		if _, err := rawDB.Exec(`INSERT INTO segments
+			(id, sessionId, text, startedAt, endedAt, captured_at, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-lag', ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("seg-lag-%d", r.seq), r.text,
+			r.emittedAt, r.writtenAt, r.capturedAt, r.seq, r.writtenAt, r.source); err != nil {
+			t.Fatalf("seed lagging segment %d: %v", r.seq, err)
+		}
+	}
+}
+
+// assertChronological fails if the segments are not in non-decreasing
+// capture order, naming the first pair that regresses.
+func assertChronological(t *testing.T, segments []Segment) {
+	t.Helper()
+	for i := 1; i < len(segments); i++ {
+		if segments[i].CapturedAt.Before(segments[i-1].CapturedAt) {
+			t.Fatalf("segments out of audio order at index %d: seq %d (captured %s) precedes seq %d (captured %s)",
+				i,
+				segments[i].SequenceNumber, segments[i].CapturedAt.UTC(),
+				segments[i-1].SequenceNumber, segments[i-1].CapturedAt.UTC())
+		}
+	}
+}
+
+func TestSegmentsForSessionOrdersByAudioTime(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+	segments, err := store.SegmentsForSession("sess-lag", 100, 0)
+	if err != nil {
+		t.Fatalf("SegmentsForSession: %v", err)
+	}
+	if len(segments) != 4 {
+		t.Fatalf("got %d segments, want 4", len(segments))
+	}
+	assertChronological(t, segments)
+
+	got := []int{}
+	for _, s := range segments {
+		got = append(got, s.SequenceNumber)
+	}
+	want := []int{1, 2, 4, 3}
+	if !slices.Equal(got, want) {
+		t.Errorf("sequence order = %v, want %v", got, want)
+	}
+}
+
+func TestSegmentsForSessionPaginatesInAudioOrder(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+
+	// A paginated read must slice the *chronological* sequence, not the
+	// sequence-number one — otherwise page boundaries hide the lagging
+	// row somewhere the caller never looks.
+	page, err := store.SegmentsForSession("sess-lag", 2, 2)
+	if err != nil {
+		t.Fatalf("SegmentsForSession paginated: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("got %d segments, want 2", len(page))
+	}
+	if page[0].SequenceNumber != 4 || page[1].SequenceNumber != 3 {
+		t.Errorf("page seqs = [%d %d], want [4 3]",
+			page[0].SequenceNumber, page[1].SequenceNumber)
+	}
+}
+
+func TestSegmentsForRangeOrdersByAudioTime(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+
+	// The sequence-range filter is the API contract and stays; only the
+	// ordering of what comes back changes.
+	segments, err := store.SegmentsForRange("sess-lag", 2, 4)
+	if err != nil {
+		t.Fatalf("SegmentsForRange: %v", err)
+	}
+	if len(segments) != 3 {
+		t.Fatalf("got %d segments, want 3", len(segments))
+	}
+	for _, s := range segments {
+		if s.SequenceNumber < 2 || s.SequenceNumber > 4 {
+			t.Errorf("seq %d outside requested range 2-4", s.SequenceNumber)
+		}
+	}
+	assertChronological(t, segments)
+}
+
+func TestSegmentsForTimeRangeOrdersByAudioTime(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+	segments, err := store.SegmentsForTimeRange("sess-lag", nil, nil)
+	if err != nil {
+		t.Fatalf("SegmentsForTimeRange: %v", err)
+	}
+	if len(segments) != 4 {
+		t.Fatalf("got %d segments, want 4", len(segments))
+	}
+	assertChronological(t, segments)
+}
+
+func TestSessionLagOnLaggingSession(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+	now := time.Unix(int64(lagBase+310), 0)
+
+	lag, err := store.SessionLag("sess-lag", 5*time.Minute, now)
+	if err != nil {
+		t.Fatalf("SessionLag: %v", err)
+	}
+	if lag == nil {
+		t.Fatal("expected lag for a session with segments")
+	}
+
+	// The row at MAX(sequenceNumber) is seq 4, describing audio at T+20.
+	// The newest audio in the session is seq 3's, at T+40. A reader
+	// ordering by sequence stops 20s short of what is already queryable.
+	if got := lag.FrontierDivergence; got != 20*time.Second {
+		t.Errorf("FrontierDivergence = %v, want 20s", got)
+	}
+	if got := lag.AudioTimeAtMaxSequence.Unix(); got != int64(lagBase+20) {
+		t.Errorf("AudioTimeAtMaxSequence = %d, want %d", got, int64(lagBase+20))
+	}
+	if got := lag.MaxAudioTime.Unix(); got != int64(lagBase+40) {
+		t.Errorf("MaxAudioTime = %d, want %d", got, int64(lagBase+40))
+	}
+
+	// Worst createdAt - captured_at among rows written in the window is
+	// seq 4: audio captured at T+20, written at T+301.
+	if got := lag.RecentIngestLag; got != 281*time.Second {
+		t.Errorf("RecentIngestLag = %v, want 281s", got)
+	}
+	if lag.RecentSampleCount != 4 {
+		t.Errorf("RecentSampleCount = %d, want 4", lag.RecentSampleCount)
+	}
+}
+
+func TestSessionLagRecentWindowExcludesOlderWrites(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedLaggingSession(t, rawDB)
+
+	store := NewStore(rawDB)
+	now := time.Unix(int64(lagBase+310), 0)
+
+	// A 20s window admits only seq 4 (written at T+301).
+	lag, err := store.SessionLag("sess-lag", 20*time.Second, now)
+	if err != nil {
+		t.Fatalf("SessionLag: %v", err)
+	}
+	if lag == nil {
+		t.Fatal("expected lag")
+	}
+	if lag.RecentSampleCount != 1 {
+		t.Errorf("RecentSampleCount = %d, want 1", lag.RecentSampleCount)
+	}
+	if got := lag.RecentIngestLag; got != 281*time.Second {
+		t.Errorf("RecentIngestLag = %v, want 281s", got)
+	}
+
+	// A window that admits nothing must not report a stale lag figure as
+	// if it were current.
+	quiet, err := store.SessionLag("sess-lag", time.Second, now)
+	if err != nil {
+		t.Fatalf("SessionLag quiet window: %v", err)
+	}
+	if quiet == nil {
+		t.Fatal("expected lag")
+	}
+	if quiet.RecentSampleCount != 0 {
+		t.Errorf("RecentSampleCount = %d, want 0", quiet.RecentSampleCount)
+	}
+	if quiet.RecentIngestLag != 0 {
+		t.Errorf("RecentIngestLag = %v, want 0 when no rows sampled", quiet.RecentIngestLag)
+	}
+}
+
+func TestSessionLagOnHealthySession(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedTestData(t, rawDB)
+
+	store := NewStore(rawDB)
+	// seedTestData writes each segment at the instant its audio starts.
+	now := time.Unix(1710000000+3600, 0)
+
+	lag, err := store.SessionLag("sess-1", time.Hour, now)
+	if err != nil {
+		t.Fatalf("SessionLag: %v", err)
+	}
+	if lag == nil {
+		t.Fatal("expected lag for a session with segments")
+	}
+	if lag.FrontierDivergence != 0 {
+		t.Errorf("FrontierDivergence = %v, want 0 on a healthy session", lag.FrontierDivergence)
+	}
+	if lag.RecentIngestLag != 0 {
+		t.Errorf("RecentIngestLag = %v, want 0 on a healthy session", lag.RecentIngestLag)
+	}
+}
+
+func TestSessionLagNilForSessionWithoutSegments(t *testing.T) {
+	rawDB := createTestDB(t)
+	defer rawDB.Close()
+	seedTestData(t, rawDB)
+
+	store := NewStore(rawDB)
+	now := time.Unix(1710000000+3600, 0)
+
+	// sess-3 is seeded with no segments. "Empty" and "healthy" must be
+	// distinguishable — a zero-valued lag would read as healthy.
+	lag, err := store.SessionLag("sess-3", time.Hour, now)
+	if err != nil {
+		t.Fatalf("SessionLag: %v", err)
+	}
+	if lag != nil {
+		t.Errorf("expected nil lag for a session with no segments, got %+v", lag)
+	}
+
+	missing, err := store.SessionLag("nope", time.Hour, now)
+	if err != nil {
+		t.Fatalf("SessionLag missing: %v", err)
+	}
+	if missing != nil {
+		t.Errorf("expected nil lag for an unknown session, got %+v", missing)
 	}
 }

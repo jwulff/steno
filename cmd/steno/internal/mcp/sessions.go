@@ -62,7 +62,7 @@ func registerSessions(s *server.MCPServer, store *db.Store) {
 
 	// get_session
 	getTool := mcp.NewTool("get_session",
-		mcp.WithDescription("Get detailed info about a single recording session, including all topics and the latest summary."),
+		mcp.WithDescription("Get detailed info about a single recording session, including all topics, the latest summary, and pipeline lag. Check `lag` before concluding a live session has gone quiet: a nonzero `recent_ingest_lag_seconds` means transcription is behind and more segments are still coming for audio that already happened."),
 		mcp.WithString("session_id",
 			mcp.Required(),
 			mcp.Description("The session ID to look up"),
@@ -98,22 +98,52 @@ func registerSessions(s *server.MCPServer, store *db.Store) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return jsonResult(formatSessionDetail(sess, topics, summary, counts))
+		lag, err := store.SessionLag(sessionID, db.DefaultLagWindow, time.Now())
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		return jsonResult(formatSessionDetail(sess, topics, summary, counts, lag))
 	})
 }
 
+// lagBrief is the JSON shape of db.SessionLag (#82). Present on a session
+// with segments, absent otherwise — a zero-valued lag would read as
+// healthy when the truth is "nothing recorded".
+type lagBrief struct {
+	AudioTimeAtMaxSequence     string  `json:"audio_time_at_max_sequence"`
+	MaxAudioTime               string  `json:"max_audio_time"`
+	SequenceFrontierLagSeconds float64 `json:"sequence_frontier_lag_seconds"`
+	RecentIngestLagSeconds     float64 `json:"recent_ingest_lag_seconds"`
+	RecentSampleCount          int     `json:"recent_sample_count"`
+}
+
+func formatLag(l *db.SessionLag) *lagBrief {
+	if l == nil {
+		return nil
+	}
+	return &lagBrief{
+		AudioTimeAtMaxSequence:     l.AudioTimeAtMaxSequence.Format(time.RFC3339),
+		MaxAudioTime:               l.MaxAudioTime.Format(time.RFC3339),
+		SequenceFrontierLagSeconds: l.FrontierDivergence.Seconds(),
+		RecentIngestLagSeconds:     l.RecentIngestLag.Seconds(),
+		RecentSampleCount:          l.RecentSampleCount,
+	}
+}
+
 type sessionDetailResponse struct {
-	ID           string          `json:"id"`
-	Title        string          `json:"title,omitempty"`
-	Status       string          `json:"status"`
-	Locale       string          `json:"locale"`
-	StartedAt    string          `json:"started_at"`
-	EndedAt      *string         `json:"ended_at,omitempty"`
-	SegmentCount int             `json:"segment_count"`
-	TopicCount   int             `json:"topic_count"`
-	SummaryCount int             `json:"summary_count"`
-	Topics       []topicBrief    `json:"topics"`
-	Summary      *summaryBrief   `json:"latest_summary,omitempty"`
+	ID           string        `json:"id"`
+	Title        string        `json:"title,omitempty"`
+	Status       string        `json:"status"`
+	Locale       string        `json:"locale"`
+	StartedAt    string        `json:"started_at"`
+	EndedAt      *string       `json:"ended_at,omitempty"`
+	SegmentCount int           `json:"segment_count"`
+	TopicCount   int           `json:"topic_count"`
+	SummaryCount int           `json:"summary_count"`
+	Topics       []topicBrief  `json:"topics"`
+	Summary      *summaryBrief `json:"latest_summary,omitempty"`
+	Lag          *lagBrief     `json:"lag,omitempty"`
 }
 
 type topicBrief struct {
@@ -132,7 +162,7 @@ type summaryBrief struct {
 	CreatedAt   string `json:"created_at"`
 }
 
-func formatSessionDetail(s *db.Session, topics []db.Topic, summary *db.Summary, counts db.SessionCounts) sessionDetailResponse {
+func formatSessionDetail(s *db.Session, topics []db.Topic, summary *db.Summary, counts db.SessionCounts, lag *db.SessionLag) sessionDetailResponse {
 	resp := sessionDetailResponse{
 		ID:           s.ID,
 		Title:        s.Title,
@@ -143,6 +173,7 @@ func formatSessionDetail(s *db.Session, topics []db.Topic, summary *db.Summary, 
 		TopicCount:   counts.Topics,
 		SummaryCount: counts.Summaries,
 		Topics:       make([]topicBrief, 0, len(topics)),
+		Lag:          formatLag(lag),
 	}
 
 	if s.EndedAt != nil {

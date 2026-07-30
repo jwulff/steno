@@ -586,4 +586,211 @@ struct DedupCoordinatorTests {
         let half = RecordingEngine.linearPeakToDbFS(0.5)
         #expect(half < -5.5 && half > -6.5)
     }
+
+    // MARK: - #80 systemAudio lag hold-back
+
+    /// Save a single segment. Thin helper for the hold-back tests, which
+    /// deliberately save mic and sys rows at different moments rather than
+    /// as a pair.
+    /// `t` is the capture instant — when the words were actually said.
+    /// `emissionDelay` is how much later the recognizer got around to
+    /// emitting the result, which is what `startedAt` records and what
+    /// drifts per source under a backlog. Default 0 keeps the healthy case
+    /// terse.
+    @discardableResult
+    private func saveOne(
+        repo: MockTranscriptRepository,
+        sessionId: UUID,
+        t: Date,
+        text: String,
+        seq: Int,
+        source: AudioSourceType,
+        emissionDelay: TimeInterval = 0
+    ) async throws -> StoredSegment {
+        let emitted = t.addingTimeInterval(emissionDelay)
+        let segment = StoredSegment(
+            sessionId: sessionId,
+            text: text,
+            startedAt: emitted,
+            endedAt: emitted.addingTimeInterval(1),
+            capturedAt: t,
+            sequenceNumber: seq,
+            source: source
+        )
+        try await repo.saveSegment(segment)
+        return segment
+    }
+
+    @Test func matchesCounterpartEmittedMinutesLate() async throws {
+        // The failure the capture clock exists for. Both recognizers heard
+        // the same words at the same instant, but the sys worker is minutes
+        // behind and emits its version long after. A +/-3s window over
+        // emission time cannot see the pair; over capture time it is exact.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 2, source: .systemAudio,
+            emissionDelay: 750
+        )
+        // Push the sys frontier past the mic segment's window so the
+        // hold-back lets it through.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(10),
+            text: "and on we go", seq: 3, source: .systemAudio,
+            emissionDelay: 760
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(outcome.evaluated == 1)
+        #expect(outcome.marked == 1)
+    }
+
+    @Test func holdDefersMicSegmentWhenSysSideHasWrittenNothing() async throws {
+        // The shape at the start of a lagging run: the mic worker is
+        // producing, the sys worker has not committed anything yet. Judging
+        // the mic segment now would find no candidates and burn the cursor
+        // past it forever.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+
+        #expect(outcome.evaluated == 0)
+        #expect(outcome.marked == 0)
+        #expect(outcome.deferred == 1)
+
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 0)
+    }
+
+    @Test func deferredMicSegmentIsMarkedOnceSysCounterpartLands() async throws {
+        // The whole point of the hold-back: the mic segment must still be
+        // reachable when its sys counterpart finally clears the backlog.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+
+        let first = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(first.deferred == 1)
+
+        // Sys catches up: the counterpart plus a later utterance that pushes
+        // the sys frontier past the mic segment's match window.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 2, source: .systemAudio
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(10),
+            text: "and then some more", seq: 3, source: .systemAudio
+        )
+
+        let second = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(second.evaluated == 1)
+        #expect(second.marked == 1)
+        #expect(second.deferred == 0)
+
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 1)
+    }
+
+    @Test func holdStopsAtFirstUnreadySegmentSoTheCursorNeverSkips() async throws {
+        // The cursor is a single watermark, so a pass that evaluated a
+        // later-but-ready segment while skipping an earlier unready one
+        // would strand the unready one behind the cursor. It must stop at
+        // the first segment it cannot judge.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+
+        // Ready: sys frontier will sit well past this one's window.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+        // Not ready: audio far ahead of anything sys has committed.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(100),
+            text: "much later utterance", seq: 3, source: .microphone
+        )
+        // Sys frontier at t+10 — past seq 1's window, nowhere near seq 3's.
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 2, source: .systemAudio
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(10),
+            text: "sys keeps going", seq: 4, source: .systemAudio
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(outcome.evaluated == 1)
+        #expect(outcome.marked == 1)
+        #expect(outcome.deferred == 1)
+
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 1)
+    }
+
+    @Test func micOnlyCaptureAdvancesCursorWithoutWaiting() async throws {
+        // systemAudio disabled: there is no counterpart coming, ever.
+        // Holding back would stall the cursor for the life of the session.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(5),
+            text: "second thing", seq: 2, source: .microphone
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id, holdForSystemAudio: false)
+        #expect(outcome.evaluated == 2)
+        #expect(outcome.deferred == 0)
+
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 2)
+    }
+
+    @Test func drainPassEvaluatesSegmentsTheHoldWouldHaveDeferred() async throws {
+        // The end-of-session pass runs with the hold off, because no more
+        // sys segments are coming. Anything the live passes deferred has to
+        // be judged now or never.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 1, source: .microphone
+        )
+        try await saveOne(
+            repo: repo, sessionId: session.id, t: t,
+            text: "hello world", seq: 2, source: .systemAudio
+        )
+
+        // Held: the sys frontier equals the mic segment's own start, so its
+        // match window is still open.
+        let held = await coord.runPass(sessionId: session.id, holdForSystemAudio: true)
+        #expect(held.evaluated == 0)
+        #expect(held.deferred == 1)
+
+        let drained = await coord.runPass(sessionId: session.id, holdForSystemAudio: false)
+        #expect(drained.evaluated == 1)
+        #expect(drained.marked == 1)
+
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 1)
+    }
 }

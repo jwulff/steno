@@ -87,7 +87,7 @@ func createTestDB(t *testing.T) *sql.DB {
 	d.SetMaxOpenConns(1)
 	schema := `
 		CREATE TABLE sessions (id TEXT PRIMARY KEY, locale TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL, title TEXT, status TEXT NOT NULL DEFAULT 'active', createdAt REAL NOT NULL);
-		CREATE TABLE segments (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), text TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL NOT NULL, confidence REAL, sequenceNumber INTEGER NOT NULL, createdAt REAL NOT NULL, source TEXT NOT NULL DEFAULT 'microphone', duplicate_of TEXT, dedup_method TEXT, heal_marker TEXT, mic_peak_db REAL, speaker_id TEXT, UNIQUE(sessionId, sequenceNumber));
+		CREATE TABLE segments (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), text TEXT NOT NULL, startedAt REAL NOT NULL, endedAt REAL NOT NULL, captured_at REAL, confidence REAL, sequenceNumber INTEGER NOT NULL, createdAt REAL NOT NULL, source TEXT NOT NULL DEFAULT 'microphone', duplicate_of TEXT, dedup_method TEXT, heal_marker TEXT, mic_peak_db REAL, speaker_id TEXT, UNIQUE(sessionId, sequenceNumber));
 		CREATE TABLE topics (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), title TEXT NOT NULL, summary TEXT NOT NULL, segmentRangeStart INTEGER NOT NULL, segmentRangeEnd INTEGER NOT NULL, createdAt REAL NOT NULL);
 		CREATE TABLE summaries (id TEXT PRIMARY KEY, sessionId TEXT NOT NULL REFERENCES sessions(id), content TEXT NOT NULL, summaryType TEXT NOT NULL, segmentRangeStart INTEGER NOT NULL, segmentRangeEnd INTEGER NOT NULL, modelId TEXT NOT NULL, createdAt REAL NOT NULL);
 	`
@@ -103,9 +103,9 @@ func seedTestData(t *testing.T, d *sql.DB) {
 	s1End := s1Start + 3600
 	d.Exec(`INSERT INTO sessions (id, locale, startedAt, endedAt, title, status, createdAt) VALUES ('sess-1', 'en_US', ?, ?, 'Team Standup', 'completed', ?)`, s1Start, s1End, s1Start)
 	for i := 1; i <= 10; i++ {
-		d.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source) VALUES (?, 'sess-1', ?, ?, ?, ?, ?, ?, 'microphone')`,
+		d.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, captured_at, confidence, sequenceNumber, createdAt, source) VALUES (?, 'sess-1', ?, ?, ?, ?, ?, ?, ?, 'microphone')`,
 			fmt.Sprintf("seg-1-%d", i), fmt.Sprintf("Segment %d from session one.", i),
-			s1Start+float64(i)*10, s1Start+float64(i)*10+9, 0.9+float64(i)*0.01, i, s1Start+float64(i)*10)
+			s1Start+float64(i)*10, s1Start+float64(i)*10+9, s1Start+float64(i)*10, 0.9+float64(i)*0.01, i, s1Start+float64(i)*10)
 	}
 	d.Exec(`INSERT INTO topics (id, sessionId, title, summary, segmentRangeStart, segmentRangeEnd, createdAt) VALUES ('top-1', 'sess-1', 'Sprint Planning', 'Discussion about next sprint goals', 1, 5, ?)`, s1Start+100)
 	d.Exec(`INSERT INTO topics (id, sessionId, title, summary, segmentRangeStart, segmentRangeEnd, createdAt) VALUES ('top-2', 'sess-1', 'Code Review', 'Reviewing the auth module', 6, 10, ?)`, s1Start+200)
@@ -114,9 +114,9 @@ func seedTestData(t *testing.T, d *sql.DB) {
 	s2Start := s1Start + 7200
 	d.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt) VALUES ('sess-2', 'en_US', ?, 'active', ?)`, s2Start, s2Start)
 	for i := 1; i <= 3; i++ {
-		d.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, sequenceNumber, createdAt, source) VALUES (?, 'sess-2', ?, ?, ?, ?, ?, 'systemAudio')`,
+		d.Exec(`INSERT INTO segments (id, sessionId, text, startedAt, endedAt, captured_at, sequenceNumber, createdAt, source) VALUES (?, 'sess-2', ?, ?, ?, ?, ?, ?, 'systemAudio')`,
 			fmt.Sprintf("seg-2-%d", i), fmt.Sprintf("Active session segment %d.", i),
-			s2Start+float64(i)*10, s2Start+float64(i)*10+9, i, s2Start+float64(i)*10)
+			s2Start+float64(i)*10, s2Start+float64(i)*10+9, s2Start+float64(i)*10, i, s2Start+float64(i)*10)
 	}
 	d.Exec(`INSERT INTO topics (id, sessionId, title, summary, segmentRangeStart, segmentRangeEnd, createdAt) VALUES ('top-3', 'sess-2', 'Architecture Discussion', 'Talking about MCP server design', 1, 3, ?)`, s2Start+100)
 
@@ -278,5 +278,114 @@ func TestSearchTool(t *testing.T) {
 	}
 	if len(results.Segments) != 3 {
 		t.Errorf("got %d scoped results, want 3", len(results.Segments))
+	}
+}
+
+// mcpLagBase is a fixed epoch for the lagging-session fixture, chosen
+// clear of seedTestData's timestamps.
+const mcpLagBase = 1720000000.0
+
+// testServerWithLaggingSession seeds the normal fixture plus one session
+// shaped like the 2026-07-29 incident: the row holding MAX(sequenceNumber)
+// describes older audio than the row holding MAX(startedAt), because the
+// two source workers share a sequence counter and one is behind.
+func testServerWithLaggingSession(t *testing.T) *server.MCPServer {
+	t.Helper()
+
+	rawDB := createTestDB(t)
+	seedTestData(t, rawDB)
+	t.Cleanup(func() { rawDB.Close() })
+
+	if _, err := rawDB.Exec(`INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+		VALUES ('sess-lag', 'en_US', ?, 'active', ?)`, mcpLagBase, mcpLagBase); err != nil {
+		t.Fatalf("seed lagging session: %v", err)
+	}
+	// See db.seedLaggingSession for the full shape. captured_at is the audio
+	// clock; startedAt is when the recognizer emitted, which drifts per
+	// source; sequenceNumber is engine handling order.
+	rows := []struct {
+		seq        int
+		source     string
+		capturedAt float64
+		emittedAt  float64
+		writtenAt  float64
+	}{
+		{1, "microphone", mcpLagBase + 10, mcpLagBase + 11, mcpLagBase + 12},
+		{2, "systemAudio", mcpLagBase + 10, mcpLagBase + 13, mcpLagBase + 14},
+		{3, "microphone", mcpLagBase + 40, mcpLagBase + 41, mcpLagBase + 42},
+		{4, "systemAudio", mcpLagBase + 20, mcpLagBase + 300, mcpLagBase + 301},
+	}
+	for _, r := range rows {
+		if _, err := rawDB.Exec(`INSERT INTO segments
+			(id, sessionId, text, startedAt, endedAt, captured_at, sequenceNumber, createdAt, source)
+			VALUES (?, 'sess-lag', ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("seg-lag-%d", r.seq), fmt.Sprintf("Lagging segment %d.", r.seq),
+			r.emittedAt, r.writtenAt, r.capturedAt, r.seq, r.writtenAt, r.source); err != nil {
+			t.Fatalf("seed lagging segment %d: %v", r.seq, err)
+		}
+	}
+
+	store := db.NewStore(rawDB)
+	s := server.NewMCPServer("steno-mcp-test", "0.0.1", server.WithToolCapabilities(false))
+	RegisterTools(s, store)
+	return s
+}
+
+func TestGetSessionToolReportsLag(t *testing.T) {
+	s := testServerWithLaggingSession(t)
+	text := callTool(t, s, "get_session", map[string]any{"session_id": "sess-lag"})
+
+	var resp sessionDetailResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.Lag == nil {
+		t.Fatal("expected lag on a session with segments")
+	}
+	// Sequence frontier sits 20s behind the timestamp frontier — the
+	// signal that told the operator the pipeline was behind rather than
+	// the room being quiet.
+	if resp.Lag.SequenceFrontierLagSeconds != 20 {
+		t.Errorf("SequenceFrontierLagSeconds = %v, want 20", resp.Lag.SequenceFrontierLagSeconds)
+	}
+	if resp.Lag.AudioTimeAtMaxSequence == "" || resp.Lag.MaxAudioTime == "" {
+		t.Error("expected both frontier timestamps to be populated")
+	}
+}
+
+func TestGetSessionToolOmitsLagWhenNoSegments(t *testing.T) {
+	s := testServer(t)
+	// sess-3 is seeded with no segments. A zero-valued lag would read as
+	// a healthy pipeline; the field must be absent instead.
+	text := callTool(t, s, "get_session", map[string]any{"session_id": "sess-3"})
+
+	var resp sessionDetailResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Lag != nil {
+		t.Errorf("expected no lag for a session without segments, got %+v", resp.Lag)
+	}
+}
+
+func TestGetOverviewToolReportsActiveSessionLag(t *testing.T) {
+	s := testServerWithLaggingSession(t)
+	text := callTool(t, s, "get_overview", nil)
+
+	var resp overviewResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.ActiveSession == nil {
+		t.Fatal("expected an active session")
+	}
+	if resp.ActiveSessionLag == nil {
+		t.Fatal("expected lag alongside the active session")
+	}
+	if resp.ActiveSessionLag.SequenceFrontierLagSeconds != 20 {
+		t.Errorf("SequenceFrontierLagSeconds = %v, want 20",
+			resp.ActiveSessionLag.SequenceFrontierLagSeconds)
 	}
 }

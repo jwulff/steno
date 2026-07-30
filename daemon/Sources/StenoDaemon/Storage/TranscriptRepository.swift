@@ -174,6 +174,21 @@ public protocol TranscriptRepository: Sendable {
     /// - Returns: Segments ordered by `sequenceNumber` ascending.
     func segmentsAfterDedupCursor(sessionId: UUID, source: AudioSourceType) async throws -> [StoredSegment]
 
+    /// Newest `startedAt` among `sessionId`'s segments from `source`, or
+    /// `nil` when that source has produced nothing for the session yet.
+    ///
+    /// This is the per-source ingest frontier. `DedupCoordinator` uses the
+    /// systemAudio frontier to decide whether a mic segment's match window
+    /// has closed: while the sys worker is behind, its counterpart may
+    /// simply not be written yet, and judging the mic segment early would
+    /// advance the dedup cursor past a pair that was going to match (#80).
+    ///
+    /// - Parameters:
+    ///   - sessionId: The session ID.
+    ///   - source: The audio source whose frontier to read.
+    /// - Returns: The newest `startedAt` for that source, or nil.
+    func latestSegmentTime(sessionId: UUID, source: AudioSourceType) async throws -> Date?
+
     /// Segments in `sessionId` of the given `source` whose `startedAt`
     /// falls within `[from, to]`. Used by `DedupCoordinator` to find
     /// time-overlapping sys candidates for a given mic segment.

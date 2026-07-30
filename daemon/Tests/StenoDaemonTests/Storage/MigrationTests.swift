@@ -404,6 +404,108 @@ struct MigrationTests {
         }
     }
 
+    // MARK: - #85 captured-audio clock
+
+    @Test func segmentsTableHasCapturedAtColumn() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            let columns = try db.columns(in: "segments").map(\.name)
+            #expect(columns.contains("captured_at"))
+        }
+    }
+
+    @Test func capturedAtIsBackfilledFromStartedAt() throws {
+        // Rows written before the column existed have no analyzer anchor to
+        // recover, so the migration seeds them from the emission timestamp
+        // they already carry. That is what lets readers order on captured_at
+        // without a COALESCE.
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO sessions (id, locale, startedAt, status, createdAt)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                arguments: ["s-backfill", "en_US", 0.0, "active", 0.0]
+            )
+            // Simulate a pre-migration row by nulling the column back out.
+            try db.execute(
+                sql: """
+                    INSERT INTO segments
+                        (id, sessionId, text, startedAt, endedAt, captured_at,
+                         sequenceNumber, createdAt, source)
+                    VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                arguments: ["seg-backfill", "s-backfill", "hello", 100.0, 101.0, 1, 102.0, "microphone"]
+            )
+            try db.execute(sql: "UPDATE segments SET captured_at = startedAt WHERE captured_at IS NULL")
+        }
+
+        try dbQueue.read { db in
+            let value = try Double.fetchOne(
+                db,
+                sql: "SELECT captured_at FROM segments WHERE id = 'seg-backfill'"
+            )
+            #expect(value == 100.0)
+        }
+    }
+
+    @Test func capturedPartialIndexExists() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            let indexes = try db.indexes(on: "segments")
+            #expect(indexes.map(\.name).contains("idx_segments_session_captured"))
+
+            let sql = try String.fetchOne(
+                db,
+                sql: "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_segments_session_captured'"
+            )
+            #expect(sql != nil)
+            #expect(sql?.contains("duplicate_of IS NULL") == true)
+        }
+    }
+
+    @Test func capturedIndexServesTheDefaultTranscriptQuery() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            // The default TUI/MCP transcript read: same filter as before,
+            // ordered on the capture axis. Without a (sessionId, captured_at)
+            // index this degrades to a sort over every row in a long session —
+            // the exact sessions this work is about.
+            let plan = try Row.fetchAll(
+                db,
+                sql: """
+                    EXPLAIN QUERY PLAN
+                    SELECT id, sessionId, text, captured_at, sequenceNumber
+                    FROM segments
+                    WHERE sessionId = ? AND duplicate_of IS NULL
+                    ORDER BY captured_at
+                """,
+                arguments: ["any-session-id"]
+            )
+            let detail = plan.compactMap { $0["detail"] as String? }.joined(separator: " | ")
+
+            // As with the dedup-index test, the contract is that *some* index
+            // keyed on (sessionId, captured_at) serves the query and that no
+            // separate sort step is required — not that the planner names this
+            // specific index.
+            let usesIndex = detail.contains("idx_segments_session_captured")
+                || (detail.contains("sessionId") && detail.contains("captured_at"))
+            #expect(
+                usesIndex,
+                Comment(rawValue: "Expected the plan to use a (sessionId, captured_at) index; got: \(detail)")
+            )
+            #expect(
+                !detail.contains("USE TEMP B-TREE FOR ORDER BY"),
+                Comment(rawValue: "Expected the index to satisfy ORDER BY captured_at without a sort; got: \(detail)")
+            )
+        }
+    }
+
     // MARK: - WAL on the writer connection
 
     @Test func onDiskWriterUsesWALMode() throws {

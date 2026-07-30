@@ -11,7 +11,7 @@ import (
 
 func registerOverview(s *server.MCPServer, store *db.Store) {
 	tool := mcp.NewTool("get_overview",
-		mcp.WithDescription("Get a high-level summary of the Steno database — total sessions, active session, recent sessions with topic counts, and date range. Start here to orient yourself."),
+		mcp.WithDescription("Get a high-level summary of the Steno database — total sessions, active session, recent sessions with topic counts, and date range. Start here to orient yourself. When a session is active, `active_session_lag` reports how far transcription has fallen behind the audio."),
 	)
 
 	s.AddTool(tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -19,15 +19,29 @@ func registerOverview(s *server.MCPServer, store *db.Store) {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return jsonResult(formatOverview(overview))
+
+		// Lag on the active session travels with the overview so an agent
+		// orienting itself sees a backlogged pipeline without a second
+		// call — the case that matters is exactly the one where it is
+		// about to mistake lag for silence (#82).
+		var lag *db.SessionLag
+		if overview.ActiveSession != nil {
+			lag, err = store.SessionLag(overview.ActiveSession.ID, db.DefaultLagWindow, time.Now())
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+
+		return jsonResult(formatOverview(overview, lag))
 	})
 }
 
 type overviewResponse struct {
-	TotalSessions  int                      `json:"total_sessions"`
-	ActiveSession  *sessionBrief            `json:"active_session,omitempty"`
-	RecentSessions []sessionWithCountsBrief `json:"recent_sessions"`
-	DateRange      *dateRange               `json:"date_range,omitempty"`
+	TotalSessions    int                      `json:"total_sessions"`
+	ActiveSession    *sessionBrief            `json:"active_session,omitempty"`
+	ActiveSessionLag *lagBrief                `json:"active_session_lag,omitempty"`
+	RecentSessions   []sessionWithCountsBrief `json:"recent_sessions"`
+	DateRange        *dateRange               `json:"date_range,omitempty"`
 }
 
 type sessionBrief struct {
@@ -50,13 +64,14 @@ type dateRange struct {
 	Latest   string `json:"latest"`
 }
 
-func formatOverview(o *db.Overview) overviewResponse {
+func formatOverview(o *db.Overview, activeLag *db.SessionLag) overviewResponse {
 	resp := overviewResponse{
 		TotalSessions: o.TotalSessions,
 	}
 
 	if o.ActiveSession != nil {
 		resp.ActiveSession = formatSessionBrief(o.ActiveSession)
+		resp.ActiveSessionLag = formatLag(activeLag)
 	}
 
 	for _, swc := range o.RecentSessions {
