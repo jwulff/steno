@@ -104,7 +104,11 @@ test-daemon:
 		fi
 
 test-steno:
-	cd $(STENO_DIR) && go test ./...
+	# `-p 1` serializes packages. `internal/app` and `internal/daemon` both
+	# drive the single shared steno-daemon over its socket, so running them
+	# concurrently means one package's recording state decides whether the
+	# other's tests pass (#87).
+	cd $(STENO_DIR) && go test -p 1 ./...
 
 # --- Clean ---
 

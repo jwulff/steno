@@ -23,6 +23,8 @@ func TestDaemonCrashDuringRecording(t *testing.T) {
 	defer client.Close()
 
 	// Start recording
+	ensureIdle(t, client)
+
 	resp, err := client.SendCommand(Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)

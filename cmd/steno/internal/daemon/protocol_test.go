@@ -430,3 +430,20 @@ func derefInt(i *int) any {
 	}
 	return *i
 }
+
+// ensureIdle brings the daemon to a known state before a test issues its
+// own `start`.
+//
+// Always-on recording (#32) means a freshly launched daemon is already
+// recording, and `go test ./...` runs packages in parallel against the one
+// shared daemon — so whether a live test found it idle used to depend on
+// what another package had done moments earlier. `start` against a
+// recording daemon fails, which made the whole suite order-dependent (#87).
+//
+// Sending `stop` is safe whether or not anything is recording.
+func ensureIdle(t *testing.T, client *Client) {
+	t.Helper()
+	if _, err := client.SendCommand(Command{Cmd: "stop"}); err != nil {
+		t.Fatalf("ensureIdle stop: %v", err)
+	}
+}
