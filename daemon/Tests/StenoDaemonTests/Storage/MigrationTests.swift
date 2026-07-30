@@ -404,6 +404,64 @@ struct MigrationTests {
         }
     }
 
+    // MARK: - #81 audio-order index
+
+    @Test func sessionTimePartialIndexExists() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            let indexes = try db.indexes(on: "segments")
+            #expect(indexes.map(\.name).contains("idx_segments_session_time"))
+
+            let sql = try String.fetchOne(
+                db,
+                sql: "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_segments_session_time'"
+            )
+            #expect(sql != nil)
+            #expect(sql?.contains("duplicate_of IS NULL") == true)
+        }
+    }
+
+    @Test func sessionTimeIndexServesTheDefaultTranscriptQuery() throws {
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+
+        try dbQueue.read { db in
+            // The default TUI/MCP transcript read after #81: same filter as
+            // before, ordered by `startedAt` because sequence order is
+            // finalization order across two source workers, not audio order.
+            // Without a (sessionId, startedAt) index this plan degrades to a
+            // sort over every row in a long session — the exact sessions this
+            // work is about.
+            let plan = try Row.fetchAll(
+                db,
+                sql: """
+                    EXPLAIN QUERY PLAN
+                    SELECT id, sessionId, text, startedAt, sequenceNumber
+                    FROM segments
+                    WHERE sessionId = ? AND duplicate_of IS NULL
+                    ORDER BY startedAt
+                """,
+                arguments: ["any-session-id"]
+            )
+            let detail = plan.compactMap { $0["detail"] as String? }.joined(separator: " | ")
+
+            // As with the dedup-index test, the contract is that *some*
+            // index keyed on (sessionId, startedAt) serves the query and
+            // that no separate sort step is required — not that the planner
+            // names this specific index.
+            let usesIndex = detail.contains("idx_segments_session_time")
+                || (detail.contains("sessionId") && detail.contains("startedAt"))
+            #expect(
+                usesIndex,
+                Comment(rawValue: "Expected the plan to use a (sessionId, startedAt) index; got: \(detail)")
+            )
+            #expect(
+                !detail.contains("USE TEMP B-TREE FOR ORDER BY"),
+                Comment(rawValue: "Expected the index to satisfy ORDER BY startedAt without a sort; got: \(detail)")
+            )
+        }
+    }
+
     // MARK: - WAL on the writer connection
 
     @Test func onDiskWriterUsesWALMode() throws {

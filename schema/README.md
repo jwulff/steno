@@ -41,7 +41,7 @@ explicitly via `PRAGMA journal_mode = WAL` in `DatabaseConfiguration.prepareData
 | startedAt      | REAL    | NO       |               | Unix timestamp                                                           |
 | endedAt        | REAL    | NO       |               | Unix timestamp                                                           |
 | confidence     | REAL    | YES      | NULL          | 0.0-1.0 or NULL                                                          |
-| sequenceNumber | INTEGER | NO       |               | Unique per session                                                       |
+| sequenceNumber | INTEGER | NO       |               | Unique per session. **Finalization order, not audio order** — see "Reading segments" below. |
 | createdAt      | REAL    | NO       |               | Unix timestamp                                                           |
 | source         | TEXT    | NO       | 'microphone'  | "microphone" or "systemAudio"                                            |
 | duplicate_of   | TEXT    | YES      | NULL          | FK to `segments(id)` ON DELETE SET NULL. Set by `DedupCoordinator` (U11) when this row is a duplicate of another segment. NULL = canonical / not yet evaluated. |
@@ -55,13 +55,50 @@ explicitly via `PRAGMA journal_mode = WAL` in `DatabaseConfiguration.prepareData
 **Indexes:**
 - `idx_segments_session(sessionId)`
 - `idx_segments_time(startedAt)`
-- `idx_segments_dedup(sessionId, sequenceNumber) WHERE duplicate_of IS NULL` — partial index that backs the default TUI/MCP query (`WHERE sessionId = ? AND duplicate_of IS NULL ORDER BY sequenceNumber`).
+- `idx_segments_dedup(sessionId, sequenceNumber) WHERE duplicate_of IS NULL` — partial index over the non-duplicate rows, keyed for sequence-range selection (`SegmentsForRange`, the dedup cursor scan).
+- `idx_segments_session_time(sessionId, startedAt) WHERE duplicate_of IS NULL` — partial index that backs the default TUI/MCP query (`WHERE sessionId = ? AND duplicate_of IS NULL ORDER BY startedAt`).
 
 **Constraints:**
 - `UNIQUE(sessionId, sequenceNumber)`
 - text length 1-10000
 - confidence 0-1
 - `dedup_method` ∈ {NULL, `'exact'`, `'normalized'`, `'fuzzy'`}
+
+#### Reading segments
+
+**`sequenceNumber` orders finalizations, not audio.** The daemon assigns it in
+`RecordingEngine.handleRecognizerResult` the moment a recognizer result finalizes,
+from a single counter shared by the microphone and systemAudio workers. Those two
+workers progress independently, so the row holding `MAX(sequenceNumber)` can describe
+older audio than the row holding `MAX(startedAt)` — by seconds normally, by tens of
+minutes when transcription falls behind on a long recording (see #85).
+
+Two rules for any consumer:
+
+1. **Order by `startedAt`.** `ORDER BY sequenceNumber` interleaves the two sources by
+   whichever finished transcribing first, which is not the order anyone spoke.
+2. **Cursor on `startedAt`, and treat a stalled sequence frontier as a lag signal
+   rather than as silence.** A consumer polling
+   `WHERE sequenceNumber > :cursor ORDER BY sequenceNumber` under a backlog sees the
+   tail stop advancing and reads it as the room having gone quiet. It has not; the
+   rows are queued.
+
+`sequenceNumber` remains the right key for *identity* and for range addressing —
+`UNIQUE(sessionId, sequenceNumber)`, and the `segmentRangeStart`/`segmentRangeEnd`
+columns on `topics` and `summaries` both refer to it.
+
+To measure how far behind the writer is, compare the two frontiers. The Go store
+exposes this as `SessionLag`, surfaced on the MCP `get_session` and `get_overview`
+tools; in raw SQL it is:
+
+```sql
+SELECT
+  (SELECT startedAt FROM segments WHERE sessionId = :sid
+     ORDER BY sequenceNumber DESC LIMIT 1) AS ts_at_max_seq,
+  (SELECT MAX(startedAt) FROM segments WHERE sessionId = :sid) AS max_ts;
+```
+
+Equal values mean sequence order is currently safe. Divergence means it is not.
 
 ### summaries
 
@@ -102,3 +139,4 @@ Migrations are managed by GRDB in the daemon. Other components should treat the 
 4. `20260425_001_dedup_and_heal` — adds dedup pointer (`duplicate_of`, `dedup_method`), in-place heal marker (`heal_marker`), mic peak dBFS (`mic_peak_db`) to segments; adds dedup cursor (`last_deduped_segment_seq`) and pause-state-survives-restart fields (`pause_expires_at`, `paused_indefinitely`) to sessions; adds the `idx_segments_dedup` partial index. All additions are nullable or have safe defaults.
 5. `20260525_001_segment_audio_time` — adds audio-frame time (`audio_start`, `audio_end`) to segments for the diarization join axis (#64). Both nullable.
 6. `20260525_002_segment_speaker` — adds `speaker_id` (global speaker UUID) to segments for diarization speaker labels (#61). Nullable.
+7. `20260730_001_segments_session_time_index` — adds the `idx_segments_session_time` partial index so the default transcript read, now ordered by `startedAt` rather than `sequenceNumber` (#81), does not sort a long session's rows on every query. Index-only; no column or data changes.

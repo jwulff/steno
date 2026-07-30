@@ -347,18 +347,27 @@ func (s *Store) SummariesForSession(sessionID string) ([]Summary, error) {
 	return summaries, rows.Err()
 }
 
-// SegmentsForSession returns paginated segments for a session.
+// SegmentsForSession returns paginated segments for a session, in audio
+// order.
 //
 // Default-filter (U9): rows where `duplicate_of IS NOT NULL` are excluded
 // — these are mic segments that the daemon's DedupCoordinator (U11)
 // marked as duplicates of an overlapping system-audio segment. Raw access
 // to all segments (including duplicates) is reserved for diagnostic SQL.
+//
+// Ordering (#81): `startedAt`, not `sequenceNumber`. The daemon assigns
+// the sequence number when a recognizer result *finalizes*, from a counter
+// shared by the mic and systemAudio workers, so sequence order is
+// finalization order — not the order the audio happened. Whenever the two
+// workers make unequal progress, ordering by sequence interleaves them
+// wrongly. Matches `SQLiteTranscriptRepository.segments(for:)` on the
+// daemon side, which already ordered this way.
 func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND duplicate_of IS NULL
-		ORDER BY sequenceNumber ASC
+		ORDER BY startedAt ASC, sequenceNumber ASC
 		LIMIT ? OFFSET ?
 	`, sessionID, limit, offset)
 	if err != nil {
@@ -368,16 +377,21 @@ func (s *Store) SegmentsForSession(sessionID string, limit, offset int) ([]Segme
 	return scanSegments(rows)
 }
 
-// SegmentsForRange returns segments within a sequence number range for a session.
+// SegmentsForRange returns segments within a sequence number range for a
+// session, in audio order.
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
+//
+// The sequence range stays the selection predicate — topics and summaries
+// address segments by `segmentRangeStart`/`End`, so that is the contract —
+// but the rows come back ordered by `startedAt` (#81).
 func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, error) {
 	rows, err := s.db.Query(`
 		SELECT id, sessionId, text, startedAt, endedAt, confidence, sequenceNumber, createdAt, source, speaker_id
 		FROM segments
 		WHERE sessionId = ? AND sequenceNumber >= ? AND sequenceNumber <= ?
 		  AND duplicate_of IS NULL
-		ORDER BY sequenceNumber ASC
+		ORDER BY startedAt ASC, sequenceNumber ASC
 	`, sessionID, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("query segments: %w", err)
@@ -386,7 +400,8 @@ func (s *Store) SegmentsForRange(sessionID string, start, end int) ([]Segment, e
 	return scanSegments(rows)
 }
 
-// SegmentsForTimeRange returns segments within a time window for a session.
+// SegmentsForTimeRange returns segments within a time window for a
+// session, in audio order (#81).
 //
 // Default-filter (U9): excludes `duplicate_of IS NOT NULL`.
 func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time) ([]Segment, error) {
@@ -403,7 +418,7 @@ func (s *Store) SegmentsForTimeRange(sessionID string, after, before *time.Time)
 		args = append(args, float64(before.Unix()))
 	}
 
-	query += ` ORDER BY sequenceNumber ASC`
+	query += ` ORDER BY startedAt ASC, sequenceNumber ASC`
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -519,6 +534,64 @@ func (s *Store) SessionCounts(sessionID string) (SessionCounts, error) {
 		return c, fmt.Errorf("count summaries: %w", err)
 	}
 	return c, nil
+}
+
+// DefaultLagWindow is the recent-writes window SessionLag samples for its
+// ingest-lag figure. Wide enough to survive a natural pause in speech,
+// narrow enough that the number describes now rather than the whole run.
+const DefaultLagWindow = 5 * time.Minute
+
+// SessionLag reports how far the write side has fallen behind for a
+// session (#82). Returns nil — not a zero value — when the session has no
+// segments, so "empty" stays distinguishable from "healthy".
+//
+// `window` bounds the recent-writes sample by `createdAt`; `now` is
+// injected so the sample is deterministic in tests. Duplicate-marked rows
+// are deliberately NOT filtered: lag is a property of the writer, and a
+// row the dedup pass later discards still cost transcription time.
+func (s *Store) SessionLag(sessionID string, window time.Duration, now time.Time) (*SessionLag, error) {
+	// Both frontiers in one round trip. NULL for a session with no rows.
+	var atMaxSeq, maxAudio sql.NullFloat64
+	err := s.db.QueryRow(`
+		SELECT
+			(SELECT startedAt FROM segments WHERE sessionId = ?
+			   ORDER BY sequenceNumber DESC LIMIT 1),
+			(SELECT MAX(startedAt) FROM segments WHERE sessionId = ?)
+	`, sessionID, sessionID).Scan(&atMaxSeq, &maxAudio)
+	if err != nil {
+		return nil, fmt.Errorf("query lag frontiers: %w", err)
+	}
+	if !atMaxSeq.Valid || !maxAudio.Valid {
+		return nil, nil
+	}
+
+	lag := &SessionLag{
+		AudioTimeAtMaxSequence: timeFromUnix(atMaxSeq.Float64),
+		MaxAudioTime:           timeFromUnix(maxAudio.Float64),
+	}
+	// MAX(startedAt) is by definition >= any single row's startedAt, so
+	// this cannot go negative.
+	lag.FrontierDivergence = lag.MaxAudioTime.Sub(lag.AudioTimeAtMaxSequence)
+
+	cutoff := float64(now.Add(-window).Unix())
+	var count int
+	var worst sql.NullFloat64
+	err = s.db.QueryRow(`
+		SELECT COUNT(*), MAX(createdAt - startedAt)
+		FROM segments
+		WHERE sessionId = ? AND createdAt >= ?
+	`, sessionID, cutoff).Scan(&count, &worst)
+	if err != nil {
+		return nil, fmt.Errorf("query recent ingest lag: %w", err)
+	}
+	lag.RecentSampleCount = count
+	if count > 0 && worst.Valid && worst.Float64 > 0 {
+		// A negative gap would mean the row was committed before the
+		// audio it describes — clock skew, not lag. Report nothing.
+		lag.RecentIngestLag = time.Duration(worst.Float64 * float64(time.Second))
+	}
+
+	return lag, nil
 }
 
 // scanSession scans a session row from a *sql.Rows.

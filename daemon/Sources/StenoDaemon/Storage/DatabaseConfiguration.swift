@@ -198,6 +198,20 @@ public enum DatabaseConfiguration {
             try db.execute(sql: "ALTER TABLE segments ADD COLUMN speaker_id TEXT")
         }
 
+        // #81: the default transcript query now orders by `startedAt`, not
+        // `sequenceNumber` — sequence is finalization order across two
+        // source workers, not audio order. `idx_segments_dedup` still serves
+        // the filter but no longer serves the sort, which would leave long
+        // sessions sorting thousands of rows per read. Same partial-index
+        // shape, keyed on the column the query actually orders by.
+        migrator.registerMigration("20260730_001_segments_session_time_index") { db in
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_segments_session_time
+                ON segments(sessionId, startedAt)
+                WHERE duplicate_of IS NULL
+            """)
+        }
+
         return migrator
     }
 }
