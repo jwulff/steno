@@ -119,6 +119,71 @@ struct CommandDispatcherTests {
         #expect(events.count == 1)
     }
 
+    // MARK: - #86 subscribe response ordering
+
+    @Test @MainActor func subscribeResponsePrecedesReplayedEvents() async throws {
+        // A client reads the socket line by line, so the response to
+        // `subscribe` must be the FIRST line written on that connection.
+        // #62's replay-on-subscribe wrote model readiness from inside the
+        // handler, i.e. before the dispatcher wrote the response — the
+        // client then decoded a `model_status` event as its response, saw no
+        // `ok` field, and reported "subscribe not ok" with an empty error.
+        let (dispatcher, engine, _) = makeDispatcher()
+        let client = MockClientConnection()
+
+        // Starting the engine makes it report model readiness, which is the
+        // precondition for the replay firing on the next subscribe.
+        await dispatcher.handle(DaemonCommand(cmd: "start", locale: "en_US"), from: client)
+        await client.reset()
+
+        await dispatcher.handle(DaemonCommand(cmd: "subscribe"), from: client)
+
+        let lines = await client.sentLines
+        #expect(!lines.isEmpty)
+        guard case .response(let response)? = lines.first else {
+            Issue.record("First line on the wire was not the subscribe response: \(lines)")
+            await engine.stop()
+            return
+        }
+        #expect(response.ok == true)
+
+        // And the replay still happens — just after the response.
+        let replayed = lines.dropFirst().compactMap { line -> DaemonEvent? in
+            if case .event(let event) = line { return event }
+            return nil
+        }
+        #expect(replayed.contains { $0.event == "model_status" })
+
+        await engine.stop()
+    }
+
+    @Test @MainActor func subscribeResponsePrecedesBroadcastEvents() async throws {
+        // The general form of the same bug: registering the client with the
+        // broadcaster opens the event firehose on its connection. While
+        // recording, level events alone fire at 10Hz, so anything written
+        // between registration and the response can beat it. Nothing may be
+        // written to the client between the two.
+        let (dispatcher, engine, broadcaster) = makeDispatcher()
+        let client = MockClientConnection()
+
+        await dispatcher.handle(DaemonCommand(cmd: "subscribe"), from: client)
+
+        let lines = await client.sentLines
+        guard case .response? = lines.first else {
+            Issue.record("First line on the wire was not the subscribe response: \(lines)")
+            return
+        }
+
+        // Subscription is live: events broadcast after the response arrive.
+        await broadcaster.engine(engine, didEmit: .partialText("test", .microphone))
+        let after = await client.sentLines
+        let events = after.dropFirst().compactMap { line -> DaemonEvent? in
+            if case .event(let event) = line { return event }
+            return nil
+        }
+        #expect(events.contains { $0.event == "partial" })
+    }
+
     @Test @MainActor func reconfigureWithoutSystemAudioReturnsError() async throws {
         let (dispatcher, _, _) = makeDispatcher()
         let client = MockClientConnection()

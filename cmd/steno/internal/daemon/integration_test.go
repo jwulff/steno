@@ -29,7 +29,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 		t.Fatalf("status: %v", err)
 	}
 	fmt.Printf("Initial status: ok=%v recording=%v status=%q device=%q\n",
-		resp.OK, resp.Recording, resp.Status, resp.Device)
+		resp.OK, derefBool(resp.Recording), resp.Status, resp.Device)
 
 	// Get devices
 	resp, err = client.SendCommand(Command{Cmd: "devices"})
@@ -46,7 +46,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("start failed: %s", resp.Error)
 	}
-	fmt.Printf("Started: sessionId=%s recording=%v\n", resp.SessionID, resp.Recording)
+	fmt.Printf("Started: sessionId=%s recording=%v\n", resp.SessionID, derefBool(resp.Recording))
 
 	// Check status while recording
 	resp, err = client.SendCommand(Command{Cmd: "status"})
@@ -56,7 +56,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	if resp.Recording == nil || !*resp.Recording {
 		t.Error("expected recording=true during recording")
 	}
-	fmt.Printf("During recording: recording=%v segments=%v\n", resp.Recording, resp.Segments)
+	fmt.Printf("During recording: recording=%v segments=%v\n", derefBool(resp.Recording), derefInt(resp.Segments))
 
 	// Stop recording (immediately, no delay)
 	resp, err = client.SendCommand(Command{Cmd: "stop"})
@@ -66,7 +66,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	if !resp.OK {
 		t.Fatalf("stop failed: %s", resp.Error)
 	}
-	fmt.Printf("Stopped: recording=%v\n", resp.Recording)
+	fmt.Printf("Stopped: recording=%v\n", derefBool(resp.Recording))
 
 	// Verify stopped
 	resp, err = client.SendCommand(Command{Cmd: "status"})
@@ -76,7 +76,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	if resp.Recording != nil && *resp.Recording {
 		t.Error("expected recording=false after stop")
 	}
-	fmt.Printf("After stop: recording=%v status=%q\n", resp.Recording, resp.Status)
+	fmt.Printf("After stop: recording=%v status=%q\n", derefBool(resp.Recording), resp.Status)
 
 	fmt.Println("\nAll daemon commands working correctly!")
 }

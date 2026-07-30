@@ -30,7 +30,7 @@ func TestLiveDaemonConnection(t *testing.T) {
 		t.Fatalf("status not ok: %s", resp.Error)
 	}
 	fmt.Printf("Status: ok=%v recording=%v device=%q status=%q\n",
-		resp.OK, resp.Recording, resp.Device, resp.Status)
+		resp.OK, derefBool(resp.Recording), resp.Device, resp.Status)
 
 	// Test devices command
 	resp, err = client.SendCommand(Command{Cmd: "devices"})
