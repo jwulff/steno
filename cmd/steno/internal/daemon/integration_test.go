@@ -39,6 +39,7 @@ func TestLiveDaemonStartStop(t *testing.T) {
 	fmt.Printf("Devices: %v\n", resp.Devices)
 
 	// Start recording
+	ensureIdle(t, client)
 	resp, err = client.SendCommand(Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -114,6 +115,7 @@ func TestLiveDaemonEventStream(t *testing.T) {
 	}
 
 	// Start recording via command connection
+	ensureIdle(t, cmdClient)
 	resp, err = cmdClient.SendCommand(Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)

@@ -78,6 +78,12 @@ func TestLiveTUIFlow(t *testing.T) {
 	}
 
 	// Start recording via command connection
+	// Always-on recording (#32) means the daemon may already be recording,
+	// in which case `start` fails. Stop first — safe either way (#87).
+	if _, err := client.SendCommand(daemon.Command{Cmd: "stop"}); err != nil {
+		t.Fatalf("stop before start: %v", err)
+	}
+
 	resp, err = client.SendCommand(daemon.Command{Cmd: "start"})
 	if err != nil {
 		t.Fatalf("start: %v", err)
