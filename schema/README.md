@@ -103,6 +103,14 @@ Three rules for any consumer:
    the tail stop advancing and reads it as the room having gone quiet. It has
    not; the rows are queued.
 
+   Such a cursor no longer *loses* rows: since #83 the sequence number is
+   assigned inside the insert's transaction, so a row numbered N is durable
+   before N+1 exists and a reader cannot poll into the gap. Before that fix the
+   engine bumped an in-memory counter and then awaited before inserting, so N
+   could land after N+1 and any reader that polled in between skipped N forever.
+   The remaining reason to prefer `captured_at` is freshness and cross-source
+   ordering, not loss.
+
 `sequenceNumber` remains the right key for *identity* and for range addressing —
 `UNIQUE(sessionId, sequenceNumber)`, and the `segmentRangeStart`/`segmentRangeEnd`
 columns on `topics` and `summaries` both refer to it.
