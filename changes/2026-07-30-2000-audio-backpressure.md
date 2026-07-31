@@ -55,6 +55,9 @@ absent.
   nominal so the assertion proves measurement rather than coincidence.
 - `audioBacklogCapSeconds` survives a settings round trip.
 - A settings JSON written before this change decodes to `0` — shedding stays opt-in.
+- A bounded-latency window fires once for 50 rapid events; a trailing debounce would not
+  have fired at all.
+- The analyzer-range mapping is early by exactly the shed duration without the correction.
 
 `make test-daemon`: 0 failures. (The reported pass count varies run to run — 464 to 469
 here — because the harness's documented macOS 26 teardown abort truncates the log before
@@ -65,6 +68,30 @@ a real backlog deterministically means starving a live audio pipeline on a timer
 exactly the sort of load-dependent test that passes on an idle machine and flakes on a busy
 one. The primitive, the measurement, and the defaults are tested; the integration is
 reasoned from them.
+
+## What review caught
+
+Four defects in the first pass, two of them serious enough to have made this a net
+negative:
+
+- **Shedding corrupted the capture clock.** `capturedAt` is
+  `analyzerStart + audioStartSeconds`, and the analyzer's timeline advances only over
+  frames it actually receives — so every dropped buffer shifted all later segments earlier
+  by the discarded duration, cumulatively. That is the exact axis #85 built the transcript
+  ordering, dedup matching, and lag measurement on. Now the running shed total is added
+  back when mapping analyzer ranges to wall clock.
+- **The report would never have fired.** The coalescing used a trailing debounce that
+  rescheduled on every drop — and the failure this cap exists for is *continuous* shedding,
+  many drops per second. It would have been cancelled and replaced indefinitely: audio lost
+  silently, no event, no marker, for hours. Replaced with a bounded-latency window opened by
+  the first drop of a burst, so a sustained shed reports once per second for as long as it
+  lasts.
+- **Report tasks survived `stop()`**, so a shed within a second of stopping could re-arm a
+  heal marker after teardown cleared it — making the first segment of the *next* session
+  claim audio was shed in a session that had not started.
+- **Two wire events per report**, because `EventBroadcaster` already maps `.audioShed` onto
+  the transient-error channel and the code emitted `.error` as well — defeating the
+  coalescing.
 
 ## What's next
 

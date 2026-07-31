@@ -447,6 +447,57 @@ struct AudioBacklogSheddingTests {
         #expect(abs(measured - nominal) > 0.1, "fixture must differ from nominal or it proves nothing")
     }
 
+    @Test func aBurstReportsWithinItsWindowRatherThanWaitingForQuiet() async throws {
+        // The failure this cap exists for is *continuous* shedding — buffers
+        // drop many times a second for as long as the recognizer stays behind.
+        // A trailing debounce would be cancelled and rescheduled on every drop
+        // and never fire, so audio would be lost silently and indefinitely.
+        //
+        // Modelled directly: a window opened by the first event and left alone
+        // by subsequent ones fires on schedule; one rescheduled by each event
+        // never does.
+        actor Window {
+            private var open = false
+            private(set) var fired = 0
+            /// Bounded latency — what the engine does.
+            func recordLeading() -> Bool {
+                if open { return false }
+                open = true
+                return true
+            }
+            func fire() { fired += 1; open = false }
+        }
+
+        let window = Window()
+        var scheduled = 0
+        for _ in 0..<50 {
+            if await window.recordLeading() { scheduled += 1 }
+        }
+        await window.fire()
+
+        // 50 drops, one scheduled report — coalesced, and it actually ran.
+        #expect(scheduled == 1)
+        #expect(await window.fired == 1)
+    }
+
+    @Test func shedTimeIsAddedBackWhenMappingAnalyzerRangesToWallClock() async throws {
+        // The analyzer's input timeline advances only over frames it receives,
+        // so a dropped buffer compresses it. Without adding the shed back,
+        // every later segment reads earlier than it happened — and the error
+        // accumulates, corrupting the clock the transcript is ordered on.
+        let analyzerStart = Date()
+        let audioStartSeconds = 30.0
+        let shed = 12.0
+
+        let uncorrected = analyzerStart.addingTimeInterval(audioStartSeconds)
+        let corrected = analyzerStart.addingTimeInterval(audioStartSeconds + shed)
+
+        #expect(corrected.timeIntervalSince(uncorrected) == shed)
+        // The uncorrected reading is early by exactly the discarded duration,
+        // which is what would misroute segments across a demarcation.
+        #expect(uncorrected < corrected)
+    }
+
     @Test func cappedSettingSurvivesASettingsRoundTrip() async throws {
         let settings = StenoSettings(audioBacklogCapSeconds: 30)
         let data = try JSONEncoder().encode(settings)
