@@ -5,4 +5,4 @@
 package version
 
 // Current is the release this binary was built from.
-const Current = "0.5.1"
+const Current = "0.5.2"
