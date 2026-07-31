@@ -2,5 +2,5 @@
 // Run `make version-sync` after bumping VERSION.
 
 enum StenoVersion {
-    static let current = "0.5.1"
+    static let current = "0.5.2"
 }
