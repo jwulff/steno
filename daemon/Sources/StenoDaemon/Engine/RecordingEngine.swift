@@ -1860,12 +1860,16 @@ public actor RecordingEngine {
         // rollback of a release that is fine. These two lines turn the same
         // sequence into a story with a beginning and an end.
         let startedAt = Date()
+        // Wording is capability-neutral on purpose: `prepareDiarization` runs
+        // regardless of whether capture actually started, so a paused daemon
+        // or a failed auto-start would otherwise be told that recording and
+        // transcription are proceeding when nothing is running.
         DaemonConsole.log(
             .info,
             "Preparing diarization models. A first run downloads them (~277MB) and "
                 + "retries transient failures — FluidAudio download warnings below are "
-                + "expected and self-healing. Transcription works without speaker labels "
-                + "until this finishes."
+                + "expected and self-healing. This does not block recording or "
+                + "transcription."
         )
 
         do {
@@ -1876,14 +1880,19 @@ public actor RecordingEngine {
             }
             diarizationModelsReady = true
             let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
-            DaemonConsole.log(.info, "Diarization models ready after \(elapsed)s. Speaker labels are live.")
+            DaemonConsole.log(
+                .info,
+                "Diarization models ready after \(elapsed)s. Speaker labelling is available "
+                    + "for segments recorded from here on."
+            )
             await emitModelStatus(.diarization, .ready)
         } catch {
             let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
             DaemonConsole.log(
                 .error,
                 "Diarization models unavailable after \(elapsed)s: \(error.localizedDescription). "
-                    + "Recording and transcription continue without speaker labels."
+                    + "Speaker labelling will be unavailable; nothing else about recording or "
+                    + "transcription is affected."
             )
             await emitModelStatus(
                 .diarization,
