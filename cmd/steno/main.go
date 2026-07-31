@@ -11,11 +11,18 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jwulff/steno/internal/app"
+	"github.com/jwulff/steno/internal/version"
 )
 
 func main() {
 	mcpMode := flag.Bool("mcp", false, "Run as MCP stdio server (read-only database access)")
+	showVersion := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("steno " + version.Current)
+		return
+	}
 
 	if *mcpMode {
 		runMCP()

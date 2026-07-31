@@ -1,4 +1,4 @@
-.PHONY: build build-daemon build-daemon-debug build-steno \
+.PHONY: version-sync check-version build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
        run-daemon run-steno run-mcp \
        build-app run-app test-app clean-app \
@@ -68,7 +68,21 @@ run-mcp: build-steno
 
 # --- Test ---
 
-test: test-daemon test-steno test-app
+test: check-version test-daemon test-steno test-app
+
+# --- Version ---
+
+version-sync:
+	./scripts/sync-version.sh
+
+# Fails if the committed version constants have drifted from VERSION.
+# They are generated and committed (rather than computed at build time)
+# because the Homebrew formula builds from a source tarball and calls
+# `swift build` / `go build` directly, so nothing the Makefile computes
+# would reach it. Committing them is what keeps all three build paths
+# honest — this check is what keeps the committed copies honest.
+check-version:
+	@./scripts/sync-version.sh --check
 
 test-daemon:
 	# Swift testing's process-teardown allocator races libdispatch's
