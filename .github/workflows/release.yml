@@ -36,6 +36,12 @@ jobs:
           swift --version
           go version
 
+      # Fail before building if the tag and VERSION disagree — otherwise a
+      # `v0.6.0` tag publishes binaries that report the previous version,
+      # which is the bug this whole change exists to prevent (#92).
+      - name: Check VERSION matches the tag
+        run: make check-release-tag TAG="${GITHUB_REF_NAME}"
+
       - name: Build daemon + steno (release)
         run: make build
 

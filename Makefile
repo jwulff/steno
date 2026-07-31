@@ -1,4 +1,4 @@
-.PHONY: version-sync check-version build build-daemon build-daemon-debug build-steno \
+.PHONY: version-sync check-version check-release-tag build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
        run-daemon run-steno run-mcp \
        build-app run-app test-app clean-app \
@@ -28,7 +28,7 @@ PREFIX = $(HOME)/.local/bin
 
 # --- Build ---
 
-build: build-daemon build-steno
+build: check-version build-daemon build-steno
 
 build-daemon:
 	cd $(DAEMON_DIR) && swift build -c release \
@@ -83,6 +83,21 @@ version-sync:
 # honest — this check is what keeps the committed copies honest.
 check-version:
 	@./scripts/sync-version.sh --check
+
+# Assert VERSION matches the release tag being built. `check-version` only
+# proves the generated constants agree with VERSION — it cannot notice that
+# VERSION itself was never bumped, so a `v0.6.0` tag would happily publish
+# binaries reporting 0.5.1. The release workflow passes the tag in as TAG.
+check-release-tag:
+	@if [ -z "$(TAG)" ]; then echo "check-release-tag: TAG is required (e.g. make check-release-tag TAG=v0.6.0)"; exit 1; fi
+	@expected="$$(tr -d '[:space:]' < VERSION)"; \
+	actual="$$(printf '%s' "$(TAG)" | sed 's/^v//')"; \
+	if [ "$$expected" != "$$actual" ]; then \
+		echo "ERROR: tag $(TAG) does not match VERSION ($$expected)."; \
+		echo "Bump VERSION to $$actual, run \`make version-sync\`, commit, and re-tag."; \
+		exit 1; \
+	fi; \
+	echo "Tag $(TAG) matches VERSION ($$expected)"
 
 test-daemon:
 	# Swift testing's process-teardown allocator races libdispatch's

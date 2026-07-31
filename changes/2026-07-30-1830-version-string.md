@@ -28,6 +28,27 @@ different again. Committing the constants is what makes `make`, Homebrew, and CI
 `make check-version` guards the committed copies against drift and is wired into
 `make test`, so CI and the pre-push hook both enforce it.
 
+There were three places a version could be wrong, not one. Besides
+`steno-daemon --version`, the Go binary advertised `0.1.0` as `ServerInfo.Version` over
+MCP — its primary interface — so a client asking what it was talking to got the wrong
+answer even after the flag was fixed.
+
+## Guarding the release path
+
+A drift check that only runs under `make test` does not protect a release: `release.yml`
+runs `make build`. And `check-version` alone cannot catch the more likely mistake — tagging
+`v0.6.0` without touching `VERSION` passes it, because the constants do agree with the
+(stale) `VERSION`. The binaries would ship reporting `0.5.1`, which is the exact bug this
+change exists to eliminate.
+
+So there are two guards on two different failure modes:
+
+- `check-version` — the generated constants match `VERSION`. Now a prerequisite of `build`,
+  not just `test`, so it covers the release path.
+- `check-release-tag TAG=…` — `VERSION` matches the tag being built. Wired into
+  `release.yml` *before* the build step, so a mismatched tag fails in seconds rather than
+  publishing wrong binaries.
+
 ## Key decisions
 
 - **`--check` never writes to the tracked files.** The first version of this guard
@@ -52,6 +73,18 @@ The guard is verified against its failure modes, not just its success:
 | Constants tampered, `VERSION` unchanged | fail | fails likewise |
 | Repaired via `make version-sync` | pass | pass |
 
+And the release-tag guard:
+
+| Case | Expected | Result |
+|---|---|---|
+| `TAG=v0.5.1` against `VERSION` 0.5.1 | pass | pass |
+| `TAG=v0.6.0` against `VERSION` 0.5.1 | fail | fails, names the bump needed |
+| `TAG` omitted | fail | fails with usage |
+| `TAG=0.5.1` (no `v`) | pass | pass |
+
+MCP `ServerInfo` verified over a real initialize handshake:
+`{"name": "steno-mcp", "version": "0.5.1"}`.
+
 End to end after `make build`:
 
 ```
@@ -66,7 +99,7 @@ steno 0.5.1
 ## What's next
 
 Releasing now has a step it didn't have: bump `VERSION`, run `make version-sync`, commit.
-`make check-version` fails the build if a release is tagged without it, so the failure mode
-is loud rather than another release that claims to be `0.1.0`.
+Forget it and `check-release-tag` fails the release workflow before it builds anything —
+loud and early, rather than another release that claims to be someone else.
 
 Closes #92.

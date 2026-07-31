@@ -63,7 +63,7 @@ func runMCP() {
 
 	s := server.NewMCPServer(
 		"steno-mcp",
-		"0.1.0",
+		version.Current,
 		server.WithToolCapabilities(false),
 		server.WithInstructions("Steno MCP server provides read-only access to the Steno speech-to-text database. "+
 			"Use get_overview first to orient yourself, then drill into sessions with list_sessions and get_session, "+
