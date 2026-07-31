@@ -30,28 +30,55 @@ class Steno < Formula
   # systems.
   depends_on macos: :tahoe
 
-  # Build-time dependencies. Swift 6.2+ comes from Xcode 26 — kept as a
-  # floor on the `xcode` dep below. Go 1.24+ is required for the
-  # `cmd/steno` binary; Homebrew installs it as a build-only dep so
-  # downstream users don't need it at runtime.
-  depends_on xcode: ["16.0", :build]
+  # Build-time dependencies. Go 1.24+ is required for the `cmd/steno`
+  # binary; Homebrew installs it as a build-only dep so downstream users
+  # don't need it at runtime.
+  #
+  # Deliberately NOT `depends_on xcode:`. What steno actually needs is the
+  # macOS 26 SDK (for SpeechAnalyzer / SpeechTranscriber) and a Swift 6.2+
+  # compiler — both of which ship with the standalone Command Line Tools
+  # 26, no Xcode.app required. `depends_on xcode:` demands a full
+  # Xcode.app and has no user override, so it hard-blocks `brew install`
+  # on CLT-only Macs that build this perfectly well. The SDK check in
+  # `install` carries the real requirement.
   depends_on "go" => :build
 
   def install
-    # steno targets `.macOS("26.0")` (in daemon/Package.swift) and
-    # imports `SpeechAnalyzer` / `SpeechTranscriber`, which are only
-    # available in the macOS 26 SDK that ships with Xcode 26. Homebrew
-    # may pick an older toolchain on Tahoe machines that still have
-    # Xcode/CLT 16.x installed, in which case the Swift build will
-    # fail late with cryptic "cannot find type 'SpeechAnalyzer' in
-    # scope" errors. Fail loudly up front instead.
-    odie <<~EOS unless MacOS::Xcode.version >= "26"
-      steno requires Xcode 26 (or its Command Line Tools) to build,
-      which provides the macOS 26 SDK. Detected Xcode version:
-      #{MacOS::Xcode.version}.
+    # steno targets `.macOS("26.0")` (in daemon/Package.swift) and imports
+    # `SpeechAnalyzer` / `SpeechTranscriber`, which need the macOS 26 SDK.
+    # Without this the Swift build fails late with a cryptic "cannot find
+    # type 'SpeechAnalyzer' in scope".
+    #
+    # Ask the toolchain what SDK it will actually compile against, rather
+    # than asking which container it came from. `MacOS::Xcode.version` is
+    # not a usable signal: it reports a plausible version even when
+    # `MacOS::Xcode.installed?` is false, so a guard written against it is
+    # dead code on exactly the CLT-only machines it was meant to help.
+    sdk_version = begin
+      Utils.safe_popen_read("xcrun", "--sdk", "macosx", "--show-sdk-version").strip
+    rescue
+      ""
+    end
 
-      Install Xcode 26 from the App Store (or `xcode-select` to a newer
-      developer dir) and try again.
+    odie <<~EOS if sdk_version.empty?
+      steno could not determine the active macOS SDK version
+      (`xcrun --sdk macosx --show-sdk-version` failed).
+
+      Install the Command Line Tools with `xcode-select --install`, or
+      point at a working developer directory with `xcode-select -s`.
+    EOS
+
+    odie <<~EOS if sdk_version.split(".").first.to_i < 26
+      steno requires the macOS 26 SDK to build, which provides
+      SpeechAnalyzer. The active toolchain offers SDK #{sdk_version}.
+
+      Install either Xcode 26 or the Command Line Tools 26 — both ship
+      the SDK, and a full Xcode.app is not required:
+
+        xcode-select --install
+
+      If you have several toolchains, select a newer one with
+      `xcode-select -s` and try again.
     EOS
 
     # Pin the deployment target so the Swift compiler honors the macOS
