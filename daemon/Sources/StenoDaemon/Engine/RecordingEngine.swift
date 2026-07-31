@@ -1851,6 +1851,23 @@ public actor RecordingEngine {
     public func prepareDiarization() async {
         guard !diarizationModelsReady else { return }
         await emitModelStatus(.diarization, .preparing)
+
+        // #93: bracket the fetch on the console. FluidAudio mirrors its retry
+        // warnings to stdout in release builds, so on a first run — or after a
+        // cache invalidation — the operator sees ~60s of bare `[WARN] ...
+        // (empty file); refusing to cache it. Retrying` with nothing saying
+        // what is happening. It reads like a broken install and invites a
+        // rollback of a release that is fine. These two lines turn the same
+        // sequence into a story with a beginning and an end.
+        let startedAt = Date()
+        DaemonConsole.log(
+            .info,
+            "Preparing diarization models. A first run downloads them (~277MB) and "
+                + "retries transient failures — FluidAudio download warnings below are "
+                + "expected and self-healing. Transcription works without speaker labels "
+                + "until this finishes."
+        )
+
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { try await self.micDiarizer.prepareModels() }
@@ -1858,8 +1875,16 @@ public actor RecordingEngine {
                 try await group.waitForAll()
             }
             diarizationModelsReady = true
+            let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+            DaemonConsole.log(.info, "Diarization models ready after \(elapsed)s. Speaker labels are live.")
             await emitModelStatus(.diarization, .ready)
         } catch {
+            let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+            DaemonConsole.log(
+                .error,
+                "Diarization models unavailable after \(elapsed)s: \(error.localizedDescription). "
+                    + "Recording and transcription continue without speaker labels."
+            )
             await emitModelStatus(
                 .diarization,
                 .unavailable(reason: error.localizedDescription)
