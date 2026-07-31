@@ -976,8 +976,12 @@ public actor RecordingEngine {
         if result.isFinal {
             guard !result.text.isEmpty else { return }
 
-            currentSequenceNumber += 1
-            segmentCount = currentSequenceNumber
+            // #83: no counter bump here. The sequence number is assigned by
+            // the repository inside the insert's transaction, so assignment
+            // order and commit order match. Bumping an in-memory counter and
+            // then awaiting before the insert let two concurrent results
+            // commit out of order, which permanently hides the lower-numbered
+            // row from a reader cursoring on `sequenceNumber > :cursor`.
 
             // #85: the audio instant this result describes. Everything that
             // reasons about *when something was said* — demarcation routing
@@ -1041,23 +1045,11 @@ public actor RecordingEngine {
                 micPeakDb = nil
             }
 
-            // U10 demarcate routing: if attributing to the previous session,
-            // we need a sequence number greater than that session's MAX (so
-            // we don't violate UNIQUE(sessionId, sequenceNumber)). Cheap
-            // single-indexed lookup; we only do it when actively routing.
-            // Otherwise the bumped `currentSequenceNumber` is the right key.
-            let segmentSequence: Int
-            if routingSessionId != session.id {
-                // Don't waste a slot on the current session for a routed
-                // segment — back the counter off by 1 and use the previous
-                // session's own next-slot.
-                currentSequenceNumber -= 1
-                segmentCount = currentSequenceNumber
-                let prevMax = (try? await repository.maxSegmentSequence(for: routingSessionId)) ?? 0
-                segmentSequence = prevMax + 1
-            } else {
-                segmentSequence = currentSequenceNumber
-            }
+            // U10 demarcate routing needs no special sequencing any more:
+            // `appendSegment` takes MAX+1 over whichever session the segment
+            // is routed to, so a segment attributed to the previous session
+            // lands in that session's own numbering without borrowing a slot
+            // from the current one (#83).
 
             // #64: carry the recognizer's audio-frame time (capture clock) for
             // the diarization merge, independent of the wall-clock startedAt/
@@ -1089,7 +1081,7 @@ public actor RecordingEngine {
                 endedAt: Date(),
                 capturedAt: audioTime,
                 confidence: result.confidence,
-                sequenceNumber: segmentSequence,
+                sequenceNumber: StoredSegment.unassignedSequence,
                 source: result.source,
                 healMarker: healMarker,
                 micPeakDb: micPeakDb,
@@ -1097,15 +1089,25 @@ public actor RecordingEngine {
                 audioEnd: audioEnd
             )
 
-            // Persist
+            // Persist. `appendSegment` assigns the sequence number inside the
+            // insert transaction and hands back the segment carrying it (#83).
+            let persisted: StoredSegment
             do {
-                try await repository.saveSegment(segment)
+                persisted = try await repository.appendSegment(segment)
             } catch {
                 await emit(.error("Failed to save segment: \(error)", isTransient: true))
                 return
             }
 
-            await emit(.segmentFinalized(segment))
+            // Track the current session's frontier for status reporting only —
+            // it is no longer the source of truth for assignment. A segment
+            // routed to the previous session must not move it.
+            if routingSessionId == session.id {
+                currentSequenceNumber = persisted.sequenceNumber
+                segmentCount = persisted.sequenceNumber
+            }
+
+            await emit(.segmentFinalized(persisted))
 
             // U11: schedule a debounced dedup pass for the session this
             // segment landed on (routing-aware — a demarcate-routed

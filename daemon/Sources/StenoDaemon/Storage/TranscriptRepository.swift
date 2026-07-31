@@ -108,10 +108,36 @@ public protocol TranscriptRepository: Sendable {
 
     // MARK: - Segments
 
-    /// Save a transcript segment.
+    /// Save a transcript segment with the sequence number it already carries.
+    ///
+    /// Primitive for callers that own sequencing themselves — test fixtures,
+    /// backfills. **Production writers must use `appendSegment`**: assigning a
+    /// sequence number outside the insert's transaction lets two concurrent
+    /// writes commit out of order, which permanently hides a row from any
+    /// reader cursoring on `sequenceNumber > :cursor` (#83).
     ///
     /// - Parameter segment: The segment to save.
     func saveSegment(_ segment: StoredSegment) async throws
+
+    /// Append a segment, assigning its `sequenceNumber` inside the same
+    /// transaction as the insert.
+    ///
+    /// The number is `MAX(sequenceNumber) + 1` over the segment's session,
+    /// computed and written atomically, so assignment order is commit order:
+    /// a row numbered N is durable before N+1 is even assigned. That is what
+    /// makes a `sequenceNumber` cursor safe — the previous scheme bumped an
+    /// in-memory counter, then awaited before inserting, so the row holding N
+    /// could land after N+1 and a reader polling in between would skip it
+    /// forever (#83).
+    ///
+    /// Also closes a `UNIQUE(sessionId, sequenceNumber)` collision window:
+    /// two writers can no longer pick the same next slot.
+    ///
+    /// - Parameter segment: The segment to append. Its `sequenceNumber` is
+    ///   ignored — pass `StoredSegment.unassignedSequence`.
+    /// - Returns: The persisted segment, carrying the assigned sequence number.
+    @discardableResult
+    func appendSegment(_ segment: StoredSegment) async throws -> StoredSegment
 
     /// Retrieve all segments for a session, ordered by sequence number.
     ///

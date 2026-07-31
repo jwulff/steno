@@ -500,3 +500,112 @@ struct SQLiteTranscriptRepositoryTests {
         #expect(summaries.isEmpty)
     }
 }
+
+// MARK: - #83 sequence assignment atomicity
+
+@Suite("Sequence assignment atomicity")
+struct SegmentSequenceAtomicityTests {
+
+    private func segment(for sessionId: UUID, text: String, source: AudioSourceType) -> StoredSegment {
+        let now = Date()
+        return StoredSegment(
+            sessionId: sessionId,
+            text: text,
+            startedAt: now,
+            endedAt: now.addingTimeInterval(1),
+            capturedAt: now,
+            sequenceNumber: StoredSegment.unassignedSequence,
+            source: source
+        )
+    }
+
+    @Test func concurrentAppendsProduceContiguousSequences() async throws {
+        // The invariant that makes a `sequenceNumber` cursor safe: assignment
+        // happens inside the insert's transaction, so N is durable before N+1
+        // exists. Two source workers appending concurrently must still yield
+        // exactly 1...N — no duplicates (a UNIQUE violation) and no gaps (a
+        // row a cursoring reader would skip forever).
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let total = 60
+        let assigned = try await withThrowingTaskGroup(of: Int.self) { group in
+            for i in 0..<total {
+                let source: AudioSourceType = i.isMultiple(of: 2) ? .microphone : .systemAudio
+                group.addTask {
+                    let saved = try await repo.appendSegment(
+                        self.segment(for: session.id, text: "utterance \(i)", source: source)
+                    )
+                    return saved.sequenceNumber
+                }
+            }
+            var out: [Int] = []
+            for try await sequenceNumber in group { out.append(sequenceNumber) }
+            return out
+        }
+
+        #expect(assigned.count == total)
+        #expect(Set(assigned).count == total, "sequence numbers were handed out twice")
+        #expect(assigned.sorted() == Array(1...total), "sequence numbers are not contiguous 1...\(total)")
+    }
+
+    @Test func assignedSequencesMatchWhatWasPersisted() async throws {
+        // The returned segment must describe the row that actually landed —
+        // the engine emits it as `segmentFinalized` and consumers cursor on it.
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        var returned: [Int] = []
+        for i in 1...10 {
+            let saved = try await repo.appendSegment(
+                segment(for: session.id, text: "line \(i)", source: .microphone)
+            )
+            returned.append(saved.sequenceNumber)
+        }
+
+        let persisted = try await repo.segments(for: session.id).map(\.sequenceNumber).sorted()
+        #expect(returned == Array(1...10))
+        #expect(persisted == Array(1...10))
+    }
+
+    @Test func appendNumbersEachSessionIndependently() async throws {
+        // Demarcate routing relies on this: a segment attributed to the
+        // previous session takes that session's next slot, without disturbing
+        // or borrowing from the current one.
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let first = try await repo.createSession(locale: Locale(identifier: "en_US"))
+        try await repo.endSession(first.id)
+        let second = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        let a = try await repo.appendSegment(segment(for: first.id, text: "old 1", source: .microphone))
+        let b = try await repo.appendSegment(segment(for: second.id, text: "new 1", source: .microphone))
+        let c = try await repo.appendSegment(segment(for: first.id, text: "old 2", source: .microphone))
+
+        #expect(a.sequenceNumber == 1)
+        #expect(b.sequenceNumber == 1)
+        #expect(c.sequenceNumber == 2)
+    }
+
+    @Test func appendResumesPastExistingSegments() async throws {
+        // A resumed session (wake / device change) must not restart at 1 and
+        // collide under UNIQUE(sessionId, sequenceNumber).
+        let dbQueue = try DatabaseConfiguration.makeInMemoryQueue()
+        let repo = SQLiteTranscriptRepository(dbQueue: dbQueue)
+        let session = try await repo.createSession(locale: Locale(identifier: "en_US"))
+
+        for i in 1...5 {
+            try await repo.saveSegment(
+                segment(for: session.id, text: "pre \(i)", source: .microphone)
+                    .withSequenceNumber(i)
+            )
+        }
+
+        let next = try await repo.appendSegment(
+            segment(for: session.id, text: "after resume", source: .microphone)
+        )
+        #expect(next.sequenceNumber == 6)
+    }
+}

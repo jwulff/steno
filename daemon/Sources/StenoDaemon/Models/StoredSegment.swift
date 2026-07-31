@@ -45,7 +45,16 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
     public let confidence: Float?
 
     /// Position of this segment within the session (1-based).
+    ///
+    /// Assigned by `TranscriptRepository.appendSegment` inside the same
+    /// transaction as the insert (#83), so assignment order and commit order
+    /// are identical. Construct with `unassignedSequence` when appending;
+    /// the value you pass is overwritten.
     public let sequenceNumber: Int
+
+    /// Sentinel for a segment whose sequence number has not been assigned
+    /// yet. Real sequence numbers are 1-based.
+    public static let unassignedSequence = 0
 
     /// When this segment was persisted.
     public let createdAt: Date
@@ -134,6 +143,30 @@ public struct StoredSegment: Sendable, Codable, Identifiable, Equatable {
         self.audioStart = audioStart
         self.audioEnd = audioEnd
         self.speakerId = speakerId
+    }
+
+    /// This segment with `sequenceNumber` replaced. Used by the repository
+    /// to return the value it assigned during the insert transaction.
+    public func withSequenceNumber(_ sequenceNumber: Int) -> StoredSegment {
+        StoredSegment(
+            id: id,
+            sessionId: sessionId,
+            text: text,
+            startedAt: startedAt,
+            endedAt: endedAt,
+            capturedAt: capturedAt,
+            confidence: confidence,
+            sequenceNumber: sequenceNumber,
+            createdAt: createdAt,
+            source: source,
+            healMarker: healMarker,
+            duplicateOf: duplicateOf,
+            dedupMethod: dedupMethod,
+            micPeakDb: micPeakDb,
+            audioStart: audioStart,
+            audioEnd: audioEnd,
+            speakerId: speakerId
+        )
     }
 
     /// Create a stored segment from a streaming TranscriptSegment.

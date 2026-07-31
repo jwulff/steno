@@ -196,6 +196,20 @@ actor MockTranscriptRepository: TranscriptRepository {
 
     // MARK: - Segments
 
+    /// Mirrors the real repository: assigns MAX+1 over the session. The
+    /// actor's isolation gives the same atomicity the SQLite writer gets from
+    /// its transaction, so a test driving concurrent appends sees the
+    /// production invariant (#83).
+    @discardableResult
+    func appendSegment(_ segment: StoredSegment) async throws -> StoredSegment {
+        let maxSequence = (segments[segment.sessionId] ?? [])
+            .map(\.sequenceNumber)
+            .max() ?? 0
+        let assigned = segment.withSequenceNumber(maxSequence + 1)
+        try await saveSegment(assigned)
+        return assigned
+    }
+
     func saveSegment(_ segment: StoredSegment) async throws {
         segments[segment.sessionId, default: []].append(segment)
     }

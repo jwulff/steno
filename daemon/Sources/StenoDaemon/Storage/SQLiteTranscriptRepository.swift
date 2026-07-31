@@ -239,6 +239,24 @@ public actor SQLiteTranscriptRepository: TranscriptRepository {
         }
     }
 
+    @discardableResult
+    public func appendSegment(_ segment: StoredSegment) async throws -> StoredSegment {
+        try await dbQueue.write { db in
+            // MAX+1 and the insert share this transaction, and GRDB serializes
+            // writes, so no other writer can interleave between them (#83).
+            // Sequence assignment order is therefore commit order.
+            let maxSequence = try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(MAX(sequenceNumber), 0) FROM segments WHERE sessionId = ?",
+                arguments: [segment.sessionId.uuidString]
+            ) ?? 0
+
+            let assigned = segment.withSequenceNumber(maxSequence + 1)
+            try SegmentRecord.from(assigned).insert(db)
+            return assigned
+        }
+    }
+
     public func segments(for sessionId: UUID) async throws -> [StoredSegment] {
         try await dbQueue.read { db in
             try SegmentRecord
