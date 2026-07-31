@@ -203,6 +203,24 @@ public actor RecordingEngine {
     /// Heal markers staged for the *first* segment finalized after a
     /// successful restart on each source. Cleared by the segment-save
     /// path on consumption.
+    /// Cap on buffered-but-untranscribed audio, in seconds. `0` disables
+    /// shedding — the historical complete-but-late behavior (#84).
+    private let audioBacklogCapSeconds: Double
+
+    /// Nominal duration of one capture buffer, used only to size the bounded
+    /// stream's element count from a cap expressed in seconds. Buffer sizes
+    /// are chosen by the audio hardware and vary, so the resulting cap is
+    /// approximate — but every *reported* shed figure is computed from the
+    /// discarded buffers' real frame counts, so the numbers a reader sees are
+    /// exact even when the threshold is not.
+    private static let nominalBufferSeconds: Double = 0.1
+
+    /// Audio shed per source since the last report, in seconds (#84).
+    private var pendingShedSeconds: [AudioSourceType: Double] = [:]
+
+    /// Trailing-debounce tasks that coalesce a shedding burst into one report.
+    private var shedReportTasks: [AudioSourceType: Task<Void, Never>] = [:]
+
     private var pendingMicHealMarker: String?
     private var pendingSysHealMarker: String?
 
@@ -340,6 +358,7 @@ public actor RecordingEngine {
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
         healThresholdSeconds: Int = 30,
+        audioBacklogCapSeconds: Double = 0,
         now: @Sendable @escaping () -> Date = { Date() },
         dedupCoordinator: DedupCoordinator? = nil,
         dedupTriggerDebounce: Duration = .seconds(5),
@@ -364,6 +383,7 @@ public actor RecordingEngine {
         self.powerAssertion = powerAssertion ?? PowerAssertion()
         self.deviceUIDProvider = deviceUIDProvider
         self.healThresholdSeconds = healThresholdSeconds
+        self.audioBacklogCapSeconds = audioBacklogCapSeconds
         self.nowProvider = now
         self.dedupCoordinator = dedupCoordinator
         self.dedupTriggerDebounce = dedupTriggerDebounce
@@ -948,6 +968,54 @@ public actor RecordingEngine {
 
     private func emit(_ event: EngineEvent) async {
         await delegate?.engine(self, didEmit: event)
+    }
+
+    /// Account for audio discarded by the bounded capture queue (#84).
+    ///
+    /// Shedding arrives one buffer at a time — a sustained backlog drops
+    /// dozens per second — so this accumulates and reports per *burst* rather
+    /// than per buffer, on a short trailing debounce. Emitting per buffer
+    /// would replace one kind of log flood with another, and "we dropped
+    /// 0.1s" thirty times is less useful than "we dropped 3.0s".
+    ///
+    /// The running total is also stamped onto the next segment from that
+    /// source as `shed:<seconds>s`, so the discontinuity survives in the
+    /// transcript instead of the audio being silently absent.
+    private func recordAudioShed(seconds: Double, isMic: Bool) async {
+        let source: AudioSourceType = isMic ? .microphone : .systemAudio
+        pendingShedSeconds[source, default: 0] += seconds
+
+        shedReportTasks[source]?.cancel()
+        shedReportTasks[source] = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            await self?.flushAudioShed(source: source)
+        }
+    }
+
+    /// Emit the accumulated shed total for a source and arm the heal marker.
+    private func flushAudioShed(source: AudioSourceType) async {
+        guard let total = pendingShedSeconds[source], total > 0 else { return }
+        pendingShedSeconds[source] = 0
+        shedReportTasks[source] = nil
+
+        let rounded = (total * 10).rounded() / 10
+        let marker = "shed:\(rounded)s"
+        switch source {
+        case .microphone: pendingMicHealMarker = marker
+        case .systemAudio: pendingSysHealMarker = marker
+        }
+
+        await emit(.audioShed(seconds: rounded, source: source))
+        await emit(.error(
+            "Dropped \(rounded)s of \(source.rawValue) audio: transcription is behind and the "
+                + "capture buffer hit its \(audioBacklogCapSeconds)s cap. The live transcript stays "
+                + "current; the dropped span is marked on the next segment.",
+            isTransient: true
+        ))
     }
 
     /// Anchor `source`'s analyzer input timeline to wall clock (#85). Called
@@ -1655,7 +1723,23 @@ public actor RecordingEngine {
             let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
             let ringBuffer: AudioRingBuffer
         }
-        let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        // #84: bound the queue between capture and the recognizer. Left
+        // unbounded, a transcription backlog grows forever and never drains
+        // while audio keeps arriving. `.bufferingNewest` discards the OLDEST
+        // buffers first, which is the right end to lose for a live listener:
+        // freshness beats completeness once you are minutes behind.
+        //
+        // `0` keeps the stream unbounded — the historical behavior, and the
+        // right default for archival recording.
+        let (stream, cont): (AsyncStream<AVAudioPCMBuffer>, AsyncStream<AVAudioPCMBuffer>.Continuation)
+        if audioBacklogCapSeconds > 0 {
+            let capacity = max(1, Int((audioBacklogCapSeconds / Self.nominalBufferSeconds).rounded()))
+            (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream(
+                bufferingPolicy: .bufferingNewest(capacity)
+            )
+        } else {
+            (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        }
         let box = Box(
             source: source,
             continuation: cont,
@@ -1675,7 +1759,14 @@ public actor RecordingEngine {
                     await self?.updateSystemLevel(peak)
                 }
                 nonisolated(unsafe) let b = buffer
-                box.continuation.yield(b)
+                // A bounded stream reports what it discarded. Measure the
+                // dropped buffer's real duration rather than assuming the
+                // nominal one, so the figure a reader sees is exact (#84).
+                let yieldResult = box.continuation.yield(b)
+                if case .dropped(let discarded) = yieldResult {
+                    let seconds = Double(discarded.frameLength) / discarded.format.sampleRate
+                    await self?.recordAudioShed(seconds: seconds, isMic: isMic)
+                }
                 // Append after yielding so diarization buffering never adds
                 // latency to the live transcript. The ring buffer is its own
                 // actor — this does not touch RecordingEngine's isolation.

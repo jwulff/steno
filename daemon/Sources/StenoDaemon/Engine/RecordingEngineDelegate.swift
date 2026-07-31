@@ -37,6 +37,12 @@ public enum EngineEvent: Sendable {
     /// attempts (U5). Engine status transitions to `.error`. The TUI
     /// surfaces this as a non-transient error (U9).
     case recoveryExhausted(reason: String)
+
+    /// Buffered audio was discarded because the un-transcribed backlog
+    /// exceeded `audioBacklogCapSeconds` (#84). `seconds` is the audio
+    /// actually dropped, measured from the discarded buffers. Emitted per
+    /// shedding burst, not per buffer.
+    case audioShed(seconds: Double, source: AudioSourceType)
     /// Ephemeral: pause state changed (U10). Emitted on every transition
     /// into and out of `.paused`.
     ///

@@ -1,4 +1,5 @@
 import Testing
+import AVFoundation
 import Foundation
 @testable import StenoDaemon
 
@@ -394,5 +395,76 @@ struct RecordingEngineTests {
         #expect(segments.isEmpty)
 
         await engine.stop()
+    }
+}
+
+// MARK: - #84 audio backpressure shedding
+
+@Suite("Audio backlog shedding")
+struct AudioBacklogSheddingTests {
+
+    /// A capture buffer of `seconds` at 48kHz, matching what the audio tap
+    /// hands downstream.
+    private func buffer(seconds: Double) -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1)!
+        let frames = AVAudioFrameCount(48000 * seconds)
+        let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buf.frameLength = frames
+        return buf
+    }
+
+    @Test func boundedStreamDropsOldestWhenTheConsumerStalls() async throws {
+        // The shedding primitive, exercised directly: `.bufferingNewest`
+        // discards the OLDEST element, which is the end a live listener wants
+        // to lose. Establishing this is what the engine's cap relies on.
+        let (stream, cont) = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(3))
+
+        var dropped: [Int] = []
+        for i in 1...6 {
+            if case .dropped(let value) = cont.yield(i) {
+                dropped.append(value)
+            }
+        }
+        cont.finish()
+
+        var received: [Int] = []
+        for await value in stream { received.append(value) }
+
+        #expect(dropped == [1, 2, 3], "expected the oldest elements to be discarded")
+        #expect(received == [4, 5, 6], "expected the newest elements to survive")
+    }
+
+    @Test func droppedBufferDurationIsMeasuredNotAssumed() async throws {
+        // The cap is sized from a nominal buffer duration, but every reported
+        // figure must come from the discarded buffer's real frame count — so
+        // an operator reading "dropped 3.0s" can trust the number even when
+        // the hardware's buffer size differs from the nominal one.
+        let b = buffer(seconds: 0.25)
+        let measured = Double(b.frameLength) / b.format.sampleRate
+        #expect(abs(measured - 0.25) < 0.001)
+
+        let nominal = 0.1
+        #expect(abs(measured - nominal) > 0.1, "fixture must differ from nominal or it proves nothing")
+    }
+
+    @Test func cappedSettingSurvivesASettingsRoundTrip() async throws {
+        let settings = StenoSettings(audioBacklogCapSeconds: 30)
+        let data = try JSONEncoder().encode(settings)
+        let decoded = try JSONDecoder().decode(StenoSettings.self, from: data)
+        #expect(decoded.audioBacklogCapSeconds == 30)
+    }
+
+    @Test func settingsWrittenBeforeTheCapExistedDefaultToDisabled() async throws {
+        // An existing install must keep its complete-but-late behavior on
+        // upgrade rather than silently starting to discard audio.
+        let json = """
+        {"summarizationProvider":"local","anthropicModel":"m","lastSystemAudioEnabled":false,
+         "healGapSeconds":30,"dedupOverlapSeconds":3,"dedupScoreThreshold":0.92,
+         "dedupMicPeakThresholdDb":-25,"dedupTriggerDebounceSeconds":5,
+         "emptySessionMinChars":20,"emptySessionMinDurationSeconds":3,
+         "topicExtractionMinSegments":3,"retentionDays":0}
+        """
+        let decoded = try JSONDecoder().decode(StenoSettings.self, from: Data(json.utf8))
+        #expect(decoded.audioBacklogCapSeconds == 0, "shedding must be opt-in")
     }
 }

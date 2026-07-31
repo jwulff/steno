@@ -54,6 +54,23 @@ public struct StenoSettings: Codable, Sendable {
     /// Default: 30s per the plan.
     public var healGapSeconds: Int
 
+    /// Cap on how much un-transcribed audio may sit buffered ahead of the
+    /// recognizer, in seconds. `0` disables shedding entirely.
+    ///
+    /// Once transcription falls behind, the buffer between capture and the
+    /// recognizer grows without bound and never drains while audio keeps
+    /// arriving — on a long recording that reached ~49 minutes of lag (#85).
+    /// A live consumer is better served by fresh-and-lossy than by
+    /// complete-and-an-hour-late, but an archival recording is not, so this
+    /// defaults to **off**: the historical complete-but-late behavior is
+    /// preserved unless an operator opts in.
+    ///
+    /// When set, the oldest buffered audio is dropped first — the newest is
+    /// what a live listener wants — and the discontinuity is recorded on the
+    /// next segment's `heal_marker` as `shed:<seconds>s` so a reader can see
+    /// that audio was discarded rather than silently missing it.
+    public var audioBacklogCapSeconds: Double
+
     /// U11 dedup overlap window, in seconds. A mic segment matches a sys
     /// segment whose `startedAt` falls within `[mic.startedAt -
     /// dedupOverlapSeconds, mic.startedAt + dedupOverlapSeconds]`. Default
@@ -113,6 +130,7 @@ public struct StenoSettings: Codable, Sendable {
         lastDevice: String? = nil,
         lastSystemAudioEnabled: Bool = true,
         healGapSeconds: Int = 30,
+        audioBacklogCapSeconds: Double = 0,
         dedupOverlapSeconds: Double = 3.0,
         dedupScoreThreshold: Double = 0.92,
         dedupMicPeakThresholdDb: Double = -25.0,
@@ -128,6 +146,7 @@ public struct StenoSettings: Codable, Sendable {
         self.lastDevice = lastDevice
         self.lastSystemAudioEnabled = lastSystemAudioEnabled
         self.healGapSeconds = healGapSeconds
+        self.audioBacklogCapSeconds = audioBacklogCapSeconds
         self.dedupOverlapSeconds = dedupOverlapSeconds
         self.dedupScoreThreshold = dedupScoreThreshold
         self.dedupMicPeakThresholdDb = dedupMicPeakThresholdDb
@@ -150,6 +169,7 @@ public struct StenoSettings: Codable, Sendable {
         case lastDevice
         case lastSystemAudioEnabled
         case healGapSeconds
+        case audioBacklogCapSeconds
         case dedupOverlapSeconds
         case dedupScoreThreshold
         case dedupMicPeakThresholdDb
@@ -168,6 +188,9 @@ public struct StenoSettings: Codable, Sendable {
         self.lastDevice = try container.decodeIfPresent(String.self, forKey: .lastDevice)
         self.lastSystemAudioEnabled = try container.decodeIfPresent(Bool.self, forKey: .lastSystemAudioEnabled) ?? true
         self.healGapSeconds = try container.decodeIfPresent(Int.self, forKey: .healGapSeconds) ?? 30
+        // Absent in a settings file written before #84 — default off, so an
+        // existing install keeps its complete-but-late behavior on upgrade.
+        self.audioBacklogCapSeconds = try container.decodeIfPresent(Double.self, forKey: .audioBacklogCapSeconds) ?? 0
         self.dedupOverlapSeconds = try container.decodeIfPresent(Double.self, forKey: .dedupOverlapSeconds) ?? 3.0
         self.dedupScoreThreshold = try container.decodeIfPresent(Double.self, forKey: .dedupScoreThreshold) ?? 0.92
         self.dedupMicPeakThresholdDb = try container.decodeIfPresent(Double.self, forKey: .dedupMicPeakThresholdDb) ?? -25.0
