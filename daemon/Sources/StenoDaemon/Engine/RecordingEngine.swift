@@ -1102,7 +1102,14 @@ public actor RecordingEngine {
             // Track the current session's frontier for status reporting only —
             // it is no longer the source of truth for assignment. A segment
             // routed to the previous session must not move it.
-            if routingSessionId == session.id {
+            //
+            // Compare against `currentSession`, not the `session` captured
+            // before the append: a demarcate or a stop/start rollover can land
+            // while `appendSegment` is suspended, and the captured value would
+            // then still match — overwriting the new session's freshly reset
+            // counters with the old session's frontier, which status would
+            // report indefinitely until the next segment arrived.
+            if routingSessionId == currentSession?.id {
                 currentSequenceNumber = persisted.sequenceNumber
                 segmentCount = persisted.sequenceNumber
             }
