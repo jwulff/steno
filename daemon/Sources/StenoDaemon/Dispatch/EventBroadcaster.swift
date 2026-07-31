@@ -167,6 +167,18 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 transient: false
             ))
 
+        // #84: audio deliberately discarded to keep the live transcript
+        // current. Routed onto the `.error` channel with `transient: true`,
+        // matching how the other recovery events reach older clients — the
+        // message carries the source and the exact number of seconds so a
+        // consumer can distinguish it from a failure.
+        case .audioShed(let seconds, let source):
+            return (.error, DaemonEvent(
+                event: "error",
+                message: "audio_shed: \(seconds)s of \(source.rawValue) dropped (capture buffer at cap)",
+                transient: true
+            ))
+
         // U10: pause-state broadcast. Routed onto the existing `.status`
         // wire channel so a connecting TUI sees pause/resume transitions
         // alongside .recording / .idle. The dedicated pause-state fields

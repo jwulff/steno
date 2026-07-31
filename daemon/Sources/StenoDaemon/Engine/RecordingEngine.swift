@@ -203,6 +203,35 @@ public actor RecordingEngine {
     /// Heal markers staged for the *first* segment finalized after a
     /// successful restart on each source. Cleared by the segment-save
     /// path on consumption.
+    /// Cap on buffered-but-untranscribed audio, in seconds. `0` disables
+    /// shedding — the historical complete-but-late behavior (#84).
+    private let audioBacklogCapSeconds: Double
+
+    /// Nominal duration of one capture buffer, used only to size the bounded
+    /// stream's element count from a cap expressed in seconds. Buffer sizes
+    /// are chosen by the audio hardware and vary, so the resulting cap is
+    /// approximate — but every *reported* shed figure is computed from the
+    /// discarded buffers' real frame counts, so the numbers a reader sees are
+    /// exact even when the threshold is not.
+    private static let nominalBufferSeconds: Double = 0.1
+
+    /// Total audio shed per source since that source's analyzer started, in
+    /// seconds (#84).
+    ///
+    /// The analyzer's input timeline advances only over frames it actually
+    /// receives, so every dropped buffer compresses it. Without this, each
+    /// shed permanently shifts `capturedAt` earlier by the discarded duration
+    /// and the error accumulates — corrupting the one clock the transcript is
+    /// ordered on (#85), misrouting segments across demarcations, and
+    /// misaligning diarization. Reset when the analyzer is re-anchored.
+    private var cumulativeShedSeconds: [AudioSourceType: Double] = [:]
+
+    /// Audio shed per source since the last report, in seconds (#84).
+    private var pendingShedSeconds: [AudioSourceType: Double] = [:]
+
+    /// Trailing-debounce tasks that coalesce a shedding burst into one report.
+    private var shedReportTasks: [AudioSourceType: Task<Void, Never>] = [:]
+
     private var pendingMicHealMarker: String?
     private var pendingSysHealMarker: String?
 
@@ -340,6 +369,7 @@ public actor RecordingEngine {
         powerAssertion: (any PowerAssertionManaging)? = nil,
         deviceUIDProvider: @Sendable @escaping () -> String? = { nil },
         healThresholdSeconds: Int = 30,
+        audioBacklogCapSeconds: Double = 0,
         now: @Sendable @escaping () -> Date = { Date() },
         dedupCoordinator: DedupCoordinator? = nil,
         dedupTriggerDebounce: Duration = .seconds(5),
@@ -364,6 +394,7 @@ public actor RecordingEngine {
         self.powerAssertion = powerAssertion ?? PowerAssertion()
         self.deviceUIDProvider = deviceUIDProvider
         self.healThresholdSeconds = healThresholdSeconds
+        self.audioBacklogCapSeconds = audioBacklogCapSeconds
         self.nowProvider = now
         self.dedupCoordinator = dedupCoordinator
         self.dedupTriggerDebounce = dedupTriggerDebounce
@@ -871,6 +902,17 @@ public actor RecordingEngine {
         // #42: clear parked-for-display flag — a fresh start() decides
         // its own parked state.
         sysParkedAwaitingDisplay = false
+
+        // #84: tear down shed reporting with everything else. A report task
+        // armed within the last second would otherwise survive the stop, fire
+        // against an idle engine, and re-arm a heal marker *after* the markers
+        // below are cleared — so the first segment of the next session would
+        // claim audio was shed in a session that had not started yet.
+        for (_, task) in shedReportTasks { task.cancel() }
+        shedReportTasks.removeAll()
+        pendingShedSeconds.removeAll()
+        cumulativeShedSeconds.removeAll()
+
         pendingMicHealMarker = nil
         pendingSysHealMarker = nil
         pendingMicHealedGap = nil
@@ -950,11 +992,70 @@ public actor RecordingEngine {
         await delegate?.engine(self, didEmit: event)
     }
 
+    /// Account for audio discarded by the bounded capture queue (#84).
+    ///
+    /// Shedding arrives one buffer at a time — a sustained backlog drops
+    /// dozens per second — so this accumulates and reports per *burst* rather
+    /// than per buffer, on a short trailing debounce. Emitting per buffer
+    /// would replace one kind of log flood with another, and "we dropped
+    /// 0.1s" thirty times is less useful than "we dropped 3.0s".
+    ///
+    /// The running total is also stamped onto the next segment from that
+    /// source as `shed:<seconds>s`, so the discontinuity survives in the
+    /// transcript instead of the audio being silently absent.
+    private func recordAudioShed(seconds: Double, isMic: Bool) async {
+        let source: AudioSourceType = isMic ? .microphone : .systemAudio
+        pendingShedSeconds[source, default: 0] += seconds
+        cumulativeShedSeconds[source, default: 0] += seconds
+
+        // Bounded-latency window, NOT a trailing debounce. Under the failure
+        // this exists for — continuous capture with the recognizer slower than
+        // real time — buffers drop many times a second, so a debounce that
+        // rescheduled on every drop would be cancelled and replaced forever
+        // and never report at all: silent, unbounded audio loss.
+        //
+        // Instead the first drop of a burst opens a one-second window and
+        // subsequent drops just accumulate into it, so a sustained shed
+        // reports once per second for as long as it lasts.
+        guard shedReportTasks[source] == nil else { return }
+        shedReportTasks[source] = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(1))
+            } catch {
+                return
+            }
+            await self?.flushAudioShed(source: source)
+        }
+    }
+
+    /// Emit the accumulated shed total for a source and arm the heal marker.
+    private func flushAudioShed(source: AudioSourceType) async {
+        guard let total = pendingShedSeconds[source], total > 0 else { return }
+        pendingShedSeconds[source] = 0
+        shedReportTasks[source] = nil
+
+        let rounded = (total * 10).rounded() / 10
+        let marker = "shed:\(rounded)s"
+        switch source {
+        case .microphone: pendingMicHealMarker = marker
+        case .systemAudio: pendingSysHealMarker = marker
+        }
+
+        // One emission only. `EventBroadcaster` already maps `.audioShed` onto
+        // the transient-error wire channel, so also emitting `.error` here
+        // would put two warnings on the wire for the same dropped span — which
+        // is precisely the coalescing this function exists to provide.
+        await emit(.audioShed(seconds: rounded, source: source))
+    }
+
     /// Anchor `source`'s analyzer input timeline to wall clock (#85). Called
     /// immediately before the analyzer starts consuming, on every bring-up
     /// and every heal/device-change rebuild.
     private func markAnalyzerStart(_ source: AudioSourceType) {
         analyzerStartWallClock[source] = Date()
+        // A fresh analyzer starts a fresh input timeline, so prior shedding no
+        // longer offsets it (#84).
+        cumulativeShedSeconds[source] = 0
     }
 
     /// Wall-clock instant the audio behind `result` was captured (#85).
@@ -967,7 +1068,16 @@ public actor RecordingEngine {
               let analyzerStart = analyzerStartWallClock[result.source] else {
             return result.timestamp
         }
-        return analyzerStart.addingTimeInterval(audioStart)
+        // Add back the audio the cap discarded (#84). The analyzer's timeline
+        // skips dropped frames entirely, so without this every segment after a
+        // shed reads earlier than it happened, cumulatively.
+        //
+        // Approximate by construction: the correction applied is the total
+        // shed so far, which is exact for a result whose audio began after the
+        // last drop and slightly over-corrects one that straddles a drop. The
+        // alternative is unbounded drift, and shedding is opt-in.
+        let shed = cumulativeShedSeconds[result.source] ?? 0
+        return analyzerStart.addingTimeInterval(audioStart + shed)
     }
 
     private func handleRecognizerResult(_ result: RecognizerResult) async {
@@ -1655,7 +1765,23 @@ public actor RecordingEngine {
             let continuation: AsyncStream<AVAudioPCMBuffer>.Continuation
             let ringBuffer: AudioRingBuffer
         }
-        let (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        // #84: bound the queue between capture and the recognizer. Left
+        // unbounded, a transcription backlog grows forever and never drains
+        // while audio keeps arriving. `.bufferingNewest` discards the OLDEST
+        // buffers first, which is the right end to lose for a live listener:
+        // freshness beats completeness once you are minutes behind.
+        //
+        // `0` keeps the stream unbounded — the historical behavior, and the
+        // right default for archival recording.
+        let (stream, cont): (AsyncStream<AVAudioPCMBuffer>, AsyncStream<AVAudioPCMBuffer>.Continuation)
+        if audioBacklogCapSeconds > 0 {
+            let capacity = max(1, Int((audioBacklogCapSeconds / Self.nominalBufferSeconds).rounded()))
+            (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream(
+                bufferingPolicy: .bufferingNewest(capacity)
+            )
+        } else {
+            (stream, cont) = AsyncStream<AVAudioPCMBuffer>.makeStream()
+        }
         let box = Box(
             source: source,
             continuation: cont,
@@ -1675,7 +1801,14 @@ public actor RecordingEngine {
                     await self?.updateSystemLevel(peak)
                 }
                 nonisolated(unsafe) let b = buffer
-                box.continuation.yield(b)
+                // A bounded stream reports what it discarded. Measure the
+                // dropped buffer's real duration rather than assuming the
+                // nominal one, so the figure a reader sees is exact (#84).
+                let yieldResult = box.continuation.yield(b)
+                if case .dropped(let discarded) = yieldResult {
+                    let seconds = Double(discarded.frameLength) / discarded.format.sampleRate
+                    await self?.recordAudioShed(seconds: seconds, isMic: isMic)
+                }
                 // Append after yielding so diarization buffering never adds
                 // latency to the live transcript. The ring buffer is its own
                 // actor — this does not touch RecordingEngine's isolation.

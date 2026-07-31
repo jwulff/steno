@@ -94,6 +94,7 @@ struct RunCommand: ParsableCommand {
                     delegate: broadcaster,
                     deviceUIDProvider: { defaultInputDeviceUID() },
                     healThresholdSeconds: settings.healGapSeconds,
+                    audioBacklogCapSeconds: settings.audioBacklogCapSeconds,
                     dedupCoordinator: dedupCoordinator,
                     dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),
                     emptySessionMinChars: settings.emptySessionMinChars,
