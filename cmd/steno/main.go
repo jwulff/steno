@@ -11,11 +11,18 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/jwulff/steno/internal/app"
+	"github.com/jwulff/steno/internal/version"
 )
 
 func main() {
 	mcpMode := flag.Bool("mcp", false, "Run as MCP stdio server (read-only database access)")
+	showVersion := flag.Bool("version", false, "Print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("steno " + version.Current)
+		return
+	}
 
 	if *mcpMode {
 		runMCP()
@@ -56,7 +63,7 @@ func runMCP() {
 
 	s := server.NewMCPServer(
 		"steno-mcp",
-		"0.1.0",
+		version.Current,
 		server.WithToolCapabilities(false),
 		server.WithInstructions("Steno MCP server provides read-only access to the Steno speech-to-text database. "+
 			"Use get_overview first to orient yourself, then drill into sessions with list_sessions and get_session, "+
