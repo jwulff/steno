@@ -445,13 +445,7 @@ public actor RecordingEngine {
         await setStatus(.starting)
 
         // Check permissions
-        let permissions = await permissionService.checkPermissions()
-        guard permissions.allGranted else {
-            await setStatus(.error)
-            let message = permissions.errorMessage ?? "Permissions denied"
-            await emit(.error(message, isTransient: false))
-            throw RecordingEngineError.permissionDenied(message)
-        }
+        try await ensureMicrophonePermission()
 
         // #62 Layer A gate: confirm on-device transcription can run for this
         // locale (and download its model) before creating a session or bringing
@@ -782,13 +776,7 @@ public actor RecordingEngine {
         // Step 3: permission check. Failures here are user-resolvable
         // (TCC dialog) — engine ends in `.error` with a non-transient
         // event so the TUI can prompt the user.
-        let permissions = await permissionService.checkPermissions()
-        guard permissions.allGranted else {
-            await setStatus(.error)
-            let message = permissions.errorMessage ?? "Permissions denied"
-            await emit(.error(message, isTransient: false))
-            throw RecordingEngineError.permissionDenied(message)
-        }
+        try await ensureMicrophonePermission()
 
         // Step 3b (#62): Layer A gate. Same as `start()` — confirm transcription
         // can run for this locale (and download its model) before opening a
@@ -1914,6 +1902,25 @@ public actor RecordingEngine {
     }
 
     // MARK: - Layer A availability gate (#62)
+
+    /// Confirm microphone access, prompting the user if TCC has never asked.
+    ///
+    /// `checkPermissions()` reports not-granted for both "denied" and
+    /// "undetermined", and a fresh install is always undetermined — the
+    /// engine has to call `requestMicrophoneAccess()` (which shows the TCC
+    /// prompt) or the user is never asked at all and every start fails.
+    /// When access was previously denied the request returns the recorded
+    /// answer immediately without prompting, so denied stays a fast,
+    /// user-resolvable `.error` (System Settings → Privacy → Microphone).
+    private func ensureMicrophonePermission() async throws {
+        let permissions = await permissionService.checkPermissions()
+        if permissions.allGranted { return }
+        if await permissionService.requestMicrophoneAccess() { return }
+        await setStatus(.error)
+        let message = permissions.errorMessage ?? "Permissions denied"
+        await emit(.error(message, isTransient: false))
+        throw RecordingEngineError.permissionDenied(message)
+    }
 
     /// Confirm on-device transcription can run for `locale` and that its model
     /// asset is installed, before any pipeline bring-up. Surfaces the lifecycle

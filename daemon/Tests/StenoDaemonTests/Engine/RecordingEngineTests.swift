@@ -147,6 +147,24 @@ struct RecordingEngineTests {
         #expect(statuses.last == .idle)
     }
 
+    @Test @MainActor func startRequestsMicAccessWhenNotYetGranted() async throws {
+        // First run on a fresh machine: TCC is undetermined, so
+        // checkPermissions() reports not-granted. The engine must ask —
+        // requestMicrophoneAccess() shows the TCC prompt — rather than
+        // fail without ever prompting.
+        let perms = MockPermissionService()
+        perms.permissionStatus = .denied
+        perms.microphoneAccessGranted = true
+
+        let (engine, _, _, _, _, _, _) = await makeEngine(permissionService: perms)
+
+        _ = try await engine.start()
+
+        #expect(perms.microphoneAccessRequested)
+        let status = await engine.status
+        #expect(status == .recording)
+    }
+
     @Test @MainActor func permissionDeniedThrows() async throws {
         let perms = MockPermissionService()
         perms.denyAll()
@@ -163,6 +181,9 @@ struct RecordingEngineTests {
         let errors = await delegate.errors
         #expect(!errors.isEmpty)
         #expect(errors[0].1 == false) // isTransient = false
+
+        // A denial is only final after the engine actually asked.
+        #expect(perms.microphoneAccessRequested)
     }
 
     @Test func segmentsTriggerSummaryCoordinator() async throws {
