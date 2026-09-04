@@ -603,7 +603,19 @@ public actor RecordingEngine {
         lastUsedDevice = device
         lastUsedSystemAudio = systemAudio
 
-        await setStatus(.recording)
+        // Guarded for the same reason `maybeRestoreRecordingStatus`
+        // guards: the system-audio bring-up can surrender inline —
+        // `handleSystemAudioBringUpFailure` awaits
+        // `handleSystemAudioPermissionRevoked()`, which sets `.error`
+        // before `startSystemAudio` returns. Overwriting that with
+        // `.recording` would leave the engine claiming to record while
+        // the sys pipeline is torn down and no observer can re-arm it,
+        // since `handleDisplayBecameAvailable()` refuses to act on a
+        // pipeline that was never parked. The mic path never reaches
+        // here in `.error`; it throws instead.
+        if status != .error {
+            await setStatus(.recording)
+        }
         return session
     }
 
@@ -1351,8 +1363,17 @@ public actor RecordingEngine {
     /// use the type name. This gives U5's `BackoffPolicy` a deterministic
     /// key string without coupling to any specific error enum.
     private nonisolated func errorCode(for error: Error) -> String {
-        let ns = error as NSError
-        return "\(ns.domain)#\(ns.code)"
+        // Delegates so there is exactly one key function. The bare
+        // `error as NSError` this used to do collapsed every
+        // `SystemAudioError.captureFailed` onto a single key (the
+        // mangled enum type name, code 0), which had two effects on
+        // `BackoffPolicy`: distinct SCStream codes became
+        // indistinguishable, and the same physical fault counted in one
+        // bucket arriving from bring-up and another arriving from the
+        // delegate — so "same error five times" needed ten. Errors that
+        // are not wrapped pass through with identical `domain#code`
+        // behaviour, so the mic path is unaffected.
+        SystemAudioErrorClassifier.backoffKey(for: error)
     }
 
     // MARK: - U5 Restart machinery
@@ -1748,7 +1769,93 @@ public actor RecordingEngine {
                 reason: "startSystemAudio:\(SystemAudioError.noDisplaysAvailable)"
             )
         } catch {
+            await handleSystemAudioBringUpFailure(error)
+        }
+    }
+
+    /// Route a `startSystemAudio` bring-up failure through the same
+    /// classifier the SCStream delegate path and `restartSystemPipeline`
+    /// already use.
+    ///
+    /// Before this existed, every throw that was not the typed
+    /// `SystemAudioError.noDisplaysAvailable` fell into a bare `catch`
+    /// that emitted a transient error and returned. That left the sys
+    /// pipeline unrecoverable by *any* observer:
+    /// `sysParkedAwaitingDisplay` is cleared eagerly at the top of the
+    /// bring-up, so `handleDisplayBecameAvailable()` bails at its first
+    /// guard; no `sysRestartTask` is scheduled, so nothing retries; and
+    /// `isSystemAudioEnabled` keeps reporting system audio as on.
+    /// `restartSystemPipeline` learned this in the PR #35 review
+    /// (issue 4) — the bring-up path had not.
+    ///
+    /// Lid-close then lid-open is the trigger. Lid-close empties the
+    /// display list and parks correctly. Lid-open re-arms while the
+    /// display is still settling, so ScreenCaptureKit fails, the bring-up
+    /// stranded itself here, and the park flag it had just cleared meant
+    /// no later display event could rescue it. The mic, on its own
+    /// pipeline, kept working — which is why this reads as "system audio
+    /// stopped" rather than "recording broke".
+    private func handleSystemAudioBringUpFailure(_ error: Error) async {
+        if isStopping || status == .stopping || status == .idle || Task.isCancelled {
+            return
+        }
+
+        // A source reporting its permission as denied is terminal:
+        // neither a retry nor a display event clears a revoked grant,
+        // so surface the load-bearing token instead of a transient
+        // error string. Checked ahead of the switch because this is a
+        // plain Swift enum, not an SCStream-domain error.
+        //
+        // `SystemAudioSource` no longer throws this — a real denial
+        // arrives as SCStream `userDeclined` and is handled by the
+        // `.permissionRevoked` arm below. This remains the contract for
+        // any other `AudioSource` that reports denial directly.
+        if let sysError = error as? SystemAudioError, sysError == .permissionDenied {
+            await handleSystemAudioPermissionRevoked()
+            return
+        }
+
+        switch SystemAudioErrorClassifier.classify(error) {
+        case .parkUntilDisplay:
+            // Same destination as the typed `noDisplaysAvailable` catch
+            // above, reached when ScreenCaptureKit reports the missing
+            // display as `-3815 noCaptureSource` instead.
+            await parkSystemPipelineUntilDisplay(reason: "startSystemAudio:\(error)")
+
+        case .permissionRevoked:
+            await handleSystemAudioPermissionRevoked()
+
+        case .ignore, .retry:
+            // `.ignore` means something different here than it does on
+            // the delegate path. There, it is a stream that stopped for
+            // a reason we caused and can disregard because the pipeline
+            // is otherwise intact. Here the bring-up produced no working
+            // source at all, so disregarding it would leave exactly the
+            // dead-but-enabled pipeline this function exists to prevent.
+            // Both classifications get the bounded retry.
             await emit(.error("System audio failed: \(error)", isTransient: true))
+
+            // An in-flight restart rebuilds against current state;
+            // scheduling a second would only race it. Mirrors the gate
+            // in `handleSystemAudioRetry`.
+            if sysRestartTask != nil { return }
+
+            if sysBackoff.isExhausted {
+                await emit(.recoveryExhausted(
+                    reason: "startSystemAudio:\(error.localizedDescription)"
+                ))
+                await setStatus(.error)
+                return
+            }
+
+            // Teardown of the failed source is left to
+            // `restartSystemPipeline`, which stops it before rebuilding.
+            // Niling it here instead would make that stop a no-op and
+            // strand a partially-constructed SCStream.
+            await scheduleSysRestart(
+                reason: "startSystemAudio:\(error.localizedDescription)",
+                errorCode: errorCode(for: error)
+            )
         }
     }
 

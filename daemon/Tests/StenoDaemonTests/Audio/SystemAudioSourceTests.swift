@@ -165,6 +165,50 @@ struct SystemAudioErrorClassifierTests {
         #expect(SystemAudioErrorClassifier.backoffKey(for: a)
                 != SystemAudioErrorClassifier.backoffKey(for: b))
     }
+
+    // MARK: - Wrapped bring-up errors
+
+    // `SystemAudioSource.start()` cannot throw a bare NSError, so a
+    // bring-up failure reaches the classifier wrapped in
+    // `SystemAudioError.captureFailed`. A wrapped error and the raw
+    // error it carries must classify identically — otherwise the same
+    // ScreenCaptureKit fault means one thing arriving from the delegate
+    // and another arriving from bring-up.
+
+    @Test("wrapped -3815 classifies as .parkUntilDisplay, same as raw")
+    func wrappedNoCaptureSourceUnwrapsToPark() {
+        let raw = Self.makeSCError(SCStreamError.noCaptureSource.rawValue)
+        let wrapped = SystemAudioError.captureFailed(stage: .startCapture, underlying: raw)
+        #expect(SystemAudioErrorClassifier.classify(wrapped) == .parkUntilDisplay)
+        #expect(SystemAudioErrorClassifier.classify(wrapped)
+                == SystemAudioErrorClassifier.classify(raw))
+    }
+
+    @Test("wrapped userDeclined classifies as .permissionRevoked, same as raw")
+    func wrappedUserDeclinedUnwrapsToPermissionRevoked() {
+        let raw = Self.makeSCError(SCStreamError.userDeclined.rawValue)
+        let wrapped = SystemAudioError.captureFailed(stage: .shareableContent, underlying: raw)
+        #expect(SystemAudioErrorClassifier.classify(wrapped) == .permissionRevoked)
+    }
+
+    @Test("wrapped errors share the raw error's backoff key")
+    func wrappedErrorSharesBackoffKey() {
+        // If these diverged, "same error five times" tracking would
+        // split into two buckets and the bounded backoff would take
+        // twice as long to surrender.
+        let raw = Self.makeSCError(SCStreamError.systemStoppedStream.rawValue)
+        let wrapped = SystemAudioError.captureFailed(stage: .startCapture, underlying: raw)
+        #expect(SystemAudioErrorClassifier.backoffKey(for: wrapped)
+                == SystemAudioErrorClassifier.backoffKey(for: raw))
+    }
+
+    @Test("an unwrapped non-SCStream error is still defensively .retry")
+    func wrappedNonSCStreamErrorClassifiesAsRetry() {
+        let raw = NSError(domain: "SomeOtherDomain", code: -3815, userInfo: nil)
+        let wrapped = SystemAudioError.captureFailed(stage: .startCapture, underlying: raw)
+        // Unwrapping must not bypass the domain gate.
+        #expect(SystemAudioErrorClassifier.classify(wrapped) == .retry)
+    }
 }
 
 // MARK: - U8 Microphone Permission Detector Tests

@@ -7,6 +7,37 @@ public enum SystemAudioError: Error, Equatable {
     case noDisplaysAvailable
     case streamStartFailed(String)
     case permissionDenied
+
+    /// ScreenCaptureKit failed during bring-up. Carries the original
+    /// error **verbatim** so `SystemAudioErrorClassifier` can dispatch
+    /// on its domain and code.
+    ///
+    /// This case exists because the two bring-up failure paths used to
+    /// discard exactly the information the classifier needs: any
+    /// `SCShareableContent` failure became `.permissionDenied`, and any
+    /// `startCapture` failure became `.streamStartFailed(String)`. Both
+    /// are Swift enums, whose `NSError` domain is a mangled type name,
+    /// so `classify(_:)` fell through to `.retry` and the `-3815
+    /// noCaptureSource` / `-3801 userDeclined` distinctions were
+    /// unreachable from bring-up. Delegate callbacks, which pass the
+    /// error through untouched, classified correctly — the two paths
+    /// disagreed about the same error.
+    ///
+    /// **Equality caveat.** Synthesized `==` compares the payload with
+    /// `NSError.isEqual`, which includes `userInfo`. Two errors with the
+    /// same domain and code but different `NSLocalizedDescription` (or a
+    /// different `NSUnderlyingError`) compare unequal. Classify or take
+    /// the backoff key rather than comparing two `.captureFailed` values
+    /// directly, and do not use one as a dictionary key.
+    case captureFailed(stage: CaptureStage, underlying: NSError)
+
+    /// Which ScreenCaptureKit call failed. Carried in the payload so a
+    /// reader can tell "couldn't enumerate displays" from "couldn't
+    /// start the stream" without parsing a message string.
+    public enum CaptureStage: String, Sendable, Equatable {
+        case shareableContent
+        case startCapture
+    }
 }
 
 /// Captures system audio using ScreenCaptureKit.
@@ -74,7 +105,17 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamDelegate, @
         do {
             content = try await SCShareableContent.current
         } catch {
-            throw SystemAudioError.permissionDenied
+            // Do NOT collapse this into `.permissionDenied`. A genuine
+            // denial arrives as SCStream `userDeclined` (-3801) and the
+            // classifier recognises it; a display still waking up after
+            // a lid-open does not. Calling the latter a permission
+            // failure drives the engine to a terminal `.error` it can
+            // never recover from, because `handleDisplayBecameAvailable()`
+            // refuses to re-arm from `.error`.
+            throw SystemAudioError.captureFailed(
+                stage: .shareableContent,
+                underlying: error as NSError
+            )
         }
 
         guard let display = content.displays.first else {
@@ -129,7 +170,13 @@ public final class SystemAudioSource: NSObject, AudioSource, SCStreamDelegate, @
             try await scStream.startCapture()
         } catch {
             cleanup()
-            throw SystemAudioError.streamStartFailed(error.localizedDescription)
+            // `localizedDescription` threw away the domain and code the
+            // classifier dispatches on — including `-3815 noCaptureSource`,
+            // which is precisely the lid-open case.
+            throw SystemAudioError.captureFailed(
+                stage: .startCapture,
+                underlying: error as NSError
+            )
         }
 
         return (buffers: bufferStream, format: format)
