@@ -63,7 +63,9 @@ public final class UnixSocketServer: SocketServerProtocol, @unchecked Sendable {
     }
 
     private func handleNewConnection(_ nwConnection: NWConnection) {
-        let wrapper = NWConnectionWrapper(connection: nwConnection)
+        let wrapper = NWConnectionWrapper(connection: nwConnection) { [weak self] id in
+            self?.removeConnection(id)
+        }
 
         connections.withLock { $0[wrapper.id] = wrapper }
 
@@ -109,14 +111,27 @@ public final class UnixSocketServer: SocketServerProtocol, @unchecked Sendable {
         }
     }
 
+    /// Drop a client connection and release its socket.
+    ///
+    /// The cancel is what actually frees the file descriptor. Network.framework
+    /// retains a started `NWConnection` until it is cancelled, so removing the
+    /// wrapper from the map is not enough: the descriptor stays open for the
+    /// life of the process. Accumulated across every connection the daemon ever
+    /// accepted, that exhausts the fd table, `accept()` starts failing with
+    /// EMFILE, and clients hang on connections the daemon will never read (#105).
+    ///
+    /// Idempotent: the map lookup is the guard, so a connection that both fails
+    /// a send and then reports EOF is only torn down once.
     private func removeConnection(_ id: UUID) {
-        let existed = connections.withLock { $0.removeValue(forKey: id) != nil }
+        let removed = connections.withLock { $0.removeValue(forKey: id) }
 
-        if existed {
-            let handler = onClientDisconnected
-            Task {
-                await handler?(id)
-            }
+        guard let removed else { return }
+
+        removed.connection.cancel()
+
+        let handler = onClientDisconnected
+        Task {
+            await handler?(id)
         }
     }
 }
@@ -126,19 +141,33 @@ final class NWConnectionWrapper: ClientConnection, @unchecked Sendable {
     let id = UUID()
     let connection: NWConnection
 
-    init(connection: NWConnection) {
+    /// Called when a send fails so the owning server can drop and cancel this
+    /// connection instead of leaving a dead socket registered (#105).
+    private let onSendFailure: (@Sendable (UUID) -> Void)?
+
+    init(connection: NWConnection, onSendFailure: (@Sendable (UUID) -> Void)? = nil) {
         self.connection = connection
+        self.onSendFailure = onSendFailure
     }
 
     func send(_ data: Data) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            })
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                })
+            }
+        } catch {
+            // A client that died mid-response would otherwise stay registered
+            // with an un-cancelled socket, which is the #105 leak by another
+            // route. Callers swallow send errors, so the teardown has to happen
+            // here rather than at the call site.
+            onSendFailure?(id)
+            throw error
         }
     }
 
