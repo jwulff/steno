@@ -43,6 +43,12 @@ public enum EngineEvent: Sendable {
     /// actually dropped, measured from the discarded buffers. Emitted per
     /// shedding burst, not per buffer.
     case audioShed(seconds: Double, source: AudioSourceType)
+    /// Ephemeral: a capture source has produced nothing but digital
+    /// silence for a sustained stretch while the session reports as
+    /// recording (#104). `seconds` is how long the silence had run when
+    /// the warning fired. Emitted once per silent stretch; the watchdog
+    /// re-arms when audio returns.
+    case audioSilent(seconds: Double, source: AudioSourceType)
     /// Ephemeral: pause state changed (U10). Emitted on every transition
     /// into and out of `.paused`.
     ///

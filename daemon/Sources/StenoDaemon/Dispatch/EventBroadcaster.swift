@@ -179,6 +179,18 @@ public actor EventBroadcaster: RecordingEngineDelegate {
                 transient: true
             ))
 
+        // #104: sustained digital silence from a source that is
+        // supposed to be capturing. Routed onto the `.error` channel
+        // with `transient: true` alongside the other advisory events —
+        // the session is still running, it is just not hearing anything.
+        case .audioSilent(let seconds, let source):
+            return (.error, DaemonEvent(
+                event: "error",
+                message: "audio_silent: no \(source.rawValue) input for \(Int(seconds))s "
+                    + "(device may be muted, misrouted, or offering no usable input)",
+                transient: true
+            ))
+
         // U10: pause-state broadcast. Routed onto the existing `.status`
         // wire channel so a connecting TUI sees pause/resume transitions
         // alongside .recording / .idle. The dedicated pause-state fields
