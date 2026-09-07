@@ -1488,7 +1488,7 @@ public actor RecordingEngine {
             lastMicFormat = format
             // Refresh the cached device UID — a config-change-driven
             // restart may have landed on a new default-input device.
-            lastDeviceUID = deviceUIDProvider()
+            lastDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
 
             let micBuffers = tappedStream(buffers, isMic: true)
             let recognizer = try await speechRecognizerFactory.makeRecognizer(
@@ -2443,7 +2443,7 @@ public actor RecordingEngine {
         }
 
         let gap = nowProvider().timeIntervalSince(gapStarted)
-        let currentDeviceUID = deviceUIDProvider()
+        let currentDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
         let outcome = HealRule.decide(
             gap: gap,
             deviceUID: currentDeviceUID,

@@ -283,4 +283,27 @@ struct DeviceSelectionTests {
 
         await engine.stop()
     }
+    @Test("A pinned input preserves its session across a short sleep")
+    func pinnedDeviceSurvivesWake() async throws {
+        let pinned = AudioInputDevice(id: 92, uid: "usb:1", name: "USB mic")
+        let (engine, _, _) = await makeEngine(enumerator: MockAudioInputDeviceEnumerator(devices: [pinned]))
+        let session = try await engine.start(device: pinned.uid)
+        await engine.handleSystemWillSleep()
+        await engine.handleSystemDidWake()
+        #expect(await engine.currentSession?.id == session.id)
+        await engine.stop()
+    }
+
+    @Test("A mic rebuild keeps the pinned UID for subsequent device notifications")
+    func pinnedDeviceSurvivesRebuild() async throws {
+        let pinned = AudioInputDevice(id: 92, uid: "usb:1", name: "USB mic")
+        let (engine, af, delegate) = await makeEngine(enumerator: MockAudioInputDeviceEnumerator(devices: [pinned]))
+        let session = try await engine.start(device: pinned.uid)
+        await engine.restartMicPipeline(reason: "test", errorCode: "transient")
+        await engine.handleAudioDeviceChange(deviceUID: "default:1", format: af.micFormat)
+        #expect(await engine.currentSession?.id == session.id)
+        #expect(await !delegate.recoveringReasons.contains { $0.hasPrefix("device-change:uid:") })
+        await engine.stop()
+    }
+
 }

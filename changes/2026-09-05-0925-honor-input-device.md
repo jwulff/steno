@@ -124,3 +124,10 @@ read during enumeration and thrown away; surfacing them would let a client warn 
 start rather than after.
 
 Closes #104.
+
+## Review follow-up
+
+Wake recovery and microphone rebuilds now preserve the pinned device UID,
+matching initial startup and device-change handling. Two regression tests
+showed unnecessary session rollover after a short sleep or a mic rebuild;
+both now preserve the original session.
