@@ -93,6 +93,14 @@ actor MockRecordingEngineDelegate: RecordingEngineDelegate {
         }
     }
 
+    /// All `audioSilent` warnings (#104) as (seconds, source) pairs.
+    var audioSilentReports: [(seconds: Double, source: AudioSourceType)] {
+        events.compactMap {
+            if case .audioSilent(let seconds, let source) = $0 { return (seconds, source) }
+            return nil
+        }
+    }
+
     /// All model-readiness events (#62) as (component, readiness) pairs.
     var modelStatuses: [(ModelComponent, ModelReadiness)] {
         events.compactMap {

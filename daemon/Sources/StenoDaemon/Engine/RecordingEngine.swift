@@ -98,6 +98,14 @@ public actor RecordingEngine {
     /// `StenoSettings.healGapSeconds` at construction time.
     private let healThresholdSeconds: Int
 
+    /// Lists the machine's input devices for `availableDevices()` (#104).
+    /// Injected because Core Audio enumeration needs real hardware.
+    private let deviceEnumerator: any AudioInputDeviceEnumerating
+
+    /// Watches the mic level stream for sustained digital silence (#104).
+    /// Reset on every mic bring-up so a fresh device gets a fresh window.
+    private var micSilenceWatchdog: MicSilenceWatchdog
+
     /// Wall-clock provider. Tests inject a deterministic clock so the
     /// rollover-vs-reuse path can be exercised without a real 30-second
     /// sleep.
@@ -379,7 +387,9 @@ public actor RecordingEngine {
         pauseTimer: PauseTimer? = nil,
         transcriptionGate: TranscriptionModelGate = ReadyTranscriptionModelGate(),
         micDiarizer: (any DiarizationService)? = nil,
-        sysDiarizer: (any DiarizationService)? = nil
+        sysDiarizer: (any DiarizationService)? = nil,
+        deviceEnumerator: any AudioInputDeviceEnumerating = CoreAudioInputDeviceEnumerator(),
+        micSilenceWarnAfter: Duration = .seconds(30)
     ) {
         self.repository = repository
         self.permissionService = permissionService
@@ -402,6 +412,14 @@ public actor RecordingEngine {
         self.emptySessionMinDurationSeconds = emptySessionMinDurationSeconds
         self.retentionDays = retentionDays
         self.pauseTimer = pauseTimer ?? PauseTimer()
+        self.deviceEnumerator = deviceEnumerator
+        // The watchdog counts level-throttle ticks, so convert the
+        // caller's duration into ticks at the throttle's fixed rate.
+        let warnSeconds = Double(micSilenceWarnAfter.components.seconds)
+            + Double(micSilenceWarnAfter.components.attoseconds) / 1e18
+        self.micSilenceWatchdog = MicSilenceWatchdog(
+            ticksToWarn: Int((warnSeconds / MicSilenceWatchdog.defaultTickSeconds).rounded())
+        )
     }
 
     // MARK: - Public Commands
@@ -539,12 +557,14 @@ public actor RecordingEngine {
         await sysRingBuffer.reset()
         // U6: capture the device UID at this bring-up so the next wake
         // / config-change can compare against it for the heal rule.
-        lastDeviceUID = deviceUIDProvider()
+        lastDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
 
         // Start microphone
         do {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: device)
             micStopClosure = stopMic
+            // #104: a fresh pipeline gets a fresh silence window.
+            micSilenceWatchdog.reset()
             // U7: remember the format so the device-change handler can
             // distinguish "format changed within same device" from
             // "neither changed."
@@ -946,10 +966,21 @@ public actor RecordingEngine {
         isStopping = false
     }
 
-    /// List available audio devices.
+    /// List the machine's audio input devices.
+    ///
+    /// The names returned here are exactly what `start(device:)` accepts
+    /// (#104). Before this, the method was a stub returning `[]`, so
+    /// `{"cmd":"devices"}` gave a client no way to discover a valid
+    /// device name.
     public func availableDevices() async -> [AudioDevice] {
-        // Placeholder — real implementation queries Core Audio
-        []
+        let defaultUID = deviceEnumerator.defaultInputUID()
+        return deviceEnumerator.inputDevices().map { device in
+            AudioDevice(
+                id: device.uid,
+                name: device.name,
+                isDefault: device.uid == defaultUID
+            )
+        }
     }
 
     /// Current cached mic format from the last successful pipeline
@@ -1458,13 +1489,15 @@ public actor RecordingEngine {
         do {
             let (buffers, format, stopMic) = try await audioSourceFactory.makeMicrophoneSource(device: currentDevice)
             micStopClosure = stopMic
+            // #104: a fresh pipeline gets a fresh silence window.
+            micSilenceWatchdog.reset()
             // U7: refresh cached mic format on successful rebuild so
             // a subsequent device-change handler compares against the
             // post-restart format, not the pre-restart format.
             lastMicFormat = format
             // Refresh the cached device UID — a config-change-driven
             // restart may have landed on a new default-input device.
-            lastDeviceUID = deviceUIDProvider()
+            lastDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
 
             let micBuffers = tappedStream(buffers, isMic: true)
             let recognizer = try await speechRecognizerFactory.makeRecognizer(
@@ -1962,9 +1995,18 @@ public actor RecordingEngine {
     }
 
     private func emitAndResetLevels() async {
-        await emit(.audioLevel(mic: pendingMicLevel, system: pendingSystemLevel))
+        let micPeak = pendingMicLevel
+        await emit(.audioLevel(mic: micPeak, system: pendingSystemLevel))
         pendingMicLevel = 0
         pendingSystemLevel = 0
+
+        // #104: only meaningful while a mic pipeline is actually up and
+        // the session is running. During recovery or a rebuild the
+        // absence of audio is expected and already reported.
+        guard micStopClosure != nil, status == .recording else { return }
+        if let silentSeconds = micSilenceWatchdog.observe(peak: micPeak) {
+            await emit(.audioSilent(seconds: silentSeconds, source: .microphone))
+        }
     }
 
     /// Compute peak amplitude from a buffer.
@@ -2497,7 +2539,7 @@ public actor RecordingEngine {
         }
 
         let gap = nowProvider().timeIntervalSince(gapStarted)
-        let currentDeviceUID = deviceUIDProvider()
+        let currentDeviceUID = captureDeviceUID(observed: deviceUIDProvider())
         let outcome = HealRule.decide(
             gap: gap,
             deviceUID: currentDeviceUID,
@@ -2620,7 +2662,11 @@ public actor RecordingEngine {
         let cachedUID = lastDeviceUID
         let cachedFormat = lastMicFormat
 
-        let sameUID = (deviceUID == cachedUID)
+        // #104: a pinned session is not affected by the system default
+        // moving, so compare against what we are actually capturing.
+        let observedUID = captureDeviceUID(observed: deviceUID)
+
+        let sameUID = (observedUID == cachedUID)
         let sameFormat = formatsEqual(format, cachedFormat)
         let needsHealRule = !sameUID || !sameFormat
 
@@ -2634,7 +2680,7 @@ public actor RecordingEngine {
         // .recovering(reason:) event.
         let reason: String
         if !sameUID {
-            reason = "device-change:uid:\(deviceUID ?? "nil")"
+            reason = "device-change:uid:\(observedUID ?? "nil")"
         } else if !sameFormat {
             reason = "device-change:format"
         } else {
@@ -2671,7 +2717,7 @@ public actor RecordingEngine {
         let gap = nowProvider().timeIntervalSince(gapEntry)
         let outcome = HealRule.decide(
             gap: gap,
-            deviceUID: deviceUID,
+            deviceUID: observedUID,
             lastDeviceUID: cachedUID,
             thresholdSeconds: healThresholdSeconds
         )
@@ -2719,6 +2765,26 @@ public actor RecordingEngine {
                 ))
             }
         }
+    }
+
+    /// The UID of the device the mic pipeline is actually capturing from.
+    ///
+    /// An unpinned session follows the system default input, so the
+    /// observed UID is the answer — the historical behavior. A session
+    /// pinned to a specific device (#104) is different: switching the
+    /// *system default* to something else changes nothing about what
+    /// steno is recording, and treating that as a device change would
+    /// roll the session over for no reason.
+    ///
+    /// If the pinned device has gone away, the observed UID stands. That
+    /// really is a change, and the heal rule should see it.
+    private func captureDeviceUID(observed: String?) -> String? {
+        guard let requested = currentDevice?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !requested.isEmpty else {
+            return observed
+        }
+        return AudioInputDeviceResolver
+            .resolve(requested, in: deviceEnumerator.inputDevices())?.uid ?? observed
     }
 
     /// Compare two `AVAudioFormat` values for the purposes of the

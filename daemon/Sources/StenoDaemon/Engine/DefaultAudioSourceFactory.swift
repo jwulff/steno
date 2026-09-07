@@ -10,11 +10,18 @@
 /// `(buffers, format, stop)` tuple shape so `RecordingEngine` consumes
 /// it unchanged.
 public final class DefaultAudioSourceFactory: AudioSourceFactory, Sendable {
-    public init() {}
+    /// Shared with every `MicrophoneAudioSource` this factory builds so
+    /// a requested `device` resolves against the same device list the
+    /// `devices` command advertises (#104).
+    private let deviceEnumerator: any AudioInputDeviceEnumerating
+
+    public init(deviceEnumerator: any AudioInputDeviceEnumerating = CoreAudioInputDeviceEnumerator()) {
+        self.deviceEnumerator = deviceEnumerator
+    }
 
     public func makeMicrophoneSource(device: String?) async throws
         -> (buffers: AsyncStream<AVAudioPCMBuffer>, format: AVAudioFormat, stop: @Sendable () async -> Void) {
-        let mic = MicrophoneAudioSource()
+        let mic = MicrophoneAudioSource(deviceEnumerator: deviceEnumerator)
         return try await mic.start(device: device)
     }
 
