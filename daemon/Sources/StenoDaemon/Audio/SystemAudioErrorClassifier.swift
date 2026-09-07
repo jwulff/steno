@@ -69,9 +69,27 @@ public enum SystemAudioErrorClassifier {
     /// arbitrary `NSError` values (including synthetic ones in tests).
     public static let scStreamErrorDomain = "com.apple.ScreenCaptureKit.SCStreamErrorDomain"
 
-    /// Classify an error produced by `SCStreamDelegate.stream(_:didStopWithError:)`.
+    /// Unwrap a `SystemAudioError.captureFailed` to the ScreenCaptureKit
+    /// error it carries.
+    ///
+    /// Load-bearing for agreement between the two paths that reach this
+    /// classifier. `SCStreamDelegate.stream(_:didStopWithError:)` hands
+    /// over the SCK error untouched; `SystemAudioSource.start()` has to
+    /// wrap it to throw it. Without this unwrap the same `-3815` would
+    /// classify as `.parkUntilDisplay` from the delegate and `.retry`
+    /// from bring-up.
+    private static func underlyingError(_ error: Error) -> NSError {
+        if let sysError = error as? SystemAudioError,
+           case .captureFailed(_, let underlying) = sysError {
+            return underlying
+        }
+        return error as NSError
+    }
+
+    /// Classify an error produced by `SCStreamDelegate.stream(_:didStopWithError:)`
+    /// or by a `SystemAudioSource.start()` bring-up failure.
     public static func classify(_ error: Error) -> SCStreamRecoveryAction {
-        let ns = error as NSError
+        let ns = underlyingError(error)
         // Only dispatch on SCStreamErrorDomain. An error from another
         // domain (rare, but possible if SCK wraps an underlying error
         // pre-classification) is treated as retry — the bounded
@@ -110,7 +128,11 @@ public enum SystemAudioErrorClassifier {
     /// existing `errorCode(for:)` shape (`domain#code`) so the policy
     /// state plays nicely with errors arriving from any source.
     public static func backoffKey(for error: Error) -> String {
-        let ns = error as NSError
+        // Unwrapped for the same reason as `classify(_:)`: a bring-up
+        // failure and a delegate callback carrying the same SCK error
+        // must land on the same backoff bucket, or "same error five
+        // times" tracking silently splits in two.
+        let ns = underlyingError(error)
         return "\(ns.domain)#\(ns.code)"
     }
 }
