@@ -1651,30 +1651,12 @@ public actor RecordingEngine {
             )
             return
         } catch {
-            // Mirror of mic-side handling — see `restartMicPipeline`'s
-            // catch block. Without an explicit reschedule, the system
-            // pipeline stays stuck after a rebuild throw because there
-            // is no recognizer consumer task left to re-trigger
-            // `handleRecognizerError`. PR #35 review (issue 4).
-            await emit(.error(
-                "System pipeline rebuild failed: \(error.localizedDescription)",
-                isTransient: true
-            ))
-            let nestedCode = self.errorCode(for: error)
+            // A retry can encounter a different failure than the initial
+            // bring-up. Apply the same display/permission classification
+            // before scheduling another attempt.
             sysRestartTask = nil
             sysRestartEntryTime = nil
-            if isStopping || status == .stopping || status == .idle || Task.isCancelled {
-                return
-            }
-            if sysBackoff.isExhausted {
-                await emit(.recoveryExhausted(reason: "rebuild:\(error.localizedDescription)"))
-                await setStatus(.error)
-                return
-            }
-            await scheduleSysRestart(
-                reason: "rebuild:\(error.localizedDescription)",
-                errorCode: nestedCode
-            )
+            await handleSystemAudioBringUpFailure(error)
             return
         }
 

@@ -357,4 +357,39 @@ struct SystemAudioStartFailureTests {
 
         await engine.stop()
     }
+    @Test("a wrapped missing-display error during retry parks until a display returns")
+    func wrappedRebuildFailure_parksAndRearms() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        let (engine, af, delegate, sleep) = await makeEngine(recognizerFactory: rf)
+        _ = try await engine.start(systemAudio: true)
+        af.systemAudioSource.errorToThrow = bringUpFailure(SCStreamError.noCaptureSource.rawValue)
+
+        await engine.restartSystemPipeline(reason: "test", errorCode: "transient")
+
+        let errors = await delegate.errors
+        #expect(errors.contains { $0.0.contains(RecordingEngine.systemAudioParkedNoDisplayToken) })
+        #expect(sleep.requestedDurations.count == 1)
+        af.systemAudioSource.errorToThrow = nil
+        let previousCount = rf.sysMakeCount
+        await engine.displayBecameAvailable()
+        #expect(rf.sysMakeCount == previousCount + 1)
+        await engine.stop()
+    }
+
+    @Test("a wrapped permission denial during retry reports revocation without further retries")
+    func wrappedRebuildFailure_reportsRevocation() async throws {
+        let rf = MockSpeechRecognizerFactory()
+        let (engine, af, delegate, sleep) = await makeEngine(recognizerFactory: rf)
+        _ = try await engine.start(systemAudio: true)
+        af.systemAudioSource.errorToThrow = bringUpFailure(SCStreamError.userDeclined.rawValue)
+
+        await engine.restartSystemPipeline(reason: "test", errorCode: "transient")
+
+        let reasons = await delegate.recoveryExhaustedReasons
+        #expect(reasons.contains("MIC_OR_SCREEN_PERMISSION_REVOKED"))
+        #expect(sleep.requestedDurations.count == 1)
+        #expect(await engine.status == .error)
+        await engine.stop()
+    }
+
 }

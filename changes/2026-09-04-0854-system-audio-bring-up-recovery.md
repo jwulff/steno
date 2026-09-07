@@ -213,3 +213,10 @@ not by an executable test.
 - `streamStartFailed("Failed to create audio format")` is still a synthesized
   string failure that will classify as a retry and burn the budget before
   surrendering. Rare, and out of scope here.
+
+## Review follow-up
+
+The scheduled rebuild now uses the same error classification as initial
+bring-up. A wrapped missing-display error parks and re-arms on a display event;
+a wrapped permission denial surfaces the revoked token without further retries.
+Two regression tests failed before this correction and pass after it.
