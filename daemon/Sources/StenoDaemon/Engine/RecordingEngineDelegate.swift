@@ -70,6 +70,14 @@ public enum EngineEvent: Sendable {
     /// TUI show "preparing model" / "unavailable" states for transcription
     /// (Layer A) and diarization (Layer B) instead of failing silently.
     case modelStatus(ModelComponent, ModelReadiness)
+    /// Ephemeral: a mic segment was just marked as a duplicate of a sys
+    /// segment by `DedupCoordinator`. Carries the session and sequence
+    /// numbers for both sides so subscribed clients (TUI) can locate the
+    /// matching entry in their in-memory transcript list and mark it.
+    /// One event per `markDuplicate`; debounced background pass triggers
+    /// the emission, so events typically arrive ~5s after the original
+    /// `segmentFinalized`.
+    case duplicateMarked(sessionId: UUID, micSequence: Int, sysSequence: Int, method: DedupMethod)
 }
 
 /// Status of the recording engine.

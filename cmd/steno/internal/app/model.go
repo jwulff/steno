@@ -126,6 +126,21 @@ type TranscriptEntry struct {
 	// renderer prefixes the segment text with "Speaker N: " where N is
 	// the per-session first-seen ordinal kept in Model.speakerOrder.
 	SpeakerID string
+
+	// SessionID stamped at receipt time so a late `dedup` event can be
+	// matched on the composite `(SessionID, SeqNum)` key. m.entries is
+	// not cleared on session change (entries from prior sessions stay in
+	// the timeline), and sequenceNumber is unique only within a session
+	// (`UNIQUE(sessionId, sequenceNumber)` per the schema), so a SeqNum-
+	// only match would risk cross-session collisions for the always-on
+	// flow. Boundary markers don't have a session — leave empty.
+	SessionID string
+
+	// Duplicate is set when a `dedup` event marks this entry as a
+	// duplicate of a sys segment. DuplicateOfSeq carries the canonical
+	// sys segment's sequence number for the inline `↪ dup of #N` hint.
+	Duplicate      bool
+	DuplicateOfSeq int
 }
 
 // TopicDisplay holds a topic for display in the topic panel.
@@ -260,6 +275,19 @@ type Model struct {
 	// errors. `e` keybind toggles a modal that lists them with timestamps.
 	errorHistory   []ErrorEntry
 	showErrorModal bool
+
+	// Duplicate-visibility toggle (`d` keybind). false = show marked
+	// entries dim + struck through (default); true = hide them from the
+	// timeline entirely. Per-TUI-session, not persisted across restarts.
+	hideDuplicates bool
+
+	// pendingDedup holds `dedup` events that arrived before their segment.
+	// The daemon broadcasts to subscribers concurrently, so a dedup event
+	// can overtake the segment it refers to. Later dedup passes skip rows
+	// already marked, so a dropped event would never be re-sent. Keyed by
+	// (sessionID, seqNum); value is the sys sequence number. Bounded by
+	// maxPendingDedup.
+	pendingDedup map[dedupKey]int
 
 	// Pause-hint flash (U9): "press p to resume first" shown after a
 	// spacebar press while paused. Set by the key handler, cleared by
@@ -1015,6 +1043,43 @@ func (m *Model) resetSpeakerOrder() {
 	m.speakerOrder = nil
 }
 
+// markEntryDuplicate flags the entry matching (sessionID, seqNum) as a
+// duplicate of dupOfSeq. Silently no-ops if no entry matches — the
+// `dedup` event is late-arrival (~5s after segment) and the entry may
+// have left memory or never arrived (R4 / AE2 in the brainstorm).
+func (m *Model) markEntryDuplicate(sessionID string, seqNum, dupOfSeq int) bool {
+	// Scan newest-first: dedup events refer to segments finalized a few
+	// seconds earlier, and m.entries grows across sessions.
+	for i := len(m.entries) - 1; i >= 0; i-- {
+		if m.entries[i].SessionID == sessionID && m.entries[i].SeqNum == seqNum {
+			m.entries[i].Duplicate = true
+			m.entries[i].DuplicateOfSeq = dupOfSeq
+			return true
+		}
+	}
+	return false
+}
+
+// dedupKey identifies a transcript entry across sessions.
+type dedupKey struct {
+	sessionID string
+	seqNum    int
+}
+
+// maxPendingDedup bounds pendingDedup. Events for segments that never
+// arrive (for example from a session this TUI never saw) would otherwise
+// accumulate forever.
+const maxPendingDedup = 256
+
+// rememberPendingDedup stores a dedup event whose segment has not arrived
+// yet, so the segment handler can apply it on arrival.
+func (m *Model) rememberPendingDedup(sessionID string, seqNum, dupOfSeq int) {
+	if m.pendingDedup == nil || len(m.pendingDedup) >= maxPendingDedup {
+		m.pendingDedup = make(map[dedupKey]int)
+	}
+	m.pendingDedup[dedupKey{sessionID, seqNum}] = dupOfSeq
+}
+
 // handleEvent processes a daemon event and returns any resulting command.
 //
 // Event types (mirrored from EventBroadcaster.swift):
@@ -1047,9 +1112,16 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 			Source:    ev.Source,
 			Timestamp: ts,
 			SpeakerID: ev.SpeakerID,
+			SessionID: ev.SessionID,
 		}
 		if ev.SequenceNumber != nil {
 			entry.SeqNum = *ev.SequenceNumber
+			key := dedupKey{entry.SessionID, entry.SeqNum}
+			if dupOf, ok := m.pendingDedup[key]; ok {
+				entry.Duplicate = true
+				entry.DuplicateOfSeq = dupOf
+				delete(m.pendingDedup, key)
+			}
 		}
 		// If the segment carries a speaker UUID (live diarization path
 		// once the daemon is wired up), fold it into the per-session
@@ -1110,6 +1182,21 @@ func (m *Model) handleEvent(ev daemon.Event) tea.Cmd {
 		// U10's dedicated pause-state event — applyPauseFields handles
 		// the indefinite / finite split and the resume transition.
 		m.applyPauseFields(ev.Paused, ev.PausedIndefinitely, ev.PauseExpiresAt)
+
+	case "dedup":
+		// Late-arrival event (~5s after the matching `segment`) marking
+		// a mic entry as a duplicate of a sys entry. Composite key on
+		// (SessionID, SeqNum) — m.entries persists across session
+		// boundaries, and sequenceNumber is only unique per session.
+		// Silently drop on miss (R4 / AE2): entry may have scrolled off
+		// in a long session, been replaced by a fresh launch, or this
+		// could be an event for a session not represented in memory.
+		if ev.SequenceNumber == nil || ev.DuplicateOfSequence == nil {
+			return nil
+		}
+		if !m.markEntryDuplicate(ev.SessionID, *ev.SequenceNumber, *ev.DuplicateOfSequence) {
+			m.rememberPendingDedup(ev.SessionID, *ev.SequenceNumber, *ev.DuplicateOfSequence)
+		}
 
 	case "model_processing":
 		if ev.ModelProcessing != nil {
@@ -1352,6 +1439,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, reconfigureCmd(m.client, !m.systemAudio)
 
+	case KeyToggleDuplicates:
+		// Toggle visibility of dedup-marked entries. The render loop
+		// `continue`s past marked entries when this is true. Operates
+		// purely on render state — m.entries is not mutated.
+		m.hideDuplicates = !m.hideDuplicates
+		// Hiding rows shrinks the scrollable range; keep the offset in it.
+		m.transcriptScroll = min(m.transcriptScroll, m.maxTranscriptScroll())
+		return m, nil
+
 	case "tab":
 		if m.focusedPanel == FocusTopics {
 			m.focusedPanel = FocusTranscript
@@ -1434,7 +1530,13 @@ func (m *Model) scrollToBottom() {
 }
 
 func (m Model) maxTranscriptScroll() int {
-	totalLines := len(m.entries) + len(m.partials)
+	totalLines := len(m.partials)
+	for _, e := range m.entries {
+		if m.hideDuplicates && e.Duplicate {
+			continue
+		}
+		totalLines++
+	}
 	visible := m.transcriptVisibleLines()
 	if totalLines <= visible {
 		return 0
@@ -2128,6 +2230,12 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 		// flush with segment text.
 		boundaryWidth := max(10, width-2)
 		for _, e := range m.entries {
+			// Hide-mode (d keybind): skip marked entries entirely. The
+			// dim+strike treatment is bypassed; m.entries is unchanged
+			// so re-toggling restores visibility instantly.
+			if m.hideDuplicates && e.Duplicate {
+				continue
+			}
 			// Synthetic session-boundary marker (UI-only, inserted on a
 			// successful DemarcateResponseMsg). Rendered as a horizontal
 			// rule with a timestamp. No source, no sequence number.
@@ -2143,13 +2251,7 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			if marker, ok := m.healMarkers[e.SeqNum]; ok && marker != "" {
 				displayLines = append(displayLines, ui.HealMarkerStyle.Render("  ⚠ "+formatHealMarker(marker)))
 			}
-			ts := ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
-			var src string
-			if e.Source == "systemAudio" {
-				src = ui.SysLabelStyle.Render("[SYS] ")
-			} else {
-				src = ui.MicLabelStyle.Render("[MIC] ")
-			}
+			var ts, src string
 			// Prefix the segment text with "Speaker N: " when the daemon
 			// has assigned this segment to a diarization cluster. The
 			// label is per-session and 1-based by first-seen order; an
@@ -2159,7 +2261,33 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 			if label := m.speakerLabel(e.SpeakerID); label != "" {
 				segText = label + ": " + segText
 			}
+			if e.Duplicate {
+				// Wrap the `↪ dup of #N` hint with the text so a full last
+				// line cannot push it past the panel edge and get cut off.
+				segText += fmt.Sprintf(" ↪ dup of #%d", e.DuplicateOfSeq)
+			}
 			wrapped := wrapText(segText, textWidth)
+			srcLabel := "[MIC] "
+			if e.Source == "systemAudio" {
+				srcLabel = "[SYS] "
+			}
+			if e.Duplicate {
+				// Marked as duplicate of a sys segment — render the row
+				// dim + struck through. The `↪ dup of #N` hint was added
+				// to segText above so it wraps with the text.
+				ts = ui.DuplicateStyle.Render(e.Timestamp.Format("[15:04:05]"))
+				src = ui.DuplicateStyle.Render(srcLabel)
+				for i, wl := range wrapped {
+					wrapped[i] = ui.DuplicateStyle.Render(wl)
+				}
+			} else {
+				ts = ui.TimestampStyle.Render(e.Timestamp.Format("[15:04:05]"))
+				if e.Source == "systemAudio" {
+					src = ui.SysLabelStyle.Render(srcLabel)
+				} else {
+					src = ui.MicLabelStyle.Render(srcLabel)
+				}
+			}
 			displayLines = append(displayLines, ts+" "+src+wrapped[0])
 			for _, wl := range wrapped[1:] {
 				displayLines = append(displayLines, indentStr+wl)
@@ -2193,7 +2321,9 @@ func (m Model) renderTranscriptPanel(width, height int) string {
 				start = len(displayLines) - contentHeight
 			}
 		} else {
-			start = m.transcriptScroll
+			// Clamp: hidden or late-marked duplicates can shrink the list
+			// below a stored offset, which would otherwise render blank.
+			start = min(m.transcriptScroll, max(0, len(displayLines)-contentHeight))
 		}
 		if start < 0 {
 			start = 0
@@ -2243,6 +2373,14 @@ func (m Model) renderFooter() string {
 			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio Off"))
 		} else {
 			parts = append(parts, ui.FooterKeyStyle.Render("a")+ui.FooterDescStyle.Render(" Sys Audio On"))
+		}
+		// Toggle reflects the current mode so the user sees what `d` will
+		// do next. Hint is always present (the toggle works whether or
+		// not duplicates are currently marked).
+		if m.hideDuplicates {
+			parts = append(parts, ui.FooterKeyStyle.Render("d")+ui.FooterDescStyle.Render(" Show dups"))
+		} else {
+			parts = append(parts, ui.FooterKeyStyle.Render("d")+ui.FooterDescStyle.Render(" Hide dups"))
 		}
 		parts = append(parts, ui.FooterKeyStyle.Render("Tab")+ui.FooterDescStyle.Render(" Focus"))
 		parts = append(parts, ui.FooterKeyStyle.Render("j/k")+ui.FooterDescStyle.Render(" Nav"))

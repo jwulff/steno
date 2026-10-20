@@ -11,9 +11,24 @@ public enum DedupMethod: String, Sendable, Codable, Equatable {
     case fuzzy
 }
 
-/// Counts returned by a single `runPass` invocation, useful for logging /
-/// asserting in tests. Internal to the coordinator's API surface — the
-/// engine ignores the value.
+/// A single mic→sys mark performed in a `runPass`. Surfaced through
+/// `DedupOutcome.markedPairs` so the engine can emit a wire `dedup` event
+/// per mark after the pass returns. `sessionId` is implied by the pass.
+public struct MarkedPair: Sendable, Equatable {
+    public let micSequence: Int
+    public let sysSequence: Int
+    public let method: DedupMethod
+
+    public init(micSequence: Int, sysSequence: Int, method: DedupMethod) {
+        self.micSequence = micSequence
+        self.sysSequence = sysSequence
+        self.method = method
+    }
+}
+
+/// Counts and marked-pair detail returned by a single `runPass`
+/// invocation. Counts drive logging/test assertions; `markedPairs` feeds
+/// the engine's per-mark `EngineEvent.duplicateMarked` emission.
 public struct DedupOutcome: Sendable, Equatable {
     /// Number of mic segments inspected this pass (cursor moved over them).
     public let evaluated: Int
@@ -26,12 +41,21 @@ public struct DedupOutcome: Sendable, Equatable {
     /// side had not yet written past their match window (#80). The cursor
     /// stays behind these — they are pending, not rejected.
     public let deferred: Int
+    /// One entry per mark, in mic-sequence order. Empty when `marked == 0`.
+    public let markedPairs: [MarkedPair]
 
-    public init(evaluated: Int, marked: Int, skipped: Int, deferred: Int = 0) {
+    public init(
+        evaluated: Int,
+        marked: Int,
+        skipped: Int,
+        deferred: Int = 0,
+        markedPairs: [MarkedPair] = []
+    ) {
         self.evaluated = evaluated
         self.marked = marked
         self.skipped = skipped
         self.deferred = deferred
+        self.markedPairs = markedPairs
     }
 
     public static let empty = DedupOutcome(evaluated: 0, marked: 0, skipped: 0)
@@ -145,6 +169,11 @@ public actor DedupCoordinator {
         isProcessing[sessionId] = true
         defer { isProcessing[sessionId] = false }
 
+        // Declared outside the do-block so the catch path can still report
+        // marks already written to SQLite. Later passes skip marked rows, so
+        // a mark not reported here would never reach the TUI.
+        var markedPairs: [MarkedPair] = []
+
         do {
             // 1. Load mic segments past the cursor that aren't already marked.
             let micSegments = try await repository.segmentsAfterDedupCursor(
@@ -241,6 +270,11 @@ public actor DedupCoordinator {
                     method: pick.method
                 )
                 marked += 1
+                markedPairs.append(MarkedPair(
+                    micSequence: mic.sequenceNumber,
+                    sysSequence: pick.segment.sequenceNumber,
+                    method: pick.method
+                ))
             }
 
             // 6. Cursor advance — last step. Per-mic-seq, NOT per-pass-max:
@@ -259,7 +293,8 @@ public actor DedupCoordinator {
                 evaluated: marked + skipped,
                 marked: marked,
                 skipped: skipped,
-                deferred: deferred
+                deferred: deferred,
+                markedPairs: markedPairs
             )
             logDedup("Session \(sessionId) — pass complete: \(outcome.evaluated) evaluated, \(outcome.marked) marked, \(outcome.skipped) skipped, \(outcome.deferred) deferred")
             return outcome
@@ -267,7 +302,13 @@ public actor DedupCoordinator {
             // Non-critical: log and surrender. Cursor was not advanced
             // because the UPDATE is the last step in the do-block.
             logDedup("Session \(sessionId) — pass FAILED: \(error) [\(type(of: error))]")
-            return .empty
+            guard !markedPairs.isEmpty else { return .empty }
+            return DedupOutcome(
+                evaluated: markedPairs.count,
+                marked: markedPairs.count,
+                skipped: 0,
+                markedPairs: markedPairs
+            )
         }
     }
 

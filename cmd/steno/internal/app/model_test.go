@@ -127,6 +127,274 @@ func TestSegmentEvent(t *testing.T) {
 	}
 }
 
+func TestSegmentStampsSessionID(t *testing.T) {
+	// SessionID is required to disambiguate dedup events across
+	// session boundaries — m.entries is not cleared on demarcate.
+	m := New()
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "Hello",
+		Source:         "microphone",
+		SessionID:      "session-A",
+		SequenceNumber: &seq,
+	})
+
+	if m.entries[0].SessionID != "session-A" {
+		t.Errorf("SessionID = %q, want session-A", m.entries[0].SessionID)
+	}
+}
+
+func TestDedupEventMarksMatchingEntry(t *testing.T) {
+	// AE1: dedup event arrives → matching entry becomes Duplicate=true
+	// with DuplicateOfSeq set.
+	m := New()
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+
+	if !m.entries[0].Duplicate {
+		t.Error("entry should be marked Duplicate")
+	}
+	if m.entries[0].DuplicateOfSeq != 12 {
+		t.Errorf("DuplicateOfSeq = %d, want 12", m.entries[0].DuplicateOfSeq)
+	}
+}
+
+func TestDedupEventSilentlyDropsOnUnknownSeq(t *testing.T) {
+	// AE2: dedup event for a seqNum not in m.entries is a no-op.
+	m := New()
+	knownSeq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &knownSeq,
+	})
+
+	unknownSeq := 99
+	dupOf := 50
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &unknownSeq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "exact",
+	})
+
+	if m.entries[0].Duplicate {
+		t.Error("existing entry should not be marked when seq doesn't match")
+	}
+}
+
+func TestDedupEventDropsOnWrongSession(t *testing.T) {
+	// Composite-key correctness: a dedup event for sess-2 must not
+	// mark an entry from sess-1 even if SeqNum happens to collide.
+	// SeqNum is only unique per session (UNIQUE(sessionId,seqNum)),
+	// so cross-session collision is the failure mode the composite
+	// key exists to prevent.
+	m := New()
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "old session",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-2",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "exact",
+	})
+
+	if m.entries[0].Duplicate {
+		t.Error("sess-1 entry must not be marked by sess-2 dedup event")
+	}
+}
+
+func TestDuplicateEntryRendersWithSuffix(t *testing.T) {
+	// AE1 visual: marked entry renders with the `↪ dup of #N` suffix.
+	// View output is the easiest place to assert this contractually.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+
+	view := m.View()
+	if !strings.Contains(view, "↪ dup of #12") {
+		t.Errorf("rendered view missing dup suffix:\n%s", view)
+	}
+	if !strings.Contains(view, "hello world") {
+		t.Error("entry text should still appear (dim+strike, not hidden)")
+	}
+}
+
+func TestUnmarkedEntryRendersWithoutSuffix(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	view := m.View()
+	if strings.Contains(view, "↪ dup of") {
+		t.Errorf("unmarked entry should not render dup suffix:\n%s", view)
+	}
+}
+
+func TestToggleDuplicatesKeyHidesAndRestoresMarkedEntries(t *testing.T) {
+	// AE3: with marked entries visible, pressing `d` hides them; pressing
+	// again restores them in dim+strike.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	for i, seq := range []int{1, 2, 3} {
+		s := seq
+		ts := float64(1700000000 + i)
+		m.handleEvent(daemon.Event{
+			Event:          "segment",
+			Text:           "marked entry",
+			Source:         "microphone",
+			SessionID:      "sess-1",
+			SequenceNumber: &s,
+			StartedAt:      &ts,
+		})
+		dupOf := 100 + s
+		m.handleEvent(daemon.Event{
+			Event:               "dedup",
+			SessionID:           "sess-1",
+			SequenceNumber:      &s,
+			DuplicateOfSequence: &dupOf,
+			Method:              "exact",
+		})
+	}
+
+	visibleBefore := m.View()
+	if !strings.Contains(visibleBefore, "marked entry") {
+		t.Fatal("marked entries should be visible by default")
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m2 := updated.(Model)
+	hidden := m2.View()
+	if strings.Contains(hidden, "marked entry") {
+		t.Errorf("entries should be hidden after `d`:\n%s", hidden)
+	}
+	if !strings.Contains(hidden, "d Show dups") {
+		t.Errorf("footer should reflect hide mode:\n%s", hidden)
+	}
+
+	updated2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m3 := updated2.(Model)
+	restored := m3.View()
+	if !strings.Contains(restored, "marked entry") {
+		t.Errorf("entries should be visible after second `d`:\n%s", restored)
+	}
+	if !strings.Contains(restored, "d Hide dups") {
+		t.Errorf("footer should reflect show mode:\n%s", restored)
+	}
+}
+
+func TestToggleDuplicatesPreservesUnmarkedEntries(t *testing.T) {
+	// Hide mode must not affect unmarked entries.
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	markedSeq := 1
+	m.handleEvent(daemon.Event{
+		Event: "segment", Text: "this is marked", Source: "microphone",
+		SessionID: "sess-1", SequenceNumber: &markedSeq,
+	})
+	dupOf := 50
+	m.handleEvent(daemon.Event{
+		Event: "dedup", SessionID: "sess-1",
+		SequenceNumber: &markedSeq, DuplicateOfSequence: &dupOf, Method: "exact",
+	})
+	unmarkedSeq := 2
+	m.handleEvent(daemon.Event{
+		Event: "segment", Text: "this is fresh", Source: "microphone",
+		SessionID: "sess-1", SequenceNumber: &unmarkedSeq,
+	})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	hidden := updated.(Model).View()
+	if strings.Contains(hidden, "this is marked") {
+		t.Errorf("marked entry should be hidden:\n%s", hidden)
+	}
+	if !strings.Contains(hidden, "this is fresh") {
+		t.Errorf("unmarked entry should remain visible:\n%s", hidden)
+	}
+}
+
+func TestDedupEventNoopWhenSequenceNumbersMissing(t *testing.T) {
+	// Defensive: a malformed dedup event with missing SequenceNumber
+	// or DuplicateOfSequence should not panic or scan entries.
+	m := New()
+	seq := 1
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	m.handleEvent(daemon.Event{Event: "dedup", SessionID: "sess-1"})
+
+	if m.entries[0].Duplicate {
+		t.Error("entry must not be marked when seq fields are nil")
+	}
+}
+
 func TestPartialEvent(t *testing.T) {
 	m := New()
 	m.connected = true
@@ -1881,5 +2149,160 @@ func TestTopicSegmentsLoadedFoldsSpeakerOrder(t *testing.T) {
 	}
 	if len(got.speakerOrder) != 2 {
 		t.Errorf("speakerOrder len = %d, want 2 (uuid-x deduped, empty skipped)", len(got.speakerOrder))
+	}
+}
+
+func TestDedupEventBeforeSegmentIsAppliedOnArrival(t *testing.T) {
+	// The daemon broadcasts concurrently, so a dedup event can overtake
+	// its segment. Later passes never re-send it, so the TUI must hold it.
+	m := New()
+	seq := 17
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	if !m.entries[0].Duplicate || m.entries[0].DuplicateOfSeq != 12 {
+		t.Fatalf("entry = %+v, want Duplicate of #12", m.entries[0])
+	}
+	if len(m.pendingDedup) != 0 {
+		t.Fatalf("pendingDedup = %v, want empty after apply", m.pendingDedup)
+	}
+
+	// A pending event for another session must not mark this one.
+	other := 18
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-2",
+		SequenceNumber:      &other,
+		DuplicateOfSequence: &dupOf,
+	})
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "second",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &other,
+	})
+	for _, e := range m.entries {
+		if e.SeqNum == 18 && e.Duplicate {
+			t.Fatal("pending dedup for sess-2 marked a sess-1 entry")
+		}
+	}
+}
+
+func TestPendingDedupIsBounded(t *testing.T) {
+	m := New()
+	dupOf := 1
+	for i := 0; i < maxPendingDedup*3; i++ {
+		seq := i
+		m.handleEvent(daemon.Event{
+			Event:               "dedup",
+			SessionID:           "never-seen",
+			SequenceNumber:      &seq,
+			DuplicateOfSequence: &dupOf,
+		})
+	}
+	if len(m.pendingDedup) > maxPendingDedup {
+		t.Fatalf("pendingDedup grew to %d, cap is %d", len(m.pendingDedup), maxPendingDedup)
+	}
+}
+
+func TestHidingDuplicatesWhileScrolledKeepsTranscriptVisible(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+	m.focusedPanel = FocusTranscript
+
+	dupOf := 999
+	for i := 0; i < 100; i++ {
+		seq := i + 1
+		ts := float64(1700000000 + i)
+		text := fmt.Sprintf("keep-%d", i)
+		if i%2 == 0 {
+			text = fmt.Sprintf("dupe-%d", i)
+		}
+		m.handleEvent(daemon.Event{
+			Event:          "segment",
+			Text:           text,
+			Source:         "microphone",
+			SessionID:      "sess-1",
+			SequenceNumber: &seq,
+			StartedAt:      &ts,
+		})
+		if i%2 == 0 {
+			m.handleEvent(daemon.Event{
+				Event:               "dedup",
+				SessionID:           "sess-1",
+				SequenceNumber:      &seq,
+				DuplicateOfSequence: &dupOf,
+			})
+		}
+	}
+
+	// Scroll up from LIVE, then hide duplicates.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+
+	if m.transcriptScroll > m.maxTranscriptScroll() {
+		t.Fatalf("transcriptScroll = %d exceeds max %d after hiding", m.transcriptScroll, m.maxTranscriptScroll())
+	}
+	view := m.View()
+	if !strings.Contains(view, "keep-") {
+		t.Fatalf("transcript went blank after hiding duplicates while scrolled:\n%s", view)
+	}
+	if strings.Contains(view, "dupe-") {
+		t.Fatal("hidden duplicates still rendered")
+	}
+}
+
+func TestLongDuplicateKeepsSuffixWithinPanelWidth(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           strings.TrimSpace(strings.Repeat("a ", 44)),
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+	})
+
+	panelWidth := m.transcriptPanelWidth()
+	found := false
+	for _, line := range strings.Split(m.renderTranscriptPanel(panelWidth, 20), "\n") {
+		if w := lipgloss.Width(line); w > panelWidth {
+			t.Errorf("line width %d exceeds panel width %d: %q", w, panelWidth, line)
+		}
+		if strings.Contains(line, "dup of #12") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("dup suffix missing from rendered transcript panel")
 	}
 }

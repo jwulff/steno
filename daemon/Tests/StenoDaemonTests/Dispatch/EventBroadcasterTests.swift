@@ -100,6 +100,50 @@ struct EventBroadcasterTests {
         #expect(events[0].recording == true)
     }
 
+    @Test func dedupEventMapped() async throws {
+        let broadcaster = EventBroadcaster()
+        let client = MockClientConnection()
+        await broadcaster.subscribe(client: client, events: [.dedup])
+
+        let sessionId = UUID()
+        let engine = await makeTestEngine()
+        await broadcaster.engine(engine, didEmit: .duplicateMarked(
+            sessionId: sessionId,
+            micSequence: 17,
+            sysSequence: 12,
+            method: .fuzzy
+        ))
+
+        let events = await client.sentEvents
+        #expect(events.count == 1)
+        #expect(events[0].event == "dedup")
+        #expect(events[0].sessionId == sessionId.uuidString)
+        #expect(events[0].sequenceNumber == 17)
+        #expect(events[0].duplicateOfSequence == 12)
+        #expect(events[0].method == "fuzzy")
+    }
+
+    @Test func dedupEventNotDeliveredWithoutSubscription() async throws {
+        // AE4 equivalent: a client subscribed to other events does not
+        // receive `dedup`. The subscription gate (Set<EventType>) is the
+        // canonical filter — adding the new case is invisible to clients
+        // that didn't ask for it.
+        let broadcaster = EventBroadcaster()
+        let client = MockClientConnection()
+        await broadcaster.subscribe(client: client, events: [.segment, .status])
+
+        let engine = await makeTestEngine()
+        await broadcaster.engine(engine, didEmit: .duplicateMarked(
+            sessionId: UUID(),
+            micSequence: 17,
+            sysSequence: 12,
+            method: .exact
+        ))
+
+        let events = await client.sentEvents
+        #expect(events.isEmpty)
+    }
+
     @Test func errorEventMapped() async throws {
         let broadcaster = EventBroadcaster()
         let client = MockClientConnection()

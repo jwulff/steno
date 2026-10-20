@@ -135,6 +135,14 @@ public struct DaemonEvent: Codable, Sendable {
     public var state: String?
     public var reason: String?
 
+    /// `dedup` event payload — the sys segment's sequence number that
+    /// the (mic) `sequenceNumber` is a duplicate of. Paired with `method`
+    /// to identify the match strength.
+    public var duplicateOfSequence: Int?
+    /// `dedup` event payload — match method (`"exact"` / `"normalized"`
+    /// / `"fuzzy"`). Mirrors the SQL `segments.dedup_method` value.
+    public var method: String?
+
     public init(
         event: String,
         text: String? = nil,
@@ -155,7 +163,9 @@ public struct DaemonEvent: Codable, Sendable {
         speakerId: String? = nil,
         component: String? = nil,
         state: String? = nil,
-        reason: String? = nil
+        reason: String? = nil,
+        duplicateOfSequence: Int? = nil,
+        method: String? = nil
     ) {
         self.event = event
         self.text = text
@@ -177,5 +187,7 @@ public struct DaemonEvent: Codable, Sendable {
         self.component = component
         self.state = state
         self.reason = reason
+        self.duplicateOfSequence = duplicateOfSequence
+        self.method = method
     }
 }

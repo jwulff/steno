@@ -137,6 +137,82 @@ struct DedupCoordinatorTests {
         #expect(updatedMic?.dedupMethod == .exact)
     }
 
+    // MARK: - Pass: markedPairs return value (U1)
+
+    @Test func runPassReturnsMarkedPairsForEachMark() async throws {
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t,
+            micText: "hello world", sysText: "hello world",
+            micSeq: 1, sysSeq: 2
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.count == 1)
+        let pair = outcome.markedPairs[0]
+        #expect(pair.micSequence == 1)
+        #expect(pair.sysSequence == 2)
+        #expect(pair.method == .exact)
+    }
+
+    @Test func runPassMarkedPairsEmptyWhenNothingMatched() async throws {
+        // Mic and sys segments exist but are outside the overlap window —
+        // nothing marked, markedPairs is empty (not nil).
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        let mic = StoredSegment(
+            sessionId: session.id,
+            text: "hello world",
+            startedAt: t,
+            endedAt: t.addingTimeInterval(1),
+            sequenceNumber: 1,
+            source: .microphone
+        )
+        let sys = StoredSegment(
+            sessionId: session.id,
+            text: "hello world",
+            startedAt: t.addingTimeInterval(10),
+            endedAt: t.addingTimeInterval(11),
+            sequenceNumber: 2,
+            source: .systemAudio
+        )
+        try await repo.saveSegment(mic)
+        try await repo.saveSegment(sys)
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.isEmpty)
+    }
+
+    @Test func runPassMarkedPairsAccumulateAcrossMultipleMatches() async throws {
+        // Two mic+sys pairs that should both match. Both pairs should
+        // appear in markedPairs in mic-sequence order.
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t,
+            micText: "first utterance",
+            sysText: "first utterance",
+            micSeq: 1, sysSeq: 2
+        )
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(30),
+            micText: "second utterance",
+            sysText: "second utterance",
+            micSeq: 3, sysSeq: 4
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.count == 2)
+        #expect(outcome.markedPairs[0].micSequence == 1)
+        #expect(outcome.markedPairs[0].sysSequence == 2)
+        #expect(outcome.markedPairs[1].micSequence == 3)
+        #expect(outcome.markedPairs[1].sysSequence == 4)
+    }
+
     @Test func happyNormalizedMatchMarksDuplicate() async throws {
         let (coord, repo, session) = try await setup()
         let t = Date()
@@ -331,6 +407,36 @@ struct DedupCoordinatorTests {
     }
 
     // MARK: - Error path
+
+    /// A pass that fails after writing some marks must still report them.
+    /// Later passes skip marked rows, so a mark dropped here would never
+    /// reach the TUI as a `dedup` event.
+    @Test func partialFailureStillReportsMarksAlreadyWritten() async throws {
+        let (coord, repo, session) = try await setup()
+        let t = Date()
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t,
+            micText: "hello world", sysText: "hello world",
+            micSeq: 1, sysSeq: 2
+        )
+        try await savePair(
+            repo: repo, sessionId: session.id, t: t.addingTimeInterval(10),
+            micText: "second phrase here", sysText: "second phrase here",
+            micSeq: 3, sysSeq: 4
+        )
+
+        await repo.setMarkDuplicateError(
+            MockTranscriptRepository.InjectedError("boom"),
+            afterSuccesses: 1
+        )
+
+        let outcome = await coord.runPass(sessionId: session.id)
+
+        #expect(outcome.markedPairs.map(\.micSequence) == [1])
+        #expect(outcome.markedPairs.map(\.sysSequence) == [2])
+        let updated = try await repo.session(session.id)
+        #expect(updated?.lastDedupedSegmentSeq == 0)
+    }
 
     @Test func markDuplicateThrowDoesNotBumpCursor() async throws {
         let (coord, repo, session) = try await setup()
@@ -573,6 +679,60 @@ struct DedupCoordinatorTests {
 
         await engine.stop()
         _ = session
+    }
+
+    /// The engine must turn every mark the debounced pass makes into one
+    /// `.duplicateMarked` delegate event, carrying the mic and sys sequence
+    /// numbers, so the TUI can find and dim the row.
+    @Test func engineEmitsOneDuplicateMarkedEventPerMark() async throws {
+        let repo = MockTranscriptRepository()
+        let af = MockAudioSourceFactory()
+        let rf = MockSpeechRecognizerFactory()
+        let perms = await MainActor.run { MockPermissionService() }
+        let delegate = MockRecordingEngineDelegate()
+        let summaryCoordinator = RollingSummaryCoordinator(
+            repository: repo,
+            summarizer: MockSummarizationService(),
+            triggerCount: 1000,
+            timeThreshold: 3600
+        )
+        let engine = RecordingEngine(
+            repository: repo,
+            permissionService: perms,
+            summaryCoordinator: summaryCoordinator,
+            audioSourceFactory: af,
+            speechRecognizerFactory: rf,
+            delegate: delegate,
+            dedupCoordinator: DedupCoordinator(repository: repo),
+            dedupTriggerDebounce: .milliseconds(100)
+        )
+        rf.handle.resultsToYield = (0..<3).map { _ in
+            RecognizerResult(text: "hello world", isFinal: true, confidence: 0.95, source: .microphone)
+        }
+
+        let session = try await engine.start()
+        try await repo.saveSegment(StoredSegment(
+            sessionId: session.id,
+            text: "hello world",
+            startedAt: Date(),
+            endedAt: Date().addingTimeInterval(1),
+            sequenceNumber: 1000,
+            source: .systemAudio
+        ))
+        try await Task.sleep(for: .milliseconds(800))
+
+        // Read before stop(): closing a session this short prunes it.
+        let marked = try await repo.segments(for: session.id)
+            .filter { $0.source == .microphone && $0.duplicateOf != nil }
+        await engine.stop()
+        let emitted: [(UUID, Int, Int)] = await delegate.events.compactMap {
+            if case .duplicateMarked(let sid, let mic, let sys, _) = $0 { return (sid, mic, sys) }
+            return nil
+        }
+        #expect(!marked.isEmpty)
+        #expect(emitted.count == marked.count)
+        #expect(Set(emitted.map(\.1)) == Set(marked.map(\.sequenceNumber)))
+        #expect(emitted.allSatisfy { $0.0 == session.id && $0.2 == 1000 })
     }
 
     // MARK: - linearPeakToDbFS conversion
