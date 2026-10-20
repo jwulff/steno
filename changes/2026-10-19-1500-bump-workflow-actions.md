@@ -9,15 +9,20 @@ covering both workflows replaces all three (#120).
 
 ## How
 
-- `actions/setup-go` v5 → v6 in `test.yml` and `release.yml`.
+- `actions/setup-go` v5 → v7 in `test.yml` and `release.yml`.
 - `actions/upload-artifact` v6 → v7 in `release.yml`.
 - `softprops/action-gh-release` v2 → v3 in `release.yml`.
 
-No inputs changed. These majors move the actions to the Node 24 runtime, which
-GitHub-hosted `macos-15` runners support.
+Dependabot proposed `setup-go` v6, but v7 shipped on 2026-07-16 with unchanged inputs, so
+this goes straight to v7 instead of landing a major that is already behind. No inputs
+changed. These majors move the actions to the Node 24 runtime, which GitHub-hosted
+`macos-15` runners support.
 
 ## Validation
 
-- CI on this PR exercises `setup-go@v6` through `test.yml`.
-- `release.yml` runs only on tags, so the upload and release steps are exercised on
-  the next tagged release.
+- `actionlint` parse check and a Codex preflight review of both workflow files.
+- CI does not exercise these steps on this PR. `test.yml` gates Setup Go, Build and
+  Run tests on a Swift version check that fails on the runner (Swift 6.0 installed,
+  6.2 required), so those steps are skipped; that gap is tracked separately.
+- `release.yml` runs only on tags, so all three bumps are first exercised on the next
+  tagged release.
