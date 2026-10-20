@@ -2151,3 +2151,158 @@ func TestTopicSegmentsLoadedFoldsSpeakerOrder(t *testing.T) {
 		t.Errorf("speakerOrder len = %d, want 2 (uuid-x deduped, empty skipped)", len(got.speakerOrder))
 	}
 }
+
+func TestDedupEventBeforeSegmentIsAppliedOnArrival(t *testing.T) {
+	// The daemon broadcasts concurrently, so a dedup event can overtake
+	// its segment. Later passes never re-send it, so the TUI must hold it.
+	m := New()
+	seq := 17
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+		Method:              "fuzzy",
+	})
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "hello world",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+
+	if !m.entries[0].Duplicate || m.entries[0].DuplicateOfSeq != 12 {
+		t.Fatalf("entry = %+v, want Duplicate of #12", m.entries[0])
+	}
+	if len(m.pendingDedup) != 0 {
+		t.Fatalf("pendingDedup = %v, want empty after apply", m.pendingDedup)
+	}
+
+	// A pending event for another session must not mark this one.
+	other := 18
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-2",
+		SequenceNumber:      &other,
+		DuplicateOfSequence: &dupOf,
+	})
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           "second",
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &other,
+	})
+	for _, e := range m.entries {
+		if e.SeqNum == 18 && e.Duplicate {
+			t.Fatal("pending dedup for sess-2 marked a sess-1 entry")
+		}
+	}
+}
+
+func TestPendingDedupIsBounded(t *testing.T) {
+	m := New()
+	dupOf := 1
+	for i := 0; i < maxPendingDedup*3; i++ {
+		seq := i
+		m.handleEvent(daemon.Event{
+			Event:               "dedup",
+			SessionID:           "never-seen",
+			SequenceNumber:      &seq,
+			DuplicateOfSequence: &dupOf,
+		})
+	}
+	if len(m.pendingDedup) > maxPendingDedup {
+		t.Fatalf("pendingDedup grew to %d, cap is %d", len(m.pendingDedup), maxPendingDedup)
+	}
+}
+
+func TestHidingDuplicatesWhileScrolledKeepsTranscriptVisible(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+	m.focusedPanel = FocusTranscript
+
+	dupOf := 999
+	for i := 0; i < 100; i++ {
+		seq := i + 1
+		ts := float64(1700000000 + i)
+		text := fmt.Sprintf("keep-%d", i)
+		if i%2 == 0 {
+			text = fmt.Sprintf("dupe-%d", i)
+		}
+		m.handleEvent(daemon.Event{
+			Event:          "segment",
+			Text:           text,
+			Source:         "microphone",
+			SessionID:      "sess-1",
+			SequenceNumber: &seq,
+			StartedAt:      &ts,
+		})
+		if i%2 == 0 {
+			m.handleEvent(daemon.Event{
+				Event:               "dedup",
+				SessionID:           "sess-1",
+				SequenceNumber:      &seq,
+				DuplicateOfSequence: &dupOf,
+			})
+		}
+	}
+
+	// Scroll up from LIVE, then hide duplicates.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+
+	if m.transcriptScroll > m.maxTranscriptScroll() {
+		t.Fatalf("transcriptScroll = %d exceeds max %d after hiding", m.transcriptScroll, m.maxTranscriptScroll())
+	}
+	view := m.View()
+	if !strings.Contains(view, "keep-") {
+		t.Fatalf("transcript went blank after hiding duplicates while scrolled:\n%s", view)
+	}
+	if strings.Contains(view, "dupe-") {
+		t.Fatal("hidden duplicates still rendered")
+	}
+}
+
+func TestLongDuplicateKeepsSuffixWithinPanelWidth(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.width = 100
+	m.height = 24
+
+	seq := 17
+	m.handleEvent(daemon.Event{
+		Event:          "segment",
+		Text:           strings.TrimSpace(strings.Repeat("a ", 44)),
+		Source:         "microphone",
+		SessionID:      "sess-1",
+		SequenceNumber: &seq,
+	})
+	dupOf := 12
+	m.handleEvent(daemon.Event{
+		Event:               "dedup",
+		SessionID:           "sess-1",
+		SequenceNumber:      &seq,
+		DuplicateOfSequence: &dupOf,
+	})
+
+	panelWidth := m.transcriptPanelWidth()
+	found := false
+	for _, line := range strings.Split(m.renderTranscriptPanel(panelWidth, 20), "\n") {
+		if w := lipgloss.Width(line); w > panelWidth {
+			t.Errorf("line width %d exceeds panel width %d: %q", w, panelWidth, line)
+		}
+		if strings.Contains(line, "dup of #12") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("dup suffix missing from rendered transcript panel")
+	}
+}
