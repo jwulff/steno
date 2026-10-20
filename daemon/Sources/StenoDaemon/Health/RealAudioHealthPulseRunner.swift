@@ -180,25 +180,37 @@ public struct RealAudioHealthPulseRunner: HealthPulseRunning {
         }.joined(separator: " ")
     }
 
+    /// How well `expected` appears somewhere inside `observed`, from 0 to 1.
+    ///
+    /// `observed` is every segment persisted during the pulse window, so it
+    /// usually holds other speech too: people talking, a video playing. The
+    /// score is therefore the edit distance from `expected` to its
+    /// best-matching span of `observed`, normalised by the expected length.
+    /// Comparing against the whole window would let surrounding speech drag
+    /// a perfect hit below threshold and trigger a needless capture restart.
     static func similarity(expected: String, observed: String) -> Double {
         let lhs = normalize(expected)
         let rhs = normalize(observed)
         guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
         if rhs.contains(lhs) { return 1 }
-        let distance = levenshtein(lhs, rhs)
-        return max(0, 1 - (Double(distance) / Double(max(lhs.count, rhs.count))))
+        let distance = bestSpanDistance(pattern: lhs, text: rhs)
+        return max(0, 1 - (Double(distance) / Double(lhs.count)))
     }
 
     private static func normalize(_ text: String) -> String {
         text.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 
-    private static func levenshtein(_ lhs: String, _ rhs: String) -> Int {
-        let a = Array(lhs)
-        let b = Array(rhs)
-        if a.isEmpty { return b.count }
+    /// Minimum edit distance between `pattern` and any substring of `text`
+    /// (semi-global alignment). The first row is all zeros so the match may
+    /// start anywhere in `text`, and the answer is the minimum of the last
+    /// row so it may end anywhere.
+    private static func bestSpanDistance(pattern: String, text: String) -> Int {
+        let a = Array(pattern)
+        let b = Array(text)
+        if a.isEmpty { return 0 }
         if b.isEmpty { return a.count }
-        var previous = Array(0...b.count)
+        var previous = Array(repeating: 0, count: b.count + 1)
         for (i, ac) in a.enumerated() {
             var current = [i + 1] + Array(repeating: 0, count: b.count)
             for (j, bc) in b.enumerated() {
@@ -210,6 +222,6 @@ public struct RealAudioHealthPulseRunner: HealthPulseRunning {
             }
             previous = current
         }
-        return previous[b.count]
+        return previous.min() ?? a.count
     }
 }

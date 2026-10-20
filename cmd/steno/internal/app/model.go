@@ -772,7 +772,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// U10: status response carries pause-state on every status fetch
 		// so a freshly-connected TUI sees the truth immediately.
 		m.applyPauseFields(r.Paused, r.PausedIndefinitely, r.PauseExpiresAt)
-		if !m.healthPulseTriggered && m.recording && m.sessionID != "" && m.client != nil {
+		// Only pulse on attach when the daemon's automatic-pulse opt-in is
+		// on. A pulse speaks out loud and, on failure, restarts the
+		// recording daemon, so it must not fire on every TUI launch by
+		// default. `h` still runs one on demand.
+		automatic := r.HealthPulseAutomatic != nil && *r.HealthPulseAutomatic
+		if automatic && !m.healthPulseTriggered && m.recording && m.sessionID != "" && m.client != nil {
 			m.healthPulseTriggered = true
 			m.healthPulseRetryPending = false
 			m.healthPulseRestartAttempts = 0
@@ -1466,6 +1471,12 @@ func (m *Model) applyHealthPulseResult(ok bool, message string) tea.Cmd {
 
 func shouldRestartForHealthPulse(resp daemon.Response, allowDaemonRestart bool, attempts int) bool {
 	if !allowDaemonRestart || attempts >= 1 {
+		return false
+	}
+	// cannotRun means the pulse never started (permissions not granted, TTS
+	// unavailable). Restarting the daemon cannot fix that and would only
+	// interrupt the recording.
+	if resp.HealthPulseState == "cannotRun" {
 		return false
 	}
 	if resp.HealthPulseOK != nil {

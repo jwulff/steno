@@ -5,6 +5,7 @@ public actor CommandDispatcher {
     private let engine: RecordingEngine
     private let broadcaster: EventBroadcaster
     private let healthPulseCoordinator: HealthPulseCoordinator?
+    private let healthPulseAutomaticEnabled: Bool
 
     /// Default auto-resume window for `pause` commands that omit both
     /// `autoResumeSeconds` and `indefinite`. 30 minutes matches the
@@ -15,11 +16,13 @@ public actor CommandDispatcher {
     public init(
         engine: RecordingEngine,
         broadcaster: EventBroadcaster,
-        healthPulseCoordinator: HealthPulseCoordinator? = nil
+        healthPulseCoordinator: HealthPulseCoordinator? = nil,
+        healthPulseAutomaticEnabled: Bool = false
     ) {
         self.engine = engine
         self.broadcaster = broadcaster
         self.healthPulseCoordinator = healthPulseCoordinator
+        self.healthPulseAutomaticEnabled = healthPulseAutomaticEnabled
     }
 
     /// Handle a command from a client and send a response.
@@ -183,7 +186,8 @@ public actor CommandDispatcher {
             systemAudio: systemAudio,
             paused: pause.paused,
             pausedIndefinitely: pause.indefinite,
-            pauseExpiresAt: pause.expiresAt?.timeIntervalSince1970
+            pauseExpiresAt: pause.expiresAt?.timeIntervalSince1970,
+            healthPulseAutomatic: healthPulseAutomaticEnabled
         )
     }
 

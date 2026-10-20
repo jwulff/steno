@@ -99,6 +99,47 @@ struct HealthPulseTests {
         #expect(score >= 0.82)
     }
 
+    @Test func realAudioSimilarityFindsTokenInsideSurroundingSpeech() {
+        // The runner scores everything persisted during the pulse window, so
+        // other speech around the token must not drag a clear hit below
+        // threshold.
+        let score = RealAudioHealthPulseRunner.similarity(
+            expected: "Steno health pulse token amber bravo cedar delta",
+            observed: "so anyway the budget review moved to Thursday stino health polls token amber bravo cedar deltas and then we can grab lunch after"
+        )
+
+        #expect(score >= 0.82)
+    }
+
+    @Test func realAudioSimilarityRejectsUnrelatedSpeech() {
+        let score = RealAudioHealthPulseRunner.similarity(
+            expected: "Steno health pulse token amber bravo cedar delta",
+            observed: "so anyway the budget review moved to Thursday and then we can grab lunch after the standup if everyone is free"
+        )
+
+        #expect(score < 0.82)
+    }
+
+    @Test func coordinatorJoinsInFlightPulseInsteadOfStartingAnother() async {
+        let runner = SlowCountingHealthPulseRunner()
+        let coordinator = HealthPulseCoordinator(
+            runner: runner,
+            recoverer: RecordingHealthPulseRecoverer(),
+            logger: { _ in }
+        )
+
+        let first = Task { await coordinator.run(trigger: .startup) }
+        while await runner.runs == 0 {
+            await Task.yield()
+        }
+        let second = await coordinator.run(trigger: .manual)
+        let firstReport = await first.value
+
+        #expect(await runner.runs == 1)
+        #expect(second == firstReport)
+        #expect(second.trigger == .startup)
+    }
+
     @Test @MainActor func realAudioRunnerRequiresEveryConfiguredSource() async throws {
         let repo = MockTranscriptRepository()
         let permissions = MockPermissionService()
@@ -195,6 +236,23 @@ private actor ScriptedHealthPulseRunner: HealthPulseRunning {
             return HealthPulseRunResult(state: .failed, expectedText: "token", threshold: 0.82, message: "no scripted result")
         }
         return results.removeFirst()
+    }
+}
+
+private actor SlowCountingHealthPulseRunner: HealthPulseRunning {
+    private(set) var runs = 0
+
+    func run(trigger: HealthPulseTrigger) async -> HealthPulseRunResult {
+        runs += 1
+        try? await Task.sleep(for: .milliseconds(200))
+        return HealthPulseRunResult(
+            state: .passed,
+            expectedText: "token",
+            observedText: "token",
+            similarity: 1,
+            threshold: 0.82,
+            message: "passed"
+        )
     }
 }
 

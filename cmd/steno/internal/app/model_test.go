@@ -2145,10 +2145,11 @@ func TestStatusResponseAutoTriggersHealthPulseForRunningSession(t *testing.T) {
 	defer cleanup()
 
 	updated, cmd := m.Update(StatusResponseMsg{Response: daemon.Response{
-		OK:        true,
-		SessionID: "session-a",
-		Recording: daemon.BoolPtr(true),
-		Status:    "recording",
+		OK:                   true,
+		SessionID:            "session-a",
+		Recording:            daemon.BoolPtr(true),
+		Status:               "recording",
+		HealthPulseAutomatic: daemon.BoolPtr(true),
 	}})
 	if cmd == nil {
 		t.Fatal("expected status response to trigger health pulse command")
@@ -2178,10 +2179,11 @@ func TestStatusResponseHealthPulseAutoTriggerIsOneShot(t *testing.T) {
 	defer cleanup()
 
 	updated, cmd := m.Update(StatusResponseMsg{Response: daemon.Response{
-		OK:        true,
-		SessionID: "session-a",
-		Recording: daemon.BoolPtr(true),
-		Status:    "recording",
+		OK:                   true,
+		SessionID:            "session-a",
+		Recording:            daemon.BoolPtr(true),
+		Status:               "recording",
+		HealthPulseAutomatic: daemon.BoolPtr(true),
 	}})
 	if cmd == nil {
 		t.Fatal("expected first status response to trigger health pulse command")
@@ -2189,13 +2191,47 @@ func TestStatusResponseHealthPulseAutoTriggerIsOneShot(t *testing.T) {
 	got := updated.(Model)
 
 	_, cmd = got.Update(StatusResponseMsg{Response: daemon.Response{
-		OK:        true,
-		SessionID: "session-a",
-		Recording: daemon.BoolPtr(true),
-		Status:    "recording",
+		OK:                   true,
+		SessionID:            "session-a",
+		Recording:            daemon.BoolPtr(true),
+		Status:               "recording",
+		HealthPulseAutomatic: daemon.BoolPtr(true),
 	}})
 	if cmd != nil {
 		t.Fatal("second status response triggered another health pulse command")
+	}
+}
+
+func TestStatusResponseSkipsHealthPulseWithoutAutomaticOptIn(t *testing.T) {
+	m, _, cleanup := modelWithCommandCapture(t, `{"ok":true,"healthPulseOk":true}`+"\n")
+	defer cleanup()
+
+	// The daemon's automatic-pulse setting is off by default because a pulse
+	// speaks out loud. A status response without the opt-in (or with it
+	// false) must not start one on attach.
+	for _, automatic := range []*bool{nil, daemon.BoolPtr(false)} {
+		updated, cmd := m.Update(StatusResponseMsg{Response: daemon.Response{
+			OK:                   true,
+			SessionID:            "session-a",
+			Recording:            daemon.BoolPtr(true),
+			Status:               "recording",
+			HealthPulseAutomatic: automatic,
+		}})
+		if cmd != nil {
+			t.Fatalf("automatic=%v: status response triggered a health pulse", automatic)
+		}
+		if updated.(Model).healthPulseTriggered {
+			t.Fatalf("automatic=%v: healthPulseTriggered = true, want false", automatic)
+		}
+	}
+}
+
+func TestHealthPulseCannotRunDoesNotRestartDaemon(t *testing.T) {
+	ok := false
+	resp := daemon.Response{OK: false, HealthPulseOK: &ok, HealthPulseState: "cannotRun"}
+
+	if shouldRestartForHealthPulse(resp, true, 0) {
+		t.Fatal("a pulse that could not run must not restart the daemon")
 	}
 }
 

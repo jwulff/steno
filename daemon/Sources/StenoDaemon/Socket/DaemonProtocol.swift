@@ -71,6 +71,11 @@ public struct DaemonResponse: Codable, Sendable {
     public var healthPulseObserved: String?
     public var healthPulseSimilarity: Double?
     public var healthPulseThreshold: Double?
+    /// Whether the daemon runs automatic health pulses (the
+    /// `healthPulseAutomaticEnabled` setting). Carried on `status` so the TUI
+    /// can honour the same opt-in before pulsing on attach, since a pulse
+    /// speaks out loud.
+    public var healthPulseAutomatic: Bool?
 
     public init(
         ok: Bool,
@@ -91,7 +96,8 @@ public struct DaemonResponse: Codable, Sendable {
         healthPulseExpected: String? = nil,
         healthPulseObserved: String? = nil,
         healthPulseSimilarity: Double? = nil,
-        healthPulseThreshold: Double? = nil
+        healthPulseThreshold: Double? = nil,
+        healthPulseAutomatic: Bool? = nil
     ) {
         self.ok = ok
         self.sessionId = sessionId
@@ -112,6 +118,7 @@ public struct DaemonResponse: Codable, Sendable {
         self.healthPulseObserved = healthPulseObserved
         self.healthPulseSimilarity = healthPulseSimilarity
         self.healthPulseThreshold = healthPulseThreshold
+        self.healthPulseAutomatic = healthPulseAutomatic
     }
 
     /// Convenience: success response.

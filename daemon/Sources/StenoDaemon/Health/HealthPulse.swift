@@ -132,7 +132,10 @@ public actor HealthPulseCoordinator {
     private let debounce: Duration
     private let logger: @Sendable (String) -> Void
     private var scheduled: Task<Void, Never>?
-    private var running = false
+    /// The pulse currently in progress, if any. Concurrent callers (a manual
+    /// `health_pulse` command racing a debounced automatic trigger) join this
+    /// task instead of speaking a second token over the first one.
+    private var inFlight: Task<HealthPulseReport, Never>?
     private var lastReport: HealthPulseReport?
 
     public init(
@@ -168,14 +171,26 @@ public actor HealthPulseCoordinator {
         }
     }
 
+    /// Run one pulse plus the escalation ladder. If a pulse is already in
+    /// progress, wait for it and return its report rather than starting a
+    /// second, overlapping one. The actor is reentrant across the awaits
+    /// below, so a plain "running" flag would let two first-time callers
+    /// both start a pulse.
     @discardableResult
     public func run(trigger: HealthPulseTrigger) async -> HealthPulseReport {
-        if running, let lastReport {
-            return lastReport
+        if let inFlight {
+            return await inFlight.value
         }
-        running = true
-        defer { running = false }
+        let task = Task { await self.performRun(trigger: trigger) }
+        inFlight = task
+        let report = await task.value
+        if inFlight == task {
+            inFlight = nil
+        }
+        return report
+    }
 
+    private func performRun(trigger: HealthPulseTrigger) async -> HealthPulseReport {
         let started = now()
         var recoveryAttempts: [HealthPulseRecoveryAttempt] = []
         var result = await runner.run(trigger: trigger)

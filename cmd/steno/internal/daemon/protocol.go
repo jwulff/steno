@@ -62,6 +62,10 @@ type Response struct {
 	HealthPulseObserved   string   `json:"healthPulseObserved,omitempty"`
 	HealthPulseSimilarity *float64 `json:"healthPulseSimilarity,omitempty"`
 	HealthPulseThreshold  *float64 `json:"healthPulseThreshold,omitempty"`
+	// HealthPulseAutomatic mirrors the daemon's healthPulseAutomaticEnabled
+	// setting on status responses. The TUI only pulses on attach when it is
+	// true, because a pulse speaks out loud through the default output.
+	HealthPulseAutomatic *bool `json:"healthPulseAutomatic,omitempty"`
 }
 
 // Event is streamed from the daemon to subscribed clients.

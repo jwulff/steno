@@ -156,7 +156,8 @@ struct RunCommand: ParsableCommand {
                 let dispatcher = CommandDispatcher(
                     engine: engine,
                     broadcaster: broadcaster,
-                    healthPulseCoordinator: healthPulseCoordinator
+                    healthPulseCoordinator: healthPulseCoordinator,
+                    healthPulseAutomaticEnabled: settings.healthPulseAutomaticEnabled
                 )
 
                 // U6: register IOKit power observer BEFORE auto-start so

@@ -255,6 +255,25 @@ struct CommandDispatcherTests {
         #expect(responses[0].error?.contains("Unknown command") == true)
     }
 
+    @Test @MainActor func statusReportsHealthPulseAutomaticSetting() async throws {
+        let (_, engine, broadcaster) = makeDispatcher()
+
+        for enabled in [false, true] {
+            let dispatcher = CommandDispatcher(
+                engine: engine,
+                broadcaster: broadcaster,
+                healthPulseAutomaticEnabled: enabled
+            )
+            let client = MockClientConnection()
+
+            await dispatcher.handle(DaemonCommand(cmd: "status"), from: client)
+
+            let responses = await client.sentResponses
+            #expect(responses.count == 1)
+            #expect(responses[0].healthPulseAutomatic == enabled)
+        }
+    }
+
     @Test @MainActor func healthPulseCommandReturnsStructuredReport() async throws {
         let (_, engine, broadcaster) = makeDispatcher()
         let runner = DispatcherScriptedHealthPulseRunner(result: HealthPulseRunResult(
