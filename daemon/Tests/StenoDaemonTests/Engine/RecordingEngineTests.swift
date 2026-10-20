@@ -539,4 +539,27 @@ struct AudioBacklogSheddingTests {
         let decoded = try JSONDecoder().decode(StenoSettings.self, from: Data(json.utf8))
         #expect(decoded.audioBacklogCapSeconds == 0, "shedding must be opt-in")
     }
+
+    // #113 review fix: `reArmIdleOnWake` defaults to `false`. A plain
+    // `stop()` and a privacy-motivated `stop()` are the same wire
+    // command, so silently resuming capture on the next wake must be an
+    // opt-in, not the out-of-the-box behavior.
+    @Test func reArmIdleOnWakeDefaultsToFalse() async throws {
+        #expect(StenoSettings().reArmIdleOnWake == false)
+    }
+
+    @Test func reArmIdleOnWakeMissingFromAnOlderSettingsFileDefaultsToFalse() async throws {
+        // A settings.json written before #111/#113 shipped has no
+        // `reArmIdleOnWake` key at all. Decoding it must not silently
+        // opt an existing install into wake-triggered auto-resume.
+        let json = """
+        {"summarizationProvider":"local","anthropicModel":"m","lastSystemAudioEnabled":false,
+         "healGapSeconds":30,"dedupOverlapSeconds":3,"dedupScoreThreshold":0.92,
+         "dedupMicPeakThresholdDb":-25,"dedupTriggerDebounceSeconds":5,
+         "emptySessionMinChars":20,"emptySessionMinDurationSeconds":3,
+         "topicExtractionMinSegments":3,"retentionDays":0}
+        """
+        let decoded = try JSONDecoder().decode(StenoSettings.self, from: Data(json.utf8))
+        #expect(decoded.reArmIdleOnWake == false, "wake auto-resume must be opt-in")
+    }
 }

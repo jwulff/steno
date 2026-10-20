@@ -177,7 +177,21 @@ actor MockTranscriptRepository: TranscriptRepository {
         sessions.values.sorted { $0.startedAt > $1.startedAt }
     }
 
+    /// One-shot hook awaited at the top of the next
+    /// `mostRecentlyModifiedSession()` call, then cleared. Lets a test park
+    /// the engine inside its pause-anchor read and act on the engine while
+    /// it is suspended there (actor reentrancy).
+    private var mostRecentlyModifiedSessionGate: (@Sendable () async -> Void)?
+
+    func setMostRecentlyModifiedSessionGate(_ gate: (@Sendable () async -> Void)?) {
+        mostRecentlyModifiedSessionGate = gate
+    }
+
     func mostRecentlyModifiedSession() async throws -> Session? {
+        if let gate = mostRecentlyModifiedSessionGate {
+            mostRecentlyModifiedSessionGate = nil
+            await gate()
+        }
         if let error = mostRecentlyModifiedSessionError { throw error }
         // ORDER BY COALESCE(endedAt, startedAt) DESC.
         return sessions.values.sorted { lhs, rhs in

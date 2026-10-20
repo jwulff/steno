@@ -95,7 +95,8 @@ public struct Summary: Sendable, Equatable {
 /// Overall health of the daemon process, as the app sees it. Combines socket
 /// reachability, engine status, and whether the process is actually running.
 public enum DaemonHealth: String, Sendable {
-    case healthy        // connected, engine recording/idle
+    case healthy        // connected, engine recording
+    case notCapturing   // connected and idle: capture off, nobody asked (#111)
     case paused         // connected, intentionally paused
     case recovering     // engine restarting its pipeline
     case error          // engine reported an error (often missing permission)
@@ -109,7 +110,7 @@ public enum DaemonHealth: String, Sendable {
     public var severity: Severity {
         switch self {
         case .healthy: return .ok
-        case .paused, .recovering, .connecting, .restarting: return .warn
+        case .paused, .recovering, .connecting, .restarting, .notCapturing: return .warn
         case .error, .unreachable, .stopped: return .bad
         }
     }
@@ -117,6 +118,7 @@ public enum DaemonHealth: String, Sendable {
     public var title: String {
         switch self {
         case .healthy: return "Engine healthy"
+        case .notCapturing: return "Not capturing"
         case .paused: return "Engine paused"
         case .recovering: return "Engine recovering"
         case .error: return "Engine error"
@@ -130,6 +132,7 @@ public enum DaemonHealth: String, Sendable {
     public var symbol: String {
         switch self {
         case .healthy: return "bolt.heart.fill"
+        case .notCapturing: return "mic.slash.fill"
         case .paused: return "pause.circle.fill"
         case .recovering, .connecting: return "arrow.triangle.2.circlepath"
         case .error: return "exclamationmark.triangle.fill"

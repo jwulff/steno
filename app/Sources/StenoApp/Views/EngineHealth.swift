@@ -37,6 +37,7 @@ struct EngineHealthChip: View {
     private func shortTitle(_ h: DaemonHealth) -> String {
         switch h {
         case .healthy: return "Healthy"
+        case .notCapturing: return "Not capturing"
         case .paused: return "Paused"
         case .recovering: return "Recovering"
         case .error: return "Error"

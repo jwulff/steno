@@ -120,6 +120,7 @@ struct RunCommand: ParsableCommand {
                     emptySessionMinChars: settings.emptySessionMinChars,
                     emptySessionMinDurationSeconds: settings.emptySessionMinDurationSeconds,
                     retentionDays: settings.retentionDays,
+                    reArmIdleOnWake: settings.reArmIdleOnWake,
                     // #62: real Layer-A availability gate (hardware + ASR asset).
                     // Tests default to the permissive `ReadyTranscriptionModelGate`.
                     transcriptionGate: DefaultTranscriptionModelGate(),

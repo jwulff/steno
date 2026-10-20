@@ -97,7 +97,12 @@ public final class AppModel {
     ) -> DaemonHealth {
         if restarting { return .restarting }
         switch status {
-        case .recording, .idle, .starting: return .healthy
+        case .recording, .starting: return .healthy
+        // #111: always-on recording has no user-facing stop and the
+        // engine never leaves `.idle` on its own, so idle means capture
+        // is off and nobody asked for it. `.paused` covers the
+        // deliberate case and is handled below.
+        case .idle: return .notCapturing
         case .paused: return .paused
         case .recovering, .stopping: return .recovering
         case .error: return .error

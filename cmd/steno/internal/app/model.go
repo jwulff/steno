@@ -1716,9 +1716,23 @@ func (m Model) statusLabel() (label string, recordingish bool) {
 	case StatusStopping:
 		return ui.IdleDotStyle.Render("◌ STOPPING"), false
 
-	case StatusIdle, StatusUnknown:
+	case StatusIdle:
 		// Legacy `recording: bool` may still be the only signal we have
 		// from a daemon that hasn't been re-built against U9's wire.
+		if m.recording {
+			return ui.RecordingDotStyle.Render("● REC"), true
+		}
+		// #111: always-on recording (#32) has no user-facing stop, and the
+		// engine never leaves `.idle` on its own, so `idle` means capture
+		// is off and nobody asked for it. Rendering it with the same
+		// neutral dot as STARTING / STOPPING is what let a stopped daemon
+		// sit unnoticed. PAUSED is the state that legitimately means "not
+		// capturing, on purpose", and it is handled above.
+		return ui.RecoveringStyle.Render("⚠ NOT CAPTURING — daemon idle"), false
+
+	case StatusUnknown:
+		// Unknown is not idle: we have no evidence capture is off, so it
+		// must not borrow the warning above.
 		if m.recording {
 			return ui.RecordingDotStyle.Render("● REC"), true
 		}

@@ -238,3 +238,59 @@ func TestStatusBarTranscriptionPreparingBeatsDiarizationHint(t *testing.T) {
 		t.Errorf("status bar should not show diarization hint while transcription is preparing: %q", bar)
 	}
 }
+
+// --- #111 idle visibility --------------------------------------------------
+
+// `idle` on an always-on daemon means capture is off and nobody asked for
+// it. Rendering it with the same neutral dot as STARTING / STOPPING is what
+// let a stopped daemon sit unnoticed. `PAUSED` is the state that
+// legitimately means "not capturing, on purpose" and has its own label.
+func TestStatusLabelIdleReadsAsNotCapturing(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusIdle
+
+	label, recordingish := m.statusLabel()
+	if recordingish {
+		t.Errorf("idle must not be recordingish, got true (label %q)", label)
+	}
+	if !strings.Contains(label, "NOT CAPTURING") {
+		t.Errorf("idle should read as not-capturing, got %q", label)
+	}
+	if strings.Contains(label, "○ IDLE") {
+		t.Errorf("idle should no longer render as a neutral dot, got %q", label)
+	}
+}
+
+// The legacy `recording: bool` still wins: a daemon too old to send U9's
+// engine status but reporting recording=true is capturing, not idle.
+func TestStatusLabelIdleWithLegacyRecordingFlagStillReadsRec(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusIdle
+	m.recording = true
+
+	label, recordingish := m.statusLabel()
+	if !recordingish {
+		t.Errorf("legacy recording=true must stay recordingish, got false (label %q)", label)
+	}
+	if !strings.Contains(label, "REC") {
+		t.Errorf("legacy recording=true should render REC, got %q", label)
+	}
+}
+
+// `unknown` is not `idle`. We have no evidence capture is off, so it must
+// not borrow the not-capturing warning.
+func TestStatusLabelUnknownStaysNeutral(t *testing.T) {
+	m := New()
+	m.connected = true
+	m.engineStatus = StatusUnknown
+
+	label, recordingish := m.statusLabel()
+	if recordingish {
+		t.Errorf("unknown must not be recordingish, got true (label %q)", label)
+	}
+	if strings.Contains(label, "NOT CAPTURING") {
+		t.Errorf("unknown should stay neutral, got %q", label)
+	}
+}

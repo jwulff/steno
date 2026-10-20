@@ -160,6 +160,25 @@ public struct StenoSettings: Codable, Sendable {
     /// every interval.
     public var errorRecoveryIntervalSeconds: Int
 
+    /// #111 — whether a wake re-applies the always-on arm rule when the
+    /// engine is sitting in `.idle`.
+    ///
+    /// `.idle` is reachable only from `stop()`. Always-on recording (#32)
+    /// has no user-facing stop, but `stop` is still a valid wire command
+    /// and nothing in the engine ever leaves `.idle` on its own, so a stop
+    /// from any client otherwise disables capture for the life of the
+    /// daemon process. A wake re-runs the same check daemon start does,
+    /// including the persisted pause anchor, so an explicit `pause` is
+    /// still honoured.
+    ///
+    /// #113 review fix: default is `false`. A plain `stop()` and a
+    /// privacy-motivated `stop()` are the same wire command — this layer
+    /// cannot tell an incidental script/test stop from a deliberate one,
+    /// so the safe default is to keep `stop` terminal and require an
+    /// explicit opt-in (`true`) for the self-healing behavior.
+    /// Default: `false`.
+    public var reArmIdleOnWake: Bool
+
     public init(
         summarizationProvider: SummarizationProvider = .local,
         anthropicAPIKey: String? = nil,
@@ -176,7 +195,8 @@ public struct StenoSettings: Codable, Sendable {
         emptySessionMinDurationSeconds: Double = 3.0,
         topicExtractionMinSegments: Int = 3,
         retentionDays: Int = 0,
-        errorRecoveryIntervalSeconds: Int = 60
+        errorRecoveryIntervalSeconds: Int = 60,
+        reArmIdleOnWake: Bool = false
     ) {
         self.summarizationProvider = summarizationProvider
         self.anthropicAPIKey = anthropicAPIKey
@@ -194,6 +214,7 @@ public struct StenoSettings: Codable, Sendable {
         self.topicExtractionMinSegments = topicExtractionMinSegments
         self.retentionDays = retentionDays
         self.errorRecoveryIntervalSeconds = errorRecoveryIntervalSeconds
+        self.reArmIdleOnWake = reArmIdleOnWake
     }
 
     // MARK: - Codable
@@ -218,6 +239,7 @@ public struct StenoSettings: Codable, Sendable {
         case topicExtractionMinSegments
         case retentionDays
         case errorRecoveryIntervalSeconds
+        case reArmIdleOnWake
     }
 
     public init(from decoder: Decoder) throws {
@@ -242,5 +264,6 @@ public struct StenoSettings: Codable, Sendable {
         // Absent in a settings file written before #109's timer: default
         // on, so an upgraded install gets automatic recovery from `error`.
         self.errorRecoveryIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .errorRecoveryIntervalSeconds) ?? 60
+        self.reArmIdleOnWake = try container.decodeIfPresent(Bool.self, forKey: .reArmIdleOnWake) ?? false
     }
 }
