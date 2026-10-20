@@ -53,6 +53,59 @@ type Manager struct {
 	// production code gets via NewManager and what tests get when they
 	// don't override it.
 	processIdentifier processIdentifier
+
+	// launchctl runs `launchctl` with the given arguments and reports
+	// whether it exited 0. Restart uses it to hand a LaunchAgent-managed
+	// daemon back to launchd instead of killing and respawning it outside
+	// launchd's supervision. nil means launchd is never consulted: tests
+	// that build a bare Manager get that, so no test can touch the real
+	// job. NewManager wires the real binary.
+	launchctl launchctlRunner
+}
+
+// launchctlRunner runs launchctl with args and returns an error on a
+// non-zero exit.
+type launchctlRunner func(ctx context.Context, args ...string) error
+
+// launchdLabel is the LaunchAgent label `steno-daemon install` registers
+// (LaunchdPlist.label on the Swift side).
+const launchdLabel = "com.steno.daemon"
+
+func defaultLaunchctl(ctx context.Context, args ...string) error {
+	return exec.CommandContext(ctx, "/bin/launchctl", args...).Run()
+}
+
+// launchdTarget is the launchctl service target for the daemon's
+// LaunchAgent in the current user's GUI domain.
+func launchdTarget() string {
+	return fmt.Sprintf("gui/%d/%s", os.Getuid(), launchdLabel)
+}
+
+// restartViaLaunchd restarts the daemon through launchd when its
+// LaunchAgent is loaded. It reports handled=false when launchd is not
+// consulted or the job is not loaded, so the caller falls back to a direct
+// restart.
+//
+// Killing a LaunchAgent-managed daemon ourselves is wrong: SIGTERM makes
+// it exit 0, the plist's KeepAlive only restarts on an unsuccessful exit,
+// and a replacement we spawn directly runs outside launchd, so a later
+// crash would never be restarted. `kickstart -k` kills and restarts the
+// job under launchd's supervision.
+func (m *Manager) restartViaLaunchd(ctx context.Context) (handled bool, err error) {
+	if m.launchctl == nil {
+		return false, nil
+	}
+	target := launchdTarget()
+	if err := m.launchctl(ctx, "print", target); err != nil {
+		// Not loaded (or launchctl unavailable): not ours to restart.
+		return false, nil
+	}
+	if err := m.launchctl(ctx, "kickstart", "-k", target); err != nil {
+		// Do not fall back to a direct spawn: the job is loaded, and a
+		// second, unsupervised daemon would fight launchd's for the socket.
+		return true, fmt.Errorf("restart daemon via launchd (%s): %w", target, err)
+	}
+	return true, nil
 }
 
 // NewManager creates a Manager with default paths.
@@ -61,6 +114,7 @@ func NewManager() *Manager {
 	return &Manager{
 		BasePath:          filepath.Join(home, "Library", "Application Support", "Steno"),
 		processIdentifier: defaultProcessIdentifier,
+		launchctl:         defaultLaunchctl,
 	}
 }
 
@@ -320,9 +374,20 @@ func (m *Manager) EnsureRunning(ctx context.Context) error {
 	return m.WaitForSocket(waitCtx)
 }
 
-// Restart terminates a running steno-daemon if one is identified, clears stale
-// runtime files, starts the configured daemon binary, and waits for its socket.
+// Restart restarts the daemon and waits for its socket. A daemon managed by
+// its LaunchAgent is restarted through launchd (see restartViaLaunchd).
+// Otherwise Restart terminates a running steno-daemon if one is identified,
+// clears stale runtime files, and starts the configured daemon binary.
 func (m *Manager) Restart(ctx context.Context) error {
+	if handled, err := m.restartViaLaunchd(ctx); handled {
+		if err != nil {
+			return err
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return m.WaitForSocket(waitCtx)
+	}
+
 	running, pid, err := m.IsRunning()
 	if err != nil {
 		return err

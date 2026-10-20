@@ -62,3 +62,21 @@ have shipped with it:
   that even an unused async closure property does this on main, while a
   synchronous one does not. Tracked in #133, which also records that main's
   own test run aborts partway.
+
+## Restart through launchd (2026-10-20)
+
+The cloud Codex review flagged that the TUI's restart after a failed pulse
+broke launchd supervision. `Manager.Restart` sent SIGTERM to a
+LaunchAgent-managed daemon, which exits 0. The plist's `KeepAlive` only
+restarts on an unsuccessful exit, so launchd let it go, and the replacement
+spawned by `Restart` ran outside launchd. A later crash would never be
+restarted.
+
+`Restart` now checks `launchctl print gui/<uid>/com.steno.daemon`. When the
+job is loaded, it runs `launchctl kickstart -k` on it and waits for the
+socket. If kickstart fails, it returns the error instead of spawning a
+second, unsupervised daemon. When the job is not loaded, it falls back to
+the direct kill-and-spawn path. The launchctl runner is injected, and a
+`Manager` built without one never consults launchd, so tests cannot touch
+the real job. Four tests cover the loaded path (no direct kill), the
+not-loaded fallback, the kickstart failure, and the bare `Manager`.
