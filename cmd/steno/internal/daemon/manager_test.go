@@ -3,11 +3,13 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -623,5 +625,121 @@ func TestDefaultProcessIdentifierMissing(t *testing.T) {
 	}
 	if path != "" {
 		t.Errorf("expected empty path for missing PID, got %q", path)
+	}
+}
+
+// fakeLaunchctl records launchctl invocations. `loaded` controls whether
+// `print` succeeds; `kickstartErr` is returned from `kickstart`.
+type fakeLaunchctl struct {
+	loaded       bool
+	kickstartErr error
+	calls        [][]string
+}
+
+func (f *fakeLaunchctl) run(_ context.Context, args ...string) error {
+	f.calls = append(f.calls, append([]string(nil), args...))
+	switch args[0] {
+	case "print":
+		if !f.loaded {
+			return errors.New("Could not find service")
+		}
+		return nil
+	case "kickstart":
+		return f.kickstartErr
+	}
+	return fmt.Errorf("unexpected launchctl %v", args)
+}
+
+// shortBasePath returns a base directory short enough for a unix socket
+// path (macOS caps sun_path at 104 bytes; t.TempDir() is often longer).
+func shortBasePath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "stn")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+func TestRestartUsesLaunchdKickstartWhenJobLoaded(t *testing.T) {
+	dir := shortBasePath(t)
+	// Stand in for the daemon launchd brings back up.
+	ln, err := net.Listen("unix", filepath.Join(dir, "steno.sock"))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	// A PID file for a process Restart must NOT kill itself: launchd owns it.
+	m0 := &Manager{BasePath: dir}
+	if err := os.WriteFile(m0.pidPath(), []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatalf("write pid: %v", err)
+	}
+
+	fake := &fakeLaunchctl{loaded: true}
+	m := &Manager{
+		BasePath:  dir,
+		launchctl: fake.run,
+		processIdentifier: func(context.Context, int) (string, error) {
+			t.Fatal("Restart must not identify or kill the process when launchd owns the job")
+			return "", nil
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.Restart(ctx); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+
+	target := launchdTarget()
+	want := [][]string{{"print", target}, {"kickstart", "-k", target}}
+	if fmt.Sprint(fake.calls) != fmt.Sprint(want) {
+		t.Fatalf("launchctl calls = %v, want %v", fake.calls, want)
+	}
+	if !strings.HasSuffix(target, "/com.steno.daemon") || !strings.HasPrefix(target, "gui/") {
+		t.Fatalf("target = %q, want gui/<uid>/com.steno.daemon", target)
+	}
+}
+
+func TestRestartViaLaunchdFallsBackWhenJobNotLoaded(t *testing.T) {
+	fake := &fakeLaunchctl{loaded: false}
+	m := &Manager{BasePath: shortBasePath(t), launchctl: fake.run}
+
+	handled, err := m.restartViaLaunchd(context.Background())
+	if handled || err != nil {
+		t.Fatalf("handled=%v err=%v, want false/nil so Restart spawns directly", handled, err)
+	}
+	for _, c := range fake.calls {
+		if c[0] == "kickstart" {
+			t.Fatal("kickstart must not run when the job is not loaded")
+		}
+	}
+}
+
+func TestRestartViaLaunchdKickstartFailureDoesNotFallBack(t *testing.T) {
+	fake := &fakeLaunchctl{loaded: true, kickstartErr: errors.New("exit status 113")}
+	m := &Manager{BasePath: shortBasePath(t), launchctl: fake.run}
+
+	handled, err := m.restartViaLaunchd(context.Background())
+	if !handled || err == nil {
+		t.Fatalf("handled=%v err=%v, want true/error: a loaded job must not get a second, unsupervised daemon", handled, err)
+	}
+}
+
+func TestBareManagerNeverConsultsLaunchd(t *testing.T) {
+	m := &Manager{BasePath: shortBasePath(t)}
+	handled, err := m.restartViaLaunchd(context.Background())
+	if handled || err != nil {
+		t.Fatalf("handled=%v err=%v, want false/nil for a Manager without a launchctl runner", handled, err)
 	}
 }

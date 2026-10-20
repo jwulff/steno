@@ -56,6 +56,16 @@ Steno is a two-process system:
 
 ---
 
+## Product Tenets
+
+- **Expose all functionality in the TUI.** If the daemon, CLI, MCP server, or
+  settings layer gains a user-visible capability, the TUI must provide a way to
+  discover, trigger, inspect, or configure it. CLI/MCP paths are useful
+  complements, but the terminal UI is the primary product surface and should not
+  lag behind hidden functionality.
+
+---
+
 ## Tech Stack
 
 - **Daemon**: Swift 6.2+, swift-argument-parser, GRDB (SQLite), SpeechAnalyzer API (macOS 26)

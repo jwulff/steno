@@ -1,6 +1,6 @@
 .PHONY: version-sync check-version check-release-tag build build-daemon build-daemon-debug build-steno \
        sign-daemon sign-daemon-debug \
-       run-daemon run-steno run-mcp \
+       run-daemon run-steno run-mcp run-local \
        build-app run-app test-app clean-app \
        test test-daemon test-steno test-live \
        clean install
@@ -65,6 +65,9 @@ run-steno: build-steno
 
 run-mcp: build-steno
 	$(STENO_DIR)/$(STENO_BIN) --mcp
+
+run-local:
+	./scripts/run-local
 
 # --- Test ---
 
