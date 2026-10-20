@@ -50,7 +50,7 @@ Carried from origin (`docs/brainstorms/2026-05-22-tui-dedup-rendering-brainstorm
 - Collapse-style ("+N duplicates hidden") rendering.
 - An undo / unmark affordance in the TUI for wrongly-flagged duplicates.
 - Persisting the toggle mode across TUI restarts.
-- Adding a `SessionID` field to `TranscriptEntry` — research confirmed it isn't needed because `m.entries` clears on session change.
+- ~~Adding a `SessionID` field to `TranscriptEntry`.~~ *Superseded during implementation:* `m.entries` does **not** clear on session change, and sequence numbers are unique only per session, so the TUI does carry `SessionID` and matches on `(SessionID, SeqNum)`.
 
 ---
 
@@ -100,6 +100,8 @@ Carried from origin (`docs/brainstorms/2026-05-22-tui-dedup-rendering-brainstorm
 ## Key Technical Decisions
 
 - **Emit via `EventBroadcaster`, not a synchronous side channel.** Resolves the brainstorm's deferred question on emit pipeline. Every other event does this; going synchronous would mean teaching `DedupCoordinator` about `EventBroadcaster`, which breaks the layering and has no precedent.
+> **Implementation note (2026-10-19).** Two decisions below changed during implementation. `runPass` returns the marked pairs in `DedupOutcome.markedPairs` and the engine emits one event per pair after the pass, instead of an `onDuplicateMarked` callback. Emission is still one event per mark; only the hand-off point moved. The TUI matches on `(SessionID, SeqNum)`, not `SeqNum` alone, because `m.entries` is not cleared between sessions.
+
 - **Coordinator → engine wiring via optional callback closure.** `DedupCoordinator` gains an optional `onDuplicateMarked` async callback property; `RecordingEngine` sets it during init to call `self.emit(.duplicateMarked(...))`. Matches the codebase's existing DI convention; no new module-level coupling.
 - **Per-mark emission, not per-pass batching.** The callback fires inside `markDuplicate`'s loop in `runPass`. Matches R3. Returning a list from `runPass` would batch — wrong shape.
 - **Match TUI entries by `SeqNum` alone.** `m.entries` is session-scoped (cleared on session change), so a `sessionId` check would be redundant. Add only `Duplicate bool` and `DuplicateOfSeq int` to `TranscriptEntry`. If a `dedup` event somehow arrives for a wrong session, the silently-drop-on-miss rule (R4 + AE2) makes it a no-op.

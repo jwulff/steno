@@ -268,6 +268,16 @@ actor MockTranscriptRepository: TranscriptRepository {
         markDuplicateError = error
     }
 
+    /// When set, `markDuplicate` succeeds this many times and then throws
+    /// `markDuplicateError`. Exercises a pass that fails after writing
+    /// some marks.
+    private var markDuplicateSucceedCount: Int?
+
+    func setMarkDuplicateError(_ error: Error?, afterSuccesses count: Int) {
+        markDuplicateError = error
+        markDuplicateSucceedCount = count
+    }
+
     func segmentsAfterDedupCursor(sessionId: UUID, source: AudioSourceType) async throws -> [StoredSegment] {
         guard let session = sessions[sessionId] else { return [] }
         let cursor = session.lastDedupedSegmentSeq
@@ -301,7 +311,11 @@ actor MockTranscriptRepository: TranscriptRepository {
         sysSegmentId: UUID,
         method: DedupMethod
     ) async throws {
-        if let err = markDuplicateError { throw err }
+        if let remaining = markDuplicateSucceedCount, remaining > 0 {
+            markDuplicateSucceedCount = remaining - 1
+        } else if let err = markDuplicateError {
+            throw err
+        }
         for (sid, segs) in segments {
             if let idx = segs.firstIndex(where: { $0.id == micSegmentId }) {
                 let old = segs[idx]

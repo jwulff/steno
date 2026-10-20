@@ -1040,7 +1040,9 @@ func (m *Model) resetSpeakerOrder() {
 // `dedup` event is late-arrival (~5s after segment) and the entry may
 // have left memory or never arrived (R4 / AE2 in the brainstorm).
 func (m *Model) markEntryDuplicate(sessionID string, seqNum, dupOfSeq int) {
-	for i := range m.entries {
+	// Scan newest-first: dedup events refer to segments finalized a few
+	// seconds earlier, and m.entries grows across sessions.
+	for i := len(m.entries) - 1; i >= 0; i-- {
 		if m.entries[i].SessionID == sessionID && m.entries[i].SeqNum == seqNum {
 			m.entries[i].Duplicate = true
 			m.entries[i].DuplicateOfSeq = dupOfSeq

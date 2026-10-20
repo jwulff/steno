@@ -169,6 +169,11 @@ public actor DedupCoordinator {
         isProcessing[sessionId] = true
         defer { isProcessing[sessionId] = false }
 
+        // Declared outside the do-block so the catch path can still report
+        // marks already written to SQLite. Later passes skip marked rows, so
+        // a mark not reported here would never reach the TUI.
+        var markedPairs: [MarkedPair] = []
+
         do {
             // 1. Load mic segments past the cursor that aren't already marked.
             let micSegments = try await repository.segmentsAfterDedupCursor(
@@ -200,7 +205,6 @@ public actor DedupCoordinator {
             var skipped = 0
             var deferred = 0
             var maxEvaluatedSeq = 0
-            var markedPairs: [MarkedPair] = []
 
             for mic in micSegments {
                 // The cursor is a single watermark, so the pass must stop at
@@ -298,7 +302,13 @@ public actor DedupCoordinator {
             // Non-critical: log and surrender. Cursor was not advanced
             // because the UPDATE is the last step in the do-block.
             logDedup("Session \(sessionId) — pass FAILED: \(error) [\(type(of: error))]")
-            return .empty
+            guard !markedPairs.isEmpty else { return .empty }
+            return DedupOutcome(
+                evaluated: markedPairs.count,
+                marked: markedPairs.count,
+                skipped: 0,
+                markedPairs: markedPairs
+            )
         }
     }
 
