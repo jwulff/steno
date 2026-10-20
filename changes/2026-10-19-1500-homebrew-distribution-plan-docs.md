@@ -22,6 +22,9 @@ question, the launchd conflict) in the repo next to the other plans.
 
 ## Validation
 
-Docs only. Rebased onto current main; CI runs the normal suite. Copilot's six
-review threads from the original review were addressed and resolved before
-this rebase.
+Docs only, rebased onto current main. CI's test job pins Swift 6.0 while the
+daemon needs 6.2, so CI skips the build and accepts the commit's test
+attestation. No code changed, so nothing here depends on that suite. A
+Codex review checked the status note against the repo and caught that the
+Info.plist version is not yet synced. Copilot's six threads from the
+original review were addressed and resolved before this rebase.

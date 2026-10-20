@@ -17,8 +17,11 @@ deepened: 2026-04-29
 >   `jwulff/homebrew-tap` (`brew install jwulff/tap/steno`), not a dedicated
 >   `jwulff/homebrew-steno`. A reference copy sits in `Formula/steno.rb`.
 >   The release pipeline was repaired in #44.
-> - **Shipped (U1).** The version is single-sourced from `VERSION` and both
->   binaries report it (#95, closing #92). CLT-only installs work (#96).
+> - **Partly shipped (U1).** `VERSION` is the single source for the Swift
+>   and Go version constants, and both binaries report it (#95, closing
+>   #92). The embedded `daemon/Resources/Info.plist` still carries
+>   `CFBundleVersion` 0.1.0 because `scripts/sync-version.sh` does not
+>   touch it. CLT-only installs work (#96).
 > - **Not shipped.** Bottle CI (U4), the end-to-end smoke test and TCC
 >   migration docs (U6), and daemon-side launchd conflict detection (U7).
 >   Hosted-runner builds are blocked on the macOS 26 SDK gap (#68).
@@ -116,7 +119,7 @@ R12 (origin: "track core notability + surface in README") was dropped during doc
 - `brew tap-new` generates `Formula/`, `tests.yml`, `publish.yml`. `tests.yml` runs `brew test-bot` on `macos-26` to build bottles on PRs; `publish.yml` is triggered by labeling a PR `pr-pull`, which downloads the bottle artifacts via `brew pr-pull --root-url=…` and publishes them as a GitHub Release on the tap repo, then commits the updated formula to `main`.
 - Bottle URL convention with default `root_url`: `https://github.com/jwulff/homebrew-steno/releases/download/steno-<version>/<bottle-tarball>`. Reference tap doing this end-to-end: `mas-cli/homebrew-tap`.
 - GitHub-hosted Actions: `runs-on: macos-26` GA since 2026-02-26 → arm64 by default. `macos-latest` does NOT yet point at 26 (still 14/15 in April 2026); pin explicitly.
-- Ad-hoc codesigning is content-hash-based (no machine identity) and survives bottling. `cellar: :any_skip_relocation` is correct because binaries don't reference cellar paths. **However**, the cdhash of an ad-hoc-signed binary depends on every byte of the Mach-O including SwiftPM-injected timestamps and toolchain metadata — so two builds of the same source from different machines or runners will have different cdhashes. macOS TCC keys permissions on cdhash; users migrating between builds will be re-prompted (R14 documents this).
+- Ad-hoc codesigning is content-hash-based (no machine identity) and survives bottling. `cellar: :any_skip_relocation` is correct because binaries don't reference cellar paths. **However**, the cdhash of an ad-hoc-signed binary depends on every byte of the Mach-O including SwiftPM-injected timestamps and toolchain metadata — so two builds of the same source from different machines or runners will have different cdhashes. macOS TCC keys permissions on cdhash; users migrating between builds will be re-prompted (U6 verifies and documents this).
 - SwiftPM inside Homebrew's superenv build sandbox: pass `--disable-sandbox` to `swift build` (SwiftPM's own sandbox conflicts with brew's), and redirect cache via `ENV["SWIFTPM_CACHE_DIR"] = buildpath/".cache"` so SwiftPM doesn't try to write to `~/Library/Caches`.
 - Go inside Homebrew's superenv: set `ENV["GOPATH"] = buildpath/"go"` (otherwise Go tries to write `~/go`, often blocked), `ENV["GOFLAGS"] = "-mod=mod"`, and rely on Homebrew's default network access during build for module fetches. `homebrew/core` accepts Go formulas that fetch modules at build time (e.g., `gh`, `hugo` use this pattern).
 
