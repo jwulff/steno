@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # GitHub macOS-15 runners ship Swift 6.0 by default. Steno's
       # `daemon/Package.swift` declares swift-tools-version: 6.2 and
