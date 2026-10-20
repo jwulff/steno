@@ -9,6 +9,22 @@ deepened: 2026-04-29
 
 # feat: Homebrew distribution via personal tap with bottle CI
 
+> **Status as of 2026-10-19.** This plan landed as a record after part of
+> it had already shipped by a different route. Read it as the design
+> reasoning, not as the current state:
+>
+> - **Shipped differently.** The formula lives in the shared tap
+>   `jwulff/homebrew-tap` (`brew install jwulff/tap/steno`), not a dedicated
+>   `jwulff/homebrew-steno`. A reference copy sits in `Formula/steno.rb`.
+>   The release pipeline was repaired in #44.
+> - **Shipped (U1).** The version is single-sourced from `VERSION` and both
+>   binaries report it (#95, closing #92). CLT-only installs work (#96).
+> - **Not shipped.** Bottle CI (U4), the end-to-end smoke test and TCC
+>   migration docs (U6), and daemon-side launchd conflict detection (U7).
+>   Hosted-runner builds are blocked on the macOS 26 SDK gap (#68).
+>   Remaining scope is tracked in #40.
+
+
 ## Overview
 
 Make `brew tap jwulff/steno && brew install steno` work end-to-end on macOS 26 arm64. Ship a source-built formula in a new `jwulff/homebrew-steno` tap, with bottle CI that auto-publishes prebuilt artifacts on every Steno release. Same formula stays structurally eligible for graduation to `homebrew/core` later — no rewrite required.
