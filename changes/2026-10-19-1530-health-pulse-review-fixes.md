@@ -46,3 +46,19 @@ have shipped with it:
 - `go test ./...` and `make test-daemon` pass locally. The real
   speaker-to-mic loop still needs a manual run on hardware with
   `scripts/run-local --health-pulse`.
+
+## Rebase onto 5c30453 (2026-10-20)
+
+- Main's wake path now runs through `rebuildAfterGap` and the #111 idle
+  re-arm, so the wake trigger moved into `handleSystemDidWake`. It fires
+  after either path leaves the engine recording.
+- `StenoSettings` persistence moved into a settings store (#117). The three
+  health-pulse keys now sit beside `errorRecoveryIntervalSeconds` and
+  `reArmIdleOnWake`.
+- The engine's trigger sink is now a synchronous closure, and `RunCommand`
+  wraps the relay call in a `Task`. A stored `@Sendable async` closure on
+  `RecordingEngine` made the daemon test process abort with "freed pointer
+  was not the last allocation" in `restartMicPipeline`. Bisection showed
+  that even an unused async closure property does this on main, while a
+  synchronous one does not. Tracked in #133, which also records that main's
+  own test run aborts partway.

@@ -119,7 +119,7 @@ struct RunCommand: ParsableCommand {
                     audioBacklogCapSeconds: settings.audioBacklogCapSeconds,
                     settingsStore: settingsStore,
                     healthPulseTrigger: { trigger in
-                        await healthPulseRelay.schedule(trigger)
+                        Task { await healthPulseRelay.schedule(trigger) }
                     },
                     dedupCoordinator: dedupCoordinator,
                     dedupTriggerDebounce: .seconds(settings.dedupTriggerDebounceSeconds),

@@ -155,7 +155,13 @@ public actor RecordingEngine {
     /// #76 — optional sink for automatic health-pulse triggers emitted after
     /// startup/wake/device-change recovery paths settle. Production wires this
     /// to `HealthPulseCoordinator.schedule(trigger:)`; tests default to no-op.
-    private let healthPulseTrigger: @Sendable (HealthPulseTrigger) async -> Void
+    ///
+    /// Deliberately synchronous: the sink only hands the trigger to a
+    /// debounced scheduler, so callers never need to wait. Storing an
+    /// `async` closure on this actor also tripped a Swift concurrency
+    /// runtime abort ("freed pointer was not the last allocation") in
+    /// `restartMicPipeline` (see #133).
+    private let healthPulseTrigger: @Sendable (HealthPulseTrigger) -> Void
 
     // MARK: - Internal state
 
@@ -526,7 +532,7 @@ public actor RecordingEngine {
         audioBacklogCapSeconds: Double = 0,
         now: @Sendable @escaping () -> Date = { Date() },
         settingsStore: (any SettingsStoring)? = nil,
-        healthPulseTrigger: @Sendable @escaping (HealthPulseTrigger) async -> Void = { _ in },
+        healthPulseTrigger: @Sendable @escaping (HealthPulseTrigger) -> Void = { _ in },
         dedupCoordinator: DedupCoordinator? = nil,
         dedupTriggerDebounce: Duration = .seconds(5),
         emptySessionMinChars: Int = 20,
@@ -2963,7 +2969,7 @@ public actor RecordingEngine {
         // leave `wakeRearmFailed == false` and are correctly excluded.
         if status == .idle || (status == .error && wakeRearmFailed) {
             await reArmIdleAfterWake()
-            await scheduleWakeHealthPulseIfRecording()
+            scheduleWakeHealthPulseIfRecording()
             return
         }
 
@@ -2991,15 +2997,15 @@ public actor RecordingEngine {
             reasonPrefix: "wake",
             failureLabel: "Wake"
         )
-        await scheduleWakeHealthPulseIfRecording()
+        scheduleWakeHealthPulseIfRecording()
     }
 
     /// #76: a wake that brought capture back up asks for one real-audio
     /// health pulse. The relay drops it unless automatic pulses are opted
     /// in, and the coordinator debounces it.
-    private func scheduleWakeHealthPulseIfRecording() async {
+    private func scheduleWakeHealthPulseIfRecording() {
         if status == .recording {
-            await healthPulseTrigger(.wakeFromSleep)
+            healthPulseTrigger(.wakeFromSleep)
         }
     }
 
@@ -3416,7 +3422,7 @@ public actor RecordingEngine {
             // staged its own `after_gap:Ns` heal marker). No heal-rule
             // invocation, no session boundary change.
             if status == .recording {
-                await healthPulseTrigger(.defaultInputChanged)
+                healthPulseTrigger(.defaultInputChanged)
             }
             return
         }
@@ -3477,7 +3483,7 @@ public actor RecordingEngine {
         }
 
         if status == .recording {
-            await healthPulseTrigger(.defaultInputChanged)
+            healthPulseTrigger(.defaultInputChanged)
         }
     }
 
